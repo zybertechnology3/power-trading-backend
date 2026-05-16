@@ -2,7 +2,6 @@
 SAPP MTP constrained area result endpoints.
 """
 
-import os
 from datetime import date, datetime, time
 from typing import Optional
 
@@ -14,6 +13,7 @@ from app.schemas.sapp import (
     SappConstrainedAreaResultResponse,
     SappScrapeResponse,
 )
+from sapp_scraper import run_scraper
 
 router = APIRouter(prefix="/sapp", tags=["sapp"])
 
@@ -34,18 +34,7 @@ def scrape_sapp_results(
     Download the SAPP MTP DAM constrained area document for a delivery date,
     parse hourly data, and upsert it into MongoDB.
     """
-    if os.getenv("ENABLE_HTTP_SCRAPER", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "HTTP scraping is disabled for this deployment. "
-                "Run the scraper with the Render Cron Job instead."
-            ),
-        )
-
     try:
-        from sapp_scraper import run_scraper
-
         result = run_scraper(delivery_date=delivery_date)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
