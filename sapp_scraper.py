@@ -4,9 +4,10 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import openpyxl
 from dotenv import load_dotenv
@@ -29,8 +30,8 @@ BASE_URL = "https://trading.sappmtp.com"
 LOGIN_URL = f"{BASE_URL}/account/login?returnUrl=%2F"
 INBOX_URL = f"{BASE_URL}/mdd/message-inbox"
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
-MESSAGE_SUBJECT_TEMPLATE = "MTP - DAM - Constrained Area Results for {delivery_date}"
-DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
+CONSTRAINED_AREA_SUBJECT_TEMPLATE = "MTP - DAM - Constrained Area Results for {delivery_date}"
+CONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
 MAX_INBOX_PAGES_TO_SEARCH = 25
 INBOX_GRID_READY_TIMEOUT = 10
 INBOX_PAGE_CHANGE_TIMEOUT = 10
@@ -45,8 +46,31 @@ INBOX_LOADING_SELECTOR = ".k-loading-mask, .k-i-loading, .k-loading-image"
 # stress test for all possible scenarios:
 
 
-def build_message_subject(delivery_date: date) -> str:
-    return MESSAGE_SUBJECT_TEMPLATE.format(delivery_date=delivery_date.strftime("%Y/%m/%d"))
+@dataclass(frozen=True)
+class SappExtractionJob:
+    """
+    Configuration for one SAPP inbox document type.
+
+    Add new document types by creating another job with a subject template,
+    parser, target Mongo collection, and unique-key fields.
+    """
+
+    name: str
+    subject_template: str
+    data_source: str
+    collection_name: str
+    unique_key_fields: tuple[str, ...]
+    extractor: Callable[[Path, "SappExtractionJob"], list[dict]]
+    attachment_extension: str = ".xlsx"
+
+    def build_subject(self, delivery_date: date) -> str:
+        return self.subject_template.format(
+            delivery_date=delivery_date.strftime("%Y/%m/%d")
+        )
+
+
+def build_message_subject(delivery_date: date, subject_template: str) -> str:
+    return subject_template.format(delivery_date=delivery_date.strftime("%Y/%m/%d"))
 
 
 def parse_delivery_date_value(value):
@@ -283,6 +307,31 @@ def find_message_on_current_page(driver, target_subject: str):
         return None
 
 
+def find_target_subjects_on_current_page(driver, target_subjects: list[str]) -> list[str]:
+    if not target_subjects:
+        return []
+
+    try:
+        return driver.execute_script(
+            """
+            const targets = new Set(arguments[0]);
+            const found = [];
+            for (const element of document.querySelectorAll("span[title]")) {
+                const title = element.getAttribute("title");
+                if (!targets.has(title) || found.includes(title)) continue;
+                const rect = element.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    found.push(title);
+                }
+            }
+            return found;
+            """,
+            target_subjects,
+        )
+    except WebDriverException:
+        return []
+
+
 def click_message(driver, target_subject: str):
     subject_xpath = f"//span[@title={xpath_literal(target_subject)}]"
     try:
@@ -349,8 +398,7 @@ def click_next_inbox_page(driver, page_number: int, timeout: int = INBOX_PAGE_CH
     wait_for_inbox_grid_to_settle(driver)
 
 
-def find_message_and_open(driver, delivery_date: date):
-    target_subject = build_message_subject(delivery_date)
+def find_message_and_open(driver, target_subject: str):
     print(f"[5/7] Looking for message with subject: {target_subject}")
 
     for page_number in range(1, MAX_INBOX_PAGES_TO_SEARCH + 1):
@@ -373,11 +421,16 @@ def find_message_and_open(driver, delivery_date: date):
         f"{target_subject}"
     )
 
-def wait_for_new_download_file(download_dir: Path, existing_names: set, timeout: int = 30) -> Path:
+def wait_for_new_download_file(
+    download_dir: Path,
+    existing_names: set,
+    extension: str = ".xlsx",
+    timeout: int = 30,
+) -> Path:
     print("[6/7] ⏳ Waiting for the downloaded Excel file to appear")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        files = [p for p in download_dir.glob("*.xlsx") if p.name not in existing_names]
+        files = [p for p in download_dir.glob(f"*{extension}") if p.name not in existing_names]
         if files:
             latest = max(files, key=lambda p: p.stat().st_mtime)
             if latest.stat().st_size > 0:
@@ -468,7 +521,10 @@ def extract_data_from_file(file_path: Path):
     return output_path
 
 
-def extract_results_from_file(file_path: Path) -> list[dict]:
+def extract_constrained_area_results(
+    file_path: Path,
+    data_source: str = CONSTRAINED_AREA_DATA_SOURCE,
+) -> list[dict]:
     print(f"[7/7] Extracting SAPP rows from downloaded file: {file_path.name}")
     workbook = openpyxl.load_workbook(file_path, data_only=True)
     sheet = workbook.active
@@ -531,7 +587,7 @@ def extract_results_from_file(file_path: Path) -> list[dict]:
                 "area_sales_mw": to_float(area_sales),
                 "area_price_usd_per_mwh": to_float(area_price),
                 "metadata": {
-                    "data_source": DATA_SOURCE,
+                    "data_source": data_source,
                     "source_file": file_path.name,
                 },
                 "source_file": file_path.name,
@@ -556,24 +612,34 @@ def extract_results_from_file(file_path: Path) -> list[dict]:
     return records
 
 
-def store_results_in_database(records: list[dict]) -> dict:
+def extract_constrained_area_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
+    return extract_constrained_area_results(file_path, data_source=job.data_source)
+
+
+def build_unique_filter(record: dict, unique_key_fields: tuple[str, ...]) -> dict:
+    missing_fields = [field for field in unique_key_fields if field not in record]
+    if missing_fields:
+        raise RuntimeError(
+            f"Record is missing unique key fields for import: {', '.join(missing_fields)}"
+        )
+    return {field: record[field] for field in unique_key_fields}
+
+
+def store_records_in_database(records: list[dict], job: SappExtractionJob) -> dict:
     if not records:
         raise RuntimeError("No SAPP records were provided for database import.")
 
     from app.db.database import get_db
 
     db = get_db()
-    collection = db["sapp_constrained_area_results"]
+    collection = db[job.collection_name]
     now = datetime.now(timezone.utc)
 
     operations = []
     for record in records:
         operations.append(
             UpdateOne(
-                {
-                    "delivery_date": record["delivery_date"],
-                    "hour": record["hour"],
-                },
+                build_unique_filter(record, job.unique_key_fields),
                 {
                     "$set": {
                         **record,
@@ -589,6 +655,7 @@ def store_results_in_database(records: list[dict]) -> dict:
 
     result = collection.bulk_write(operations, ordered=False)
     return {
+        "job": job.name,
         "delivery_date": records[0]["delivery_date"],
         "imported": result.upserted_count,
         "updated": result.matched_count,
@@ -596,15 +663,22 @@ def store_results_in_database(records: list[dict]) -> dict:
     }
 
 
-def download_attachment(driver, download_dir: Path):
+def store_results_in_database(records: list[dict]) -> dict:
+    return store_records_in_database(records, CONSTRAINED_AREA_RESULTS_JOB)
+
+
+def download_attachment(driver, download_dir: Path, extension: str = ".xlsx"):
     # Click the attachment button for the Excel file using the data-cy/title attribute.
-    attachment_xpath = "//button[contains(@data-cy, '.xlsx') or contains(@title, '.xlsx')]"
+    attachment_xpath = (
+        f"//button[contains(@data-cy, {xpath_literal(extension)}) "
+        f"or contains(@title, {xpath_literal(extension)})]"
+    )
 
     attachment_button = WebDriverWait(driver, 20).until(
         EC.element_to_be_clickable((By.XPATH, attachment_xpath))
     )
 
-    existing_files = {p.name for p in download_dir.glob("*.xlsx")}
+    existing_files = {p.name for p in download_dir.glob(f"*{extension}")}
     driver.execute_script(
         "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
         attachment_button,
@@ -618,14 +692,67 @@ def download_attachment(driver, download_dir: Path):
         )
         driver.execute_script("arguments[0].click();", attachment_button)
 
-    downloaded_file = wait_for_new_download_file(download_dir, existing_files, timeout=60)
+    downloaded_file = wait_for_new_download_file(
+        download_dir,
+        existing_files,
+        extension=extension,
+        timeout=60,
+    )
     print(f"📥 Downloaded file: {downloaded_file.name}")
     return downloaded_file
 
 
-def run_scraper(delivery_date: Optional[date] = None) -> dict:
+CONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
+    name="constrained_area_results",
+    subject_template=CONSTRAINED_AREA_SUBJECT_TEMPLATE,
+    data_source=CONSTRAINED_AREA_DATA_SOURCE,
+    collection_name="sapp_constrained_area_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_constrained_area_job,
+)
+
+SAPP_EXTRACTION_JOBS: dict[str, SappExtractionJob] = {
+    CONSTRAINED_AREA_RESULTS_JOB.name: CONSTRAINED_AREA_RESULTS_JOB,
+}
+
+
+def get_extraction_job(job_name: str) -> SappExtractionJob:
+    try:
+        return SAPP_EXTRACTION_JOBS[job_name]
+    except KeyError as exc:
+        available_jobs = ", ".join(sorted(SAPP_EXTRACTION_JOBS))
+        raise ValueError(
+            f"Unknown SAPP extraction job '{job_name}'. Available jobs: {available_jobs}"
+        ) from exc
+
+
+def iter_delivery_dates(start_date: date, end_date: date):
+    if end_date < start_date:
+        raise ValueError("end_date must be greater than or equal to start_date.")
+
+    current_date = start_date
+    while current_date <= end_date:
+        yield current_date
+        current_date += timedelta(days=1)
+
+
+def iter_delivery_dates_descending(start_date: date, end_date: date):
+    if end_date < start_date:
+        raise ValueError("end_date must be greater than or equal to start_date.")
+
+    current_date = end_date
+    while current_date >= start_date:
+        yield current_date
+        current_date -= timedelta(days=1)
+
+
+def run_extraction_job(
+    job: SappExtractionJob,
+    delivery_date: Optional[date] = None,
+) -> dict:
     delivery_date = delivery_date or datetime.now().date()
-    print(f"Starting SAPP scraper for {delivery_date.isoformat()}")
+    target_subject = job.build_subject(delivery_date)
+    print(f"Starting SAPP scraper job '{job.name}' for {delivery_date.isoformat()}")
     username, password = load_config()
     with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
@@ -633,14 +760,158 @@ def run_scraper(delivery_date: Optional[date] = None) -> dict:
         try:
             login(driver, username, password)
             navigate_to_inbox(driver)
-            find_message_and_open(driver, delivery_date)
-            downloaded_file = download_attachment(driver, download_dir)
-            records = extract_results_from_file(downloaded_file)
-            result = store_results_in_database(records)
+            find_message_and_open(driver, target_subject)
+            downloaded_file = download_attachment(
+                driver,
+                download_dir,
+                extension=job.attachment_extension,
+            )
+            records = job.extractor(downloaded_file, job)
+            result = store_records_in_database(records, job)
             print(f"SAPP scraper completed successfully: {result}")
             return result
         finally:
             driver.quit()
+
+
+def run_extraction_job_for_date_range(
+    job: SappExtractionJob,
+    start_date: date,
+    end_date: date,
+    continue_on_error: bool = True,
+) -> dict:
+    delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
+    pending_by_subject = {
+        job.build_subject(delivery_date): delivery_date
+        for delivery_date in delivery_dates
+    }
+    print(
+        f"Starting SAPP scraper job '{job.name}' for date range "
+        f"{start_date.isoformat()} to {end_date.isoformat()} "
+        f"from newest to oldest"
+    )
+
+    username, password = load_config()
+    results = []
+
+    with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
+        download_dir = Path(temp_download_dir)
+        driver = create_driver(download_dir)
+        try:
+            login(driver, username, password)
+            navigate_to_inbox(driver)
+
+            for page_number in range(1, MAX_INBOX_PAGES_TO_SEARCH + 1):
+                if not pending_by_subject:
+                    break
+
+                wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
+                print(
+                    f"[5/7] Scanning inbox page {page_number} for "
+                    f"{len(pending_by_subject)} remaining target messages"
+                )
+
+                while pending_by_subject:
+                    found_subjects = find_target_subjects_on_current_page(
+                        driver,
+                        list(pending_by_subject.keys()),
+                    )
+                    if not found_subjects:
+                        break
+
+                    for target_subject in found_subjects:
+                        if target_subject not in pending_by_subject:
+                            continue
+
+                        delivery_date = pending_by_subject[target_subject]
+                        try:
+                            print(
+                                f"[5/7] Found target message for "
+                                f"{delivery_date.isoformat()} on inbox page {page_number}"
+                            )
+                            click_message(driver, target_subject)
+                            print(
+                                f"[5/7] Opened target message for "
+                                f"{delivery_date.isoformat()} on inbox page {page_number}"
+                            )
+                            downloaded_file = download_attachment(
+                                driver,
+                                download_dir,
+                                extension=job.attachment_extension,
+                            )
+                            records = job.extractor(downloaded_file, job)
+                            result = store_records_in_database(records, job)
+                            results.append(
+                                {
+                                    "delivery_date": delivery_date.isoformat(),
+                                    "status": "success",
+                                    **result,
+                                }
+                            )
+                            pending_by_subject.pop(target_subject, None)
+                        except Exception as exc:
+                            failure = {
+                                "job": job.name,
+                                "delivery_date": delivery_date.isoformat(),
+                                "status": "failed",
+                                "error": str(exc),
+                            }
+                            results.append(failure)
+                            pending_by_subject.pop(target_subject, None)
+                            print(
+                                f"SAPP scraper failed for "
+                                f"{delivery_date.isoformat()}: {exc}"
+                            )
+                            if not continue_on_error:
+                                raise
+
+                if not pending_by_subject:
+                    break
+
+                next_page_button = find_enabled_next_page_button(driver)
+                if next_page_button is None:
+                    break
+
+                print(
+                    f"[5/7] Moving to inbox page {page_number + 1}; "
+                    f"{len(pending_by_subject)} target messages still pending"
+                )
+                click_next_inbox_page(driver, page_number)
+
+            for target_subject, delivery_date in pending_by_subject.items():
+                failure = {
+                    "job": job.name,
+                    "delivery_date": delivery_date.isoformat(),
+                    "status": "failed",
+                    "error": (
+                        "Target message not found after searching up to "
+                        f"{MAX_INBOX_PAGES_TO_SEARCH} inbox pages: {target_subject}"
+                    ),
+                }
+                results.append(failure)
+                print(f"SAPP scraper did not find message for {delivery_date.isoformat()}")
+                if not continue_on_error:
+                    raise RuntimeError(failure["error"])
+        finally:
+            driver.quit()
+
+    successful_results = [result for result in results if result["status"] == "success"]
+    failed_results = [result for result in results if result["status"] == "failed"]
+    return {
+        "job": job.name,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "requested_dates": len(delivery_dates),
+        "successful_dates": len(successful_results),
+        "failed_dates": len(failed_results),
+        "imported": sum(result.get("imported", 0) for result in successful_results),
+        "updated": sum(result.get("updated", 0) for result in successful_results),
+        "results": results,
+    }
+
+
+def run_scraper(delivery_date: Optional[date] = None) -> dict:
+    return run_extraction_job(CONSTRAINED_AREA_RESULTS_JOB, delivery_date=delivery_date)
 
 
 def main():
