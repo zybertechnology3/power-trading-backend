@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -644,7 +645,16 @@ def run_scraper(delivery_date: Optional[date] = None) -> dict:
 
 
 def main():
-    return run_scraper()
+    delivery_date = None
+    date_value = sys.argv[1] if len(sys.argv) > 1 else os.getenv("SCRAPE_DELIVERY_DATE")
+    if date_value:
+        delivery_date = parse_delivery_date_value(date_value)
+        if delivery_date is None:
+            raise ValueError(
+                "Invalid delivery date. Use YYYY-MM-DD, YYYY/MM/DD, DD/MM/YYYY, or DD-MM-YYYY."
+            )
+
+    return run_scraper(delivery_date=delivery_date)
 
 
 if __name__ == "__main__":
