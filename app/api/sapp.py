@@ -163,7 +163,18 @@ def list_scrape_jobs():
     }
 
 
-@router.post("/scrape", response_model=SappScrapeResponse)
+@router.post(
+    "/scrape",
+    response_model=SappScrapeResponse,
+    summary="Scrape one SAPP document locally",
+    description=(
+        "Runs Selenium, Firefox, and geckodriver to download and import one SAPP "
+        "document. This should be run locally, not on the deployed server. The "
+        "current hosted server does not have enough memory to reliably run the "
+        "browser stack, and server-side scraping may trigger memory limit restarts. "
+        "Use the deployed API to read already-imported MongoDB data."
+    ),
+)
 def scrape_sapp_results(
     delivery_date: Optional[date] = Query(
         None,
@@ -174,10 +185,7 @@ def scrape_sapp_results(
         description="SAPP extraction job to run.",
     ),
 ):
-    """
-    Download the SAPP MTP DAM constrained area document for a delivery date,
-    parse hourly data, and upsert it into MongoDB.
-    """
+    """Download, parse, and upsert one SAPP document. Run locally."""
     try:
         job = get_extraction_job(job_name)
         result = run_extraction_job(job, delivery_date=delivery_date)
@@ -188,7 +196,19 @@ def scrape_sapp_results(
     return result
 
 
-@router.post("/scrape-range", response_model=SappScrapeRangeResponse)
+@router.post(
+    "/scrape-range",
+    response_model=SappScrapeRangeResponse,
+    summary="Scrape multiple SAPP documents locally",
+    description=(
+        "Runs Selenium, Firefox, and geckodriver to download and import SAPP "
+        "documents for an inclusive delivery date range. This should be run "
+        "locally, not on the deployed server. The current hosted server does not "
+        "have enough memory to reliably run the browser stack, and server-side "
+        "scraping may trigger memory limit restarts. Use the deployed API to read "
+        "already-imported MongoDB data."
+    ),
+)
 def scrape_sapp_results_for_date_range(
     start_date: date = Query(..., description="First delivery date to fetch."),
     end_date: date = Query(..., description="Last delivery date to fetch, inclusive."),
@@ -201,9 +221,7 @@ def scrape_sapp_results_for_date_range(
         description="Continue with later dates if one date fails.",
     ),
 ):
-    """
-    Download and import SAPP documents for every delivery date in an inclusive date range.
-    """
+    """Download, parse, and upsert SAPP documents for a date range. Run locally."""
     try:
         job = get_extraction_job(job_name)
         result = run_extraction_job_for_date_range(

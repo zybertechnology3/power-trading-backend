@@ -14,7 +14,7 @@ if __package__ in (None, ""):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health, markets, sapp, telemetry, trades
+from app.api import health, sapp, telemetry
 from app.core.config import settings
 from app.db.database import connect_db, disconnect_db
 
@@ -66,8 +66,6 @@ app.add_middleware(
 
 # Include route modules
 app.include_router(health.router)
-app.include_router(markets.router)
-app.include_router(trades.router)
 app.include_router(telemetry.router)
 app.include_router(sapp.router)
 
