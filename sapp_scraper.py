@@ -1,5 +1,7 @@
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -134,11 +136,49 @@ def create_driver(download_dir: Path):
     options.set_preference("browser.shell.checkDefaultBrowser", False)
 
     os.environ["MOZ_HEADLESS"] = "1"
-    service = Service(executable_path=GeckoDriverManager().install())
-    driver = webdriver.Firefox(service=service, options=options)
+    os.environ["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
+
+    driver_path = shutil.which("geckodriver") or GeckoDriverManager().install()
+    geckodriver_log_path = Path(tempfile.gettempdir()) / "geckodriver.log"
+    print(f"[2/7] Using geckodriver at: {driver_path}")
+    print_subprocess_version(["firefox", "--version"])
+    print_subprocess_version([driver_path, "--version"])
+
+    service = Service(executable_path=driver_path, log_output=str(geckodriver_log_path))
+    try:
+        driver = webdriver.Firefox(service=service, options=options)
+    except WebDriverException:
+        print_geckodriver_log(geckodriver_log_path)
+        raise
     driver.set_window_size(1366, 900)
     driver.implicitly_wait(0)
     return driver
+
+
+def print_subprocess_version(command: list[str]):
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        output = (result.stdout or result.stderr).strip()
+        print(f"[2/7] {' '.join(command)}: {output}")
+    except Exception as exc:
+        print(f"[2/7] Could not run {' '.join(command)}: {exc}")
+
+
+def print_geckodriver_log(log_path: Path):
+    try:
+        if log_path.exists():
+            print("[2/7] Geckodriver log:")
+            print(log_path.read_text(errors="replace")[-4000:])
+        else:
+            print(f"[2/7] Geckodriver log was not created at {log_path}")
+    except Exception as exc:
+        print(f"[2/7] Could not read geckodriver log: {exc}")
 
 
 def login(driver, username: str, password: str):

@@ -2,13 +2,30 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MOZ_HEADLESS=1
+    MOZ_HEADLESS=1 \
+    MOZ_DISABLE_CONTENT_SANDBOX=1
+
+ARG GECKODRIVER_VERSION=0.36.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     firefox-esr \
     wget \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) gecko_arch="linux64" ;; \
+        arm64) gecko_arch="linux-aarch64" ;; \
+        *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    wget -q -O /tmp/geckodriver.tar.gz "https://github.com/mozilla/geckodriver/releases/download/v${GECKODRIVER_VERSION}/geckodriver-v${GECKODRIVER_VERSION}-${gecko_arch}.tar.gz"; \
+    tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin; \
+    rm /tmp/geckodriver.tar.gz; \
+    chmod +x /usr/local/bin/geckodriver; \
+    firefox --version; \
+    geckodriver --version
 
 WORKDIR /app
 
