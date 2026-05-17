@@ -32,7 +32,20 @@ INBOX_URL = f"{BASE_URL}/mdd/message-inbox"
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 CONSTRAINED_AREA_SUBJECT_TEMPLATE = "MTP - DAM - Constrained Area Results for {delivery_date}"
 CONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
-MAX_INBOX_PAGES_TO_SEARCH = 25
+PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE = (
+    "MTP - DAM - Participant Portfolio Results for {delivery_date}"
+)
+PARTICIPANT_PORTFOLIO_DATA_SOURCE = "SAPP_MTP_DAM_PARTICIPANT_PORTFOLIO_RESULTS"
+TRADING_INVOICE_SUBJECT_TEMPLATE = (
+    "MTP - Trading Invoice / Credit Note for {delivery_date}"
+)
+TRADING_INVOICE_DATA_SOURCE = "SAPP_MTP_TRADING_INVOICE_CREDIT_NOTE"
+TRADING_INVOICE_HOURLY_DATA_SOURCE = "SAPP_MTP_TRADING_INVOICE_HOURLY_DETAIL"
+TRADING_INVOICE_HOURLY_COLLECTION = "sapp_trading_invoice_hourly_details"
+INTERNAL_COLLECTION_FIELD = "_collection_name"
+INTERNAL_UNIQUE_KEY_FIELDS_FIELD = "_unique_key_fields"
+INTERNAL_UNSET_FIELDS_FIELD = "_unset_fields"
+MAX_INBOX_PAGES_TO_SEARCH = 50
 INBOX_GRID_READY_TIMEOUT = 10
 INBOX_PAGE_CHANGE_TIMEOUT = 10
 MESSAGE_CLICK_TIMEOUT = 3
@@ -119,6 +132,288 @@ def to_float(value) -> Optional[float]:
         return float(str(value).replace(",", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def normalize_excel_header(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip()).lower()
+
+
+def find_delivery_date_in_sheet(sheet) -> Optional[date]:
+    for row in sheet.iter_rows(min_row=1, max_row=50, values_only=True):
+        if not row:
+            continue
+        for idx, value in enumerate(row):
+            if isinstance(value, str) and value.strip() == "Delivery Date:":
+                candidate = row[idx + 1] if idx + 1 < len(row) else None
+                return parse_delivery_date_value(candidate)
+    return None
+
+
+def safe_divide(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return numerator / denominator
+
+
+def get_label_value(sheet, label: str):
+    for row in sheet.iter_rows(values_only=True):
+        for idx, value in enumerate(row):
+            if isinstance(value, str) and value.strip() == label:
+                return row[idx + 1] if idx + 1 < len(row) else None
+    return None
+
+
+def find_summary_value_columns(sheet) -> tuple[int, int, Optional[int]]:
+    for row in sheet.iter_rows(values_only=True):
+        normalized = [normalize_excel_header(value) for value in row]
+        if "mwh" in normalized and "total" in normalized:
+            mwh_col = normalized.index("mwh")
+            total_col = normalized.index("total")
+            price_col = (
+                normalized.index("usd/mwh")
+                if "usd/mwh" in normalized
+                else None
+            )
+            return mwh_col, total_col, price_col
+    raise RuntimeError("Could not find invoice summary value columns.")
+
+
+def get_summary_row_values(
+    sheet,
+    label: str,
+    mwh_col: int,
+    total_col: int,
+    price_col: Optional[int],
+) -> dict:
+    for row in sheet.iter_rows(values_only=True):
+        if not row:
+            continue
+        first_cell = row[0] if len(row) > 0 else None
+        if not isinstance(first_cell, str) or first_cell.strip() != label:
+            continue
+
+        mwh = to_float(row[mwh_col] if mwh_col < len(row) else None)
+        amount = to_float(row[total_col] if total_col < len(row) else None)
+        workbook_average_price = (
+            to_float(row[price_col])
+            if price_col is not None and price_col < len(row)
+            else None
+        )
+        return {
+            "mwh": mwh,
+            "amount_usd": amount,
+            "average_price_usd_per_mwh": (
+                workbook_average_price
+                if workbook_average_price is not None
+                else safe_divide(amount, mwh)
+            ),
+        }
+
+    return {
+        "mwh": None,
+        "amount_usd": None,
+        "average_price_usd_per_mwh": None,
+    }
+
+
+def build_invoice_market_section(
+    sheet,
+    market_label: str,
+    mwh_col: int,
+    total_col: int,
+    price_col: Optional[int],
+) -> dict:
+    purchases = get_summary_row_values(
+        sheet,
+        f"{market_label} Total Purchases",
+        mwh_col,
+        total_col,
+        price_col,
+    )
+    sales = get_summary_row_values(
+        sheet,
+        f"{market_label} Total Sales",
+        mwh_col,
+        total_col,
+        price_col,
+    )
+
+    purchase_mwh = purchases["mwh"] or 0.0
+    purchase_amount = purchases["amount_usd"] or 0.0
+    sales_mwh = sales["mwh"] or 0.0
+    sales_amount = sales["amount_usd"] or 0.0
+    net_mwh = purchase_mwh - sales_mwh
+    net_amount = purchase_amount + sales_amount
+
+    has_purchases = purchase_mwh != 0.0 or purchase_amount != 0.0
+    has_sales = sales_mwh != 0.0 or sales_amount != 0.0
+
+    if has_purchases and (
+        not has_sales or abs(purchase_amount) >= abs(sales_amount)
+    ):
+        direction = "PURCHASE"
+        display_mwh = purchase_mwh
+        display_amount = purchase_amount
+    elif has_sales:
+        direction = "SALE"
+        display_mwh = sales_mwh
+        display_amount = sales_amount
+    else:
+        direction = "NONE"
+        display_mwh = max(purchase_mwh, sales_mwh)
+        display_amount = max(purchase_amount, sales_amount)
+
+    return {
+        "direction": direction,
+        "mwh": display_mwh,
+        "amount_usd": display_amount,
+        "average_price_usd_per_mwh": safe_divide(display_amount, display_mwh),
+        "purchases": purchases,
+        "sales": sales,
+        "net_mwh": net_mwh,
+        "net_amount_usd": net_amount,
+        "net_average_price_usd_per_mwh": safe_divide(abs(net_amount), abs(net_mwh)),
+    }
+
+
+def has_invoice_section_activity(section: dict) -> bool:
+    return any(
+        (section.get(group, {}).get(field) or 0.0) != 0.0
+        for group in ("purchases", "sales")
+        for field in ("mwh", "amount_usd")
+    )
+
+
+def find_detail_header_columns(sheet) -> Optional[dict[str, int]]:
+    header_row_index = None
+    normalized_headers = None
+    rows = list(sheet.iter_rows(values_only=True))
+    for row_idx, row in enumerate(rows, start=1):
+        normalized = [normalize_excel_header(value) for value in row]
+        if (
+            "traded purchases" in normalized
+            or "traded sales" in normalized
+            or "purchase turnover" in normalized
+        ):
+            header_row_index = row_idx
+            normalized_headers = normalized
+            break
+
+    if header_row_index is None or normalized_headers is None:
+        return None
+
+    hour_col = (
+        normalized_headers.index("hour")
+        if "hour" in normalized_headers
+        else None
+    )
+    if hour_col is None and header_row_index < len(rows):
+        next_row = rows[header_row_index]
+        normalized_next_row = [normalize_excel_header(value) for value in next_row]
+        if "hour" in normalized_next_row:
+            hour_col = normalized_next_row.index("hour")
+
+    def find_col(header: str) -> Optional[int]:
+        return (
+            normalized_headers.index(header)
+            if header in normalized_headers
+            else None
+        )
+
+    wheeling_col = None
+    for col_idx, header in enumerate(normalized_headers):
+        if (
+            header.endswith(" wheeling cost")
+            and "total wheeling cost" not in header
+            and "apportionment" not in header
+        ):
+            wheeling_col = col_idx
+            break
+
+    return {
+        "header_row": header_row_index,
+        "hour": hour_col,
+        "price": find_col("price"),
+        "traded_purchases_mwh": find_col("traded purchases"),
+        "traded_sales_mwh": find_col("traded sales"),
+        "purchase_turnover_usd": find_col("purchase turnover"),
+        "sale_turnover_usd": find_col("sale turnover"),
+        "admin_fees_usd": find_col("admin fees"),
+        "wheeling_cost_usd": wheeling_col,
+    }
+
+
+def extract_trading_invoice_hourly_details(
+    workbook,
+    delivery_date: date,
+    file_path: Path,
+) -> list[dict]:
+    detail_records = []
+    for sheet in workbook.worksheets:
+        if "details" not in sheet.title.lower():
+            continue
+
+        columns = find_detail_header_columns(sheet)
+        if not columns or columns["hour"] is None:
+            continue
+
+        market = sheet.title.replace(" Details", "").strip().lower().replace("-", "_")
+        for row in sheet.iter_rows(
+            min_row=columns["header_row"] + 1,
+            values_only=True,
+        ):
+            hour_col = columns["hour"]
+            if not row or hour_col >= len(row) or row[hour_col] is None:
+                continue
+
+            hour = parse_hour(row[hour_col])
+            if hour is None:
+                continue
+
+            def get_number(field_name: str) -> Optional[float]:
+                col_idx = columns[field_name]
+                if col_idx is None or col_idx >= len(row):
+                    return None
+                return to_float(row[col_idx])
+
+            values = {
+                "price_usd_per_mwh": get_number("price"),
+                "traded_purchases_mwh": get_number("traded_purchases_mwh"),
+                "traded_sales_mwh": get_number("traded_sales_mwh"),
+                "purchase_turnover_usd": get_number("purchase_turnover_usd"),
+                "sale_turnover_usd": get_number("sale_turnover_usd"),
+                "admin_fees_usd": get_number("admin_fees_usd"),
+                "wheeling_cost_usd": get_number("wheeling_cost_usd"),
+            }
+            if all(value is None for value in values.values()):
+                continue
+
+            detail_records.append(
+                {
+                    INTERNAL_COLLECTION_FIELD: TRADING_INVOICE_HOURLY_COLLECTION,
+                    INTERNAL_UNIQUE_KEY_FIELDS_FIELD: (
+                        "delivery_date",
+                        "market",
+                        "hour",
+                    ),
+                    "timestamp": delivery_timestamp(delivery_date, hour),
+                    "delivery_date": delivery_date.isoformat(),
+                    "market": market,
+                    "hour": hour,
+                    "hour_label": str(row[hour_col]).strip(),
+                    **values,
+                    "metadata": {
+                        "data_source": TRADING_INVOICE_HOURLY_DATA_SOURCE,
+                        "source_file": file_path.name,
+                        "market": market,
+                    },
+                    "source_file": file_path.name,
+                }
+            )
+
+    return detail_records
 
 
 def delivery_timestamp(delivery_date: date, hour: int) -> datetime:
@@ -616,6 +911,344 @@ def extract_constrained_area_job(file_path: Path, job: SappExtractionJob) -> lis
     return extract_constrained_area_results(file_path, data_source=job.data_source)
 
 
+def extract_participant_portfolio_results(
+    file_path: Path,
+    data_source: str = PARTICIPANT_PORTFOLIO_DATA_SOURCE,
+) -> list[dict]:
+    print(
+        "[7/7] Extracting SAPP participant portfolio rows from downloaded file: "
+        f"{file_path.name}"
+    )
+    workbook = openpyxl.load_workbook(file_path, data_only=True)
+
+    required_headers = {
+        "hour": "hour",
+        "participant_total_area_schedule_mwh": "participant total area schedule (mwh)",
+        "area_price_usd_per_mwh": "area price (usd/mwh)",
+        "unconstrained_market_price_usd_per_mwh": "unconstrained market price (usd/mwh)",
+        "total_dam_turnover_mwh": "total dam turnover (mwh)",
+    }
+
+    target_sheet = None
+    header_row_index = None
+    column_indexes = None
+    for sheet in workbook.worksheets:
+        for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            normalized = [normalize_excel_header(value) for value in row]
+            indexes = {}
+            for field_name, header in required_headers.items():
+                try:
+                    indexes[field_name] = normalized.index(header)
+                except ValueError:
+                    indexes = {}
+                    break
+            if indexes:
+                target_sheet = sheet
+                header_row_index = row_idx
+                column_indexes = indexes
+                break
+        if target_sheet is not None:
+            break
+
+    if target_sheet is None or header_row_index is None or column_indexes is None:
+        raise RuntimeError("Could not find the participant portfolio hourly data header row.")
+
+    delivery_date = find_delivery_date_in_sheet(target_sheet)
+    if delivery_date is None:
+        for sheet in workbook.worksheets:
+            delivery_date = find_delivery_date_in_sheet(sheet)
+            if delivery_date is not None:
+                break
+
+    if delivery_date is None:
+        raise RuntimeError("Could not find the delivery date in the downloaded file.")
+
+    records = []
+    for row in target_sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
+        hour_col = column_indexes["hour"]
+        if not row or hour_col >= len(row) or row[hour_col] is None:
+            continue
+
+        hour = parse_hour(row[hour_col])
+        if hour is None:
+            continue
+
+        def cell(field_name: str):
+            col_idx = column_indexes[field_name]
+            return row[col_idx] if col_idx < len(row) else None
+
+        records.append(
+            {
+                "timestamp": delivery_timestamp(delivery_date, hour),
+                "delivery_date": delivery_date.isoformat(),
+                "hour": hour,
+                "hour_label": str(row[hour_col]).strip(),
+                "participant_total_area_schedule_mwh": to_float(
+                    cell("participant_total_area_schedule_mwh")
+                ),
+                "area_price_usd_per_mwh": to_float(cell("area_price_usd_per_mwh")),
+                "unconstrained_market_price_usd_per_mwh": to_float(
+                    cell("unconstrained_market_price_usd_per_mwh")
+                ),
+                "total_dam_turnover_mwh": to_float(cell("total_dam_turnover_mwh")),
+                "metadata": {
+                    "data_source": data_source,
+                    "source_file": file_path.name,
+                },
+                "source_file": file_path.name,
+            }
+        )
+
+    if not records:
+        raise RuntimeError("No hourly rows were extracted from the downloaded file.")
+
+    extracted_hours = {record["hour"] for record in records}
+    expected_hours = set(range(1, 25))
+    if extracted_hours != expected_hours:
+        missing_hours = sorted(expected_hours - extracted_hours)
+        extra_hours = sorted(extracted_hours - expected_hours)
+        raise RuntimeError(
+            "Expected 24 hourly participant portfolio rows for the delivery day, "
+            f"but extracted {len(records)}. "
+            f"Missing hours: {missing_hours or 'none'}. "
+            f"Unexpected hours: {extra_hours or 'none'}."
+        )
+
+    return records
+
+
+def extract_participant_portfolio_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
+    return extract_participant_portfolio_results(file_path, data_source=job.data_source)
+
+
+def extract_trading_invoice_results(
+    file_path: Path,
+    data_source: str = TRADING_INVOICE_DATA_SOURCE,
+) -> list[dict]:
+    print(
+        "[7/7] Extracting SAPP trading invoice rows from downloaded file: "
+        f"{file_path.name}"
+    )
+    workbook = openpyxl.load_workbook(file_path, data_only=True)
+    summary_sheet = None
+    for sheet in workbook.worksheets:
+        labels = {
+            str(row[0]).strip()
+            for row in sheet.iter_rows(values_only=True)
+            if row and row[0] is not None
+        }
+        if "Net Amount Traded" in labels and "Total Amount Due" in labels:
+            summary_sheet = sheet
+            break
+
+    if summary_sheet is None:
+        raise RuntimeError("Could not find the invoice summary sheet.")
+
+    delivery_date = find_delivery_date_in_sheet(summary_sheet)
+    if delivery_date is None:
+        raise RuntimeError("Could not find the delivery date in the downloaded file.")
+
+    mwh_col, total_col, price_col = find_summary_value_columns(summary_sheet)
+    market_sections = {
+        "fpm_m": build_invoice_market_section(
+            summary_sheet,
+            "FPM-M",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+        "fpm_w": build_invoice_market_section(
+            summary_sheet,
+            "FPM-W",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+        "dam": build_invoice_market_section(
+            summary_sheet,
+            "DAM",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+        "idm": build_invoice_market_section(
+            summary_sheet,
+            "IDM",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+    }
+    active_market_sections = {
+        market: section
+        for market, section in market_sections.items()
+        if has_invoice_section_activity(section)
+    }
+    balancing_market = {
+        "up_regulation_activated": get_summary_row_values(
+            summary_sheet,
+            "BM Total Up Regulation Activated",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+        "down_regulation_supplied": get_summary_row_values(
+            summary_sheet,
+            "BM Total Down Regulation Supplied",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+        "up_regulation_supplied": get_summary_row_values(
+            summary_sheet,
+            "BM Total Up Regulation Supplied",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+        "down_regulation_activated": get_summary_row_values(
+            summary_sheet,
+            "BM Total Down Regulation Activated",
+            mwh_col,
+            total_col,
+            price_col,
+        ),
+    }
+
+    total_purchases = get_summary_row_values(
+        summary_sheet,
+        "Total Purchases",
+        mwh_col,
+        total_col,
+        price_col,
+    )
+    total_sales = get_summary_row_values(
+        summary_sheet,
+        "Total Sales",
+        mwh_col,
+        total_col,
+        price_col,
+    )
+    net_amount_traded = get_summary_row_values(
+        summary_sheet,
+        "Net Amount Traded",
+        mwh_col,
+        total_col,
+        price_col,
+    )["amount_usd"]
+    admin_fee = get_summary_row_values(
+        summary_sheet,
+        "Total Admin Fee",
+        mwh_col,
+        total_col,
+        price_col,
+    )
+    wheeling_fee = get_summary_row_values(
+        summary_sheet,
+        "Total Wheeling Fee",
+        mwh_col,
+        total_col,
+        price_col,
+    )["amount_usd"]
+    losses_fee = get_summary_row_values(
+        summary_sheet,
+        "Total Losses Fee",
+        mwh_col,
+        total_col,
+        price_col,
+    )["amount_usd"]
+    total_fees = get_summary_row_values(
+        summary_sheet,
+        "Total Fees",
+        mwh_col,
+        total_col,
+        price_col,
+    )["amount_usd"]
+    total_amount_due = get_summary_row_values(
+        summary_sheet,
+        "Total Amount Due",
+        mwh_col,
+        total_col,
+        price_col,
+    )["amount_usd"]
+
+    gross_total_mwh = sum(
+        section["mwh"] or 0.0 for section in active_market_sections.values()
+    )
+    gross_total_amount = sum(
+        section["amount_usd"] or 0.0 for section in active_market_sections.values()
+    )
+    total_expenditure = (
+        gross_total_amount
+        + (wheeling_fee or 0.0)
+        + (admin_fee["amount_usd"] or 0.0)
+    )
+    confirmed_trade_type = (
+        "PURCHASE"
+        if (net_amount_traded or 0.0) > 0
+        else "SALE"
+        if (net_amount_traded or 0.0) < 0
+        else "NONE"
+    )
+
+    record = {
+        "timestamp": datetime.combine(delivery_date, datetime.min.time()),
+        "delivery_date": delivery_date.isoformat(),
+        INTERNAL_UNSET_FIELDS_FIELD: (
+            "sections",
+            "company",
+            "participant",
+            "portfolio",
+            "attention",
+            "contact",
+            "country",
+            "security_requirement_usd",
+            *(
+                market
+                for market in ("fpm_m", "fpm_w", "dam", "idm")
+                if market not in active_market_sections
+            ),
+        ),
+        "currency": get_label_value(summary_sheet, "Currency:"),
+        "market_turnover_usd": to_float(get_label_value(summary_sheet, "Market Turnover:")),
+        "confirmed_trade_type": confirmed_trade_type,
+        "balancing_market": balancing_market,
+        "total_purchases": total_purchases,
+        "total_sales": total_sales,
+        "net_amount_traded_usd": net_amount_traded,
+        "admin_fee_mwh": admin_fee["mwh"],
+        "admin_fee_usd": admin_fee["amount_usd"],
+        "wheeling_fee_usd": wheeling_fee,
+        "losses_fee_usd": losses_fee,
+        "total_fees_usd": total_fees,
+        "total_amount_due_usd": total_amount_due,
+        "gross_total_mwh": gross_total_mwh,
+        "gross_total_amount_usd": gross_total_amount,
+        "gross_average_price_usd_per_mwh": safe_divide(
+            gross_total_amount,
+            gross_total_mwh,
+        ),
+        "total_expenditure_usd": total_expenditure,
+        "sapp_net_turnover_usd": total_fees,
+        "metadata": {
+            "data_source": data_source,
+            "source_file": file_path.name,
+        },
+        "source_file": file_path.name,
+    }
+    for market, section in active_market_sections.items():
+        record[market] = section
+
+    return [
+        record,
+        *extract_trading_invoice_hourly_details(workbook, delivery_date, file_path),
+    ]
+
+
+def extract_trading_invoice_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
+    return extract_trading_invoice_results(file_path, data_source=job.data_source)
+
+
 def build_unique_filter(record: dict, unique_key_fields: tuple[str, ...]) -> dict:
     missing_fields = [field for field in unique_key_fields if field not in record]
     if missing_fields:
@@ -632,34 +1265,74 @@ def store_records_in_database(records: list[dict], job: SappExtractionJob) -> di
     from app.db.database import get_db
 
     db = get_db()
-    collection = db[job.collection_name]
     now = datetime.now(timezone.utc)
 
-    operations = []
+    grouped_records = {}
     for record in records:
-        operations.append(
-            UpdateOne(
-                build_unique_filter(record, job.unique_key_fields),
-                {
-                    "$set": {
-                        **record,
-                        "updated_at": now,
-                    },
-                    "$setOnInsert": {
-                        "created_at": now,
-                    },
-                },
-                upsert=True,
-            )
+        record_to_store = dict(record)
+        collection_name = record_to_store.pop(
+            INTERNAL_COLLECTION_FIELD,
+            job.collection_name,
+        )
+        unique_key_fields = record_to_store.pop(
+            INTERNAL_UNIQUE_KEY_FIELDS_FIELD,
+            job.unique_key_fields,
+        )
+        unset_fields = record_to_store.pop(INTERNAL_UNSET_FIELDS_FIELD, ())
+        grouped_records.setdefault((collection_name, unique_key_fields), []).append(
+            (record_to_store, unset_fields)
         )
 
-    result = collection.bulk_write(operations, ordered=False)
+    imported = 0
+    updated = 0
+    for (collection_name, unique_key_fields), collection_items in grouped_records.items():
+        collection = db[collection_name]
+        operations = []
+        for record, unset_fields in collection_items:
+            update_document = {
+                "$set": {
+                    **record,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "created_at": now,
+                },
+            }
+            if unset_fields:
+                update_document["$unset"] = {field: "" for field in unset_fields}
+
+            operations.append(
+                UpdateOne(
+                    build_unique_filter(record, unique_key_fields),
+                    update_document,
+                    upsert=True,
+                )
+            )
+
+        result = collection.bulk_write(operations, ordered=False)
+        imported += result.upserted_count
+        updated += result.matched_count
+
+    stored_records = [
+        {
+            key: value
+            for key, value in record.items()
+            if key
+            not in (
+                INTERNAL_COLLECTION_FIELD,
+                INTERNAL_UNIQUE_KEY_FIELDS_FIELD,
+                INTERNAL_UNSET_FIELDS_FIELD,
+            )
+        }
+        for record in records
+    ]
+    summary_record = stored_records[0]
     return {
         "job": job.name,
-        "delivery_date": records[0]["delivery_date"],
-        "imported": result.upserted_count,
-        "updated": result.matched_count,
-        "source_file": records[0].get("source_file", ""),
+        "delivery_date": summary_record["delivery_date"],
+        "imported": imported,
+        "updated": updated,
+        "source_file": summary_record.get("source_file", ""),
     }
 
 
@@ -711,8 +1384,28 @@ CONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
     extractor=extract_constrained_area_job,
 )
 
+PARTICIPANT_PORTFOLIO_RESULTS_JOB = SappExtractionJob(
+    name="participant_portfolio_results",
+    subject_template=PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE,
+    data_source=PARTICIPANT_PORTFOLIO_DATA_SOURCE,
+    collection_name="sapp_participant_portfolio_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_participant_portfolio_job,
+)
+
+TRADING_INVOICE_RESULTS_JOB = SappExtractionJob(
+    name="trading_invoice_credit_note",
+    subject_template=TRADING_INVOICE_SUBJECT_TEMPLATE,
+    data_source=TRADING_INVOICE_DATA_SOURCE,
+    collection_name="sapp_trading_invoice_credit_notes",
+    unique_key_fields=("delivery_date",),
+    extractor=extract_trading_invoice_job,
+)
+
 SAPP_EXTRACTION_JOBS: dict[str, SappExtractionJob] = {
     CONSTRAINED_AREA_RESULTS_JOB.name: CONSTRAINED_AREA_RESULTS_JOB,
+    PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_RESULTS_JOB,
+    TRADING_INVOICE_RESULTS_JOB.name: TRADING_INVOICE_RESULTS_JOB,
 }
 
 

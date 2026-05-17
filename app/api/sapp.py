@@ -11,8 +11,14 @@ from app.db.database import get_db
 from app.schemas.sapp import (
     SappConstrainedAreaResultList,
     SappConstrainedAreaResultResponse,
+    SappParticipantPortfolioResultList,
+    SappParticipantPortfolioResultResponse,
     SappScrapeRangeResponse,
     SappScrapeResponse,
+    SappTradingInvoiceCreditNoteList,
+    SappTradingInvoiceCreditNoteResponse,
+    SappTradingInvoiceHourlyDetailList,
+    SappTradingInvoiceHourlyDetailResponse,
 )
 from sapp_scraper import (
     SAPP_EXTRACTION_JOBS,
@@ -39,7 +45,7 @@ def _serialize_result(record: dict) -> dict:
     return record
 
 
-def _build_constrained_area_filter(
+def _build_sapp_time_filter(
     delivery_date: Optional[date],
     start_time: Optional[datetime],
     end_time: Optional[datetime],
@@ -115,7 +121,7 @@ def _aggregate_constrained_area_results(
             [
                 {"$match": query_filter},
                 group_stage,
-                {"$sort": {"_id": -1}},
+                {"$sort": {"_id": 1}},
                 {"$skip": skip},
                 {"$limit": limit},
                 {
@@ -240,7 +246,7 @@ def scrape_sapp_results_for_date_range(
 @router.get("/constrained-area-results", response_model=SappConstrainedAreaResultList)
 def list_constrained_area_results(
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(1000, ge=1, le=1000),
     delivery_date: Optional[date] = Query(None),
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
@@ -255,13 +261,13 @@ def list_constrained_area_results(
     db = get_db()
     collection = db["sapp_constrained_area_results"]
 
-    query_filter = _build_constrained_area_filter(delivery_date, start_time, end_time)
+    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
 
     if frequency == "1h":
         total = collection.count_documents(query_filter)
         records = list(
             collection.find(query_filter)
-            .sort("timestamp", -1)
+            .sort("timestamp", 1)
             .skip(skip)
             .limit(limit)
         )
@@ -303,3 +309,289 @@ def get_constrained_area_results_for_day(delivery_date: date):
         raise HTTPException(status_code=404, detail="No SAPP results found for this date")
 
     return [_serialize_result(record) for record in records]
+
+
+@router.get(
+    "/participant-portfolio-results",
+    response_model=SappParticipantPortfolioResultList,
+)
+def list_participant_portfolio_results(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(1000, ge=1, le=1000),
+    delivery_date: Optional[date] = Query(None),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+):
+    """
+    List SAPP participant portfolio results with optional date filtering.
+    """
+    db = get_db()
+    collection = db["sapp_participant_portfolio_results"]
+
+    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    total = collection.count_documents(query_filter)
+    records = list(
+        collection.find(query_filter)
+        .sort("timestamp", 1)
+        .skip(skip)
+        .limit(limit)
+    )
+    records = [_serialize_result(record) for record in records]
+
+    page = (skip // limit) + 1
+    return SappParticipantPortfolioResultList(
+        records=records,
+        total=total,
+        page=page,
+        page_size=limit,
+    )
+
+
+@router.post(
+    "/participant-portfolio-results/scrape",
+    response_model=SappScrapeResponse,
+    summary="Scrape one SAPP participant portfolio document locally",
+)
+def scrape_participant_portfolio_results(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Delivery date to fetch. Defaults to today's date if omitted.",
+    ),
+):
+    """Download, parse, and upsert one SAPP participant portfolio document."""
+    try:
+        job = get_extraction_job("participant_portfolio_results")
+        result = run_extraction_job(job, delivery_date=delivery_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@router.post(
+    "/participant-portfolio-results/scrape-range",
+    response_model=SappScrapeRangeResponse,
+    summary="Scrape multiple SAPP participant portfolio documents locally",
+)
+def scrape_participant_portfolio_results_for_date_range(
+    start_date: date = Query(..., description="First delivery date to fetch."),
+    end_date: date = Query(..., description="Last delivery date to fetch, inclusive."),
+    continue_on_error: bool = Query(
+        True,
+        description="Continue with later dates if one date fails.",
+    ),
+):
+    """Download, parse, and upsert SAPP participant portfolio documents for a date range."""
+    try:
+        job = get_extraction_job("participant_portfolio_results")
+        result = run_extraction_job_for_date_range(
+            job,
+            start_date=start_date,
+            end_date=end_date,
+            continue_on_error=continue_on_error,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@router.get(
+    "/participant-portfolio-results/{delivery_date}",
+    response_model=list[SappParticipantPortfolioResultResponse],
+)
+def get_participant_portfolio_results_for_day(delivery_date: date):
+    """Get all hourly SAPP participant portfolio results for one delivery date."""
+    db = get_db()
+    collection = db["sapp_participant_portfolio_results"]
+
+    start = datetime.combine(delivery_date, time.min)
+    end = datetime.combine(delivery_date, time.max)
+    records = list(
+        collection.find({"timestamp": {"$gte": start, "$lte": end}})
+        .sort("timestamp", 1)
+    )
+    if not records:
+        raise HTTPException(
+            status_code=404,
+            detail="No SAPP participant portfolio results found for this date",
+        )
+
+    return [_serialize_result(record) for record in records]
+
+
+@router.get(
+    "/trading-invoice-credit-notes",
+    response_model=SappTradingInvoiceCreditNoteList,
+)
+def list_trading_invoice_credit_notes(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(1000, ge=1, le=1000),
+    delivery_date: Optional[date] = Query(None),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+):
+    """
+    List SAPP trading invoice / credit note summaries with optional date filtering.
+    """
+    db = get_db()
+    collection = db["sapp_trading_invoice_credit_notes"]
+
+    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    total = collection.count_documents(query_filter)
+    records = list(
+        collection.find(query_filter)
+        .sort("timestamp", 1)
+        .skip(skip)
+        .limit(limit)
+    )
+    records = [_serialize_result(record) for record in records]
+
+    page = (skip // limit) + 1
+    return SappTradingInvoiceCreditNoteList(
+        records=records,
+        total=total,
+        page=page,
+        page_size=limit,
+    )
+
+
+@router.post(
+    "/trading-invoice-credit-notes/scrape",
+    response_model=SappScrapeResponse,
+    summary="Scrape one SAPP trading invoice / credit note Excel document locally",
+)
+def scrape_trading_invoice_credit_note(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Delivery date to fetch. Defaults to today's date if omitted.",
+    ),
+):
+    """Download, parse, and upsert one SAPP trading invoice / credit note workbook."""
+    try:
+        job = get_extraction_job("trading_invoice_credit_note")
+        result = run_extraction_job(job, delivery_date=delivery_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@router.post(
+    "/trading-invoice-credit-notes/scrape-range",
+    response_model=SappScrapeRangeResponse,
+    summary="Scrape multiple SAPP trading invoice / credit note Excel documents locally",
+)
+def scrape_trading_invoice_credit_notes_for_date_range(
+    start_date: date = Query(..., description="First delivery date to fetch."),
+    end_date: date = Query(..., description="Last delivery date to fetch, inclusive."),
+    continue_on_error: bool = Query(
+        True,
+        description="Continue with later dates if one date fails.",
+    ),
+):
+    """Download, parse, and upsert SAPP trading invoice / credit note workbooks."""
+    try:
+        job = get_extraction_job("trading_invoice_credit_note")
+        result = run_extraction_job_for_date_range(
+            job,
+            start_date=start_date,
+            end_date=end_date,
+            continue_on_error=continue_on_error,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@router.get(
+    "/trading-invoice-credit-notes/hourly-details",
+    response_model=SappTradingInvoiceHourlyDetailList,
+)
+def list_trading_invoice_hourly_details(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(1000, ge=1, le=1000),
+    delivery_date: Optional[date] = Query(None),
+    market: Optional[str] = Query(None),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+):
+    """
+    List hourly SAPP trading invoice detail rows with optional date and market filtering.
+    """
+    db = get_db()
+    collection = db["sapp_trading_invoice_hourly_details"]
+
+    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    if market:
+        query_filter["market"] = market
+
+    total = collection.count_documents(query_filter)
+    records = list(
+        collection.find(query_filter)
+        .sort([("timestamp", 1), ("market", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    records = [_serialize_result(record) for record in records]
+
+    page = (skip // limit) + 1
+    return SappTradingInvoiceHourlyDetailList(
+        records=records,
+        total=total,
+        page=page,
+        page_size=limit,
+    )
+
+
+@router.get(
+    "/trading-invoice-credit-notes/{delivery_date}/hourly-details",
+    response_model=list[SappTradingInvoiceHourlyDetailResponse],
+)
+def get_trading_invoice_hourly_details_for_day(
+    delivery_date: date,
+    market: Optional[str] = Query(None),
+):
+    """Get hourly SAPP trading invoice detail rows for one delivery date."""
+    db = get_db()
+    collection = db["sapp_trading_invoice_hourly_details"]
+
+    query_filter = {"delivery_date": delivery_date.isoformat()}
+    if market:
+        query_filter["market"] = market
+
+    records = list(
+        collection.find(query_filter)
+        .sort([("timestamp", 1), ("market", 1)])
+    )
+    if not records:
+        raise HTTPException(
+            status_code=404,
+            detail="No SAPP trading invoice hourly details found for this date",
+        )
+
+    return [_serialize_result(record) for record in records]
+
+
+@router.get(
+    "/trading-invoice-credit-notes/{delivery_date}",
+    response_model=SappTradingInvoiceCreditNoteResponse,
+)
+def get_trading_invoice_credit_note_for_day(delivery_date: date):
+    """Get one SAPP trading invoice / credit note summary for a delivery date."""
+    db = get_db()
+    collection = db["sapp_trading_invoice_credit_notes"]
+
+    record = collection.find_one({"delivery_date": delivery_date.isoformat()})
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail="No SAPP trading invoice / credit note found for this date",
+        )
+
+    return _serialize_result(record)
