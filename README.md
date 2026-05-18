@@ -69,6 +69,13 @@ GET  /sapp/bid-templates
 GET  /sapp/bid-templates/{template_id}
 PATCH /sapp/bid-templates/{template_id}
 DELETE /sapp/bid-templates/{template_id}
+POST /contracts
+GET  /contracts
+GET  /contracts/{contract_id}
+PATCH /contracts/{contract_id}
+DELETE /contracts/{contract_id}
+POST /contracts/{contract_id}/files
+DELETE /contracts/{contract_id}/files/{file_id}
 ```
 
 ## SAPP Examples

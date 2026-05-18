@@ -170,6 +170,23 @@ def _initialize_collections():
         name="idx_sapp_bid_templates_market_updated",
     )
 
+    if "contracts" not in db.list_collection_names():
+        db.create_collection("contracts")
+        print("Created 'contracts' collection")
+    contracts_collection = db["contracts"]
+    contracts_collection.create_index(
+        [("deleted_at", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)],
+        name="idx_contracts_active_created",
+    )
+    contracts_collection.create_index(
+        [("contract_type", ASCENDING), ("firmness", ASCENDING), ("created_at", DESCENDING)],
+        name="idx_contracts_type_firmness_created",
+    )
+    contracts_collection.create_index(
+        [("customer", ASCENDING)],
+        name="idx_contracts_customer",
+    )
+
 
 def get_db():
     """Get MongoDB database reference."""
