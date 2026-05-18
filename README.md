@@ -59,6 +59,16 @@ POST /sapp/scrape
 POST /sapp/scrape-range
 GET  /sapp/constrained-area-results
 GET  /sapp/constrained-area-results/{delivery_date}
+POST /sapp/bids
+GET  /sapp/bids/history
+GET  /sapp/bids/{bid_id}
+PATCH /sapp/bids/{bid_id}
+POST /sapp/bids/{bid_id}/submit
+POST /sapp/bid-templates
+GET  /sapp/bid-templates
+GET  /sapp/bid-templates/{template_id}
+PATCH /sapp/bid-templates/{template_id}
+DELETE /sapp/bid-templates/{template_id}
 ```
 
 ## SAPP Examples
@@ -86,3 +96,13 @@ Supported frequencies:
 ```text
 1h, 4h, 1d, 1w, 1mo, 1y
 ```
+
+## Bid Construction
+
+Supported bid markets are `dam`, `fpm_w`, and `fpm_m`.
+
+- `dam` bids use `delivery_date` and hourly quantity cells with `hour`.
+- `fpm_w` bids use `week_start_date` and product quantity cells with `product`.
+- `fpm_m` bids use `month_start_date` and product quantity cells with `product`.
+
+FPM products are `off_peak`, `peak`, and `standard`.

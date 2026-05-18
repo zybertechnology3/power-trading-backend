@@ -359,7 +359,13 @@ def extract_trading_invoice_hourly_details(
         if not columns or columns["hour"] is None:
             continue
 
-        market = sheet.title.replace(" Details", "").strip().lower().replace("-", "_")
+        market = (
+            sheet.title.replace(" Details", "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
         for row in sheet.iter_rows(
             min_row=columns["header_row"] + 1,
             values_only=True,

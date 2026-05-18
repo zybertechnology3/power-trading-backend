@@ -131,6 +131,45 @@ def _initialize_collections():
         )
         print("Created 'sapp_trading_invoice_hourly_details' collection")
 
+    if "sapp_bids" not in db.list_collection_names():
+        db.create_collection("sapp_bids")
+        print("Created 'sapp_bids' collection")
+    bids_collection = db["sapp_bids"]
+    bids_collection.create_index(
+        [("delivery_date", ASCENDING), ("status", ASCENDING), ("updated_at", DESCENDING)],
+        name="idx_sapp_bids_date_status_updated",
+    )
+    bids_collection.create_index(
+        [("market", ASCENDING), ("period_start_date", ASCENDING), ("status", ASCENDING)],
+        name="idx_sapp_bids_market_period_status",
+    )
+    bids_collection.create_index(
+        [("status", ASCENDING), ("submitted_at", DESCENDING)],
+        name="idx_sapp_bids_status_submitted",
+    )
+    bids_collection.create_index(
+        [("created_at", DESCENDING)],
+        name="idx_sapp_bids_created_at",
+    )
+
+    if "sapp_bid_templates" not in db.list_collection_names():
+        db.create_collection("sapp_bid_templates")
+        print("Created 'sapp_bid_templates' collection")
+    bid_templates_collection = db["sapp_bid_templates"]
+    bid_templates_collection.create_index(
+        [("name_key", ASCENDING)],
+        unique=True,
+        name="idx_sapp_bid_templates_name_key_unique",
+    )
+    bid_templates_collection.create_index(
+        [("updated_at", DESCENDING)],
+        name="idx_sapp_bid_templates_updated_at",
+    )
+    bid_templates_collection.create_index(
+        [("market", ASCENDING), ("updated_at", DESCENDING)],
+        name="idx_sapp_bid_templates_market_updated",
+    )
+
 
 def get_db():
     """Get MongoDB database reference."""
