@@ -70,7 +70,10 @@ def _serialize_contract(record: dict) -> dict:
         "firmness": record["firmness"],
         "capacity_mw": record["capacity_mw"],
         "tariff_energy_usd_per_mwh": record["tariff_energy_usd_per_mwh"],
-        "tariff_overall_usd_per_mwh": record["tariff_overall_usd_per_mwh"],
+        "tariff_demand_usd_per_mw_month": record.get(
+            "tariff_demand_usd_per_mw_month"
+        ),
+        "tariff_overall_usd_per_mwh": None,
         "indexation_formula": record["indexation_formula"],
         "ppi_series": record["ppi_series"],
         "custom_fields": record.get("custom_fields", []),

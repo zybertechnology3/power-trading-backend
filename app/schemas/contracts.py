@@ -42,7 +42,7 @@ class ContractCreate(BaseModel):
     firmness: Firmness
     capacity_mw: float = Field(..., ge=0)
     tariff_energy_usd_per_mwh: float = Field(..., ge=0)
-    tariff_overall_usd_per_mwh: float = Field(..., ge=0)
+    tariff_demand_usd_per_mw_month: float = Field(..., ge=0)
     ppi_series: str = Field(..., min_length=1)
     custom_fields: list[ContractCustomField] = Field(default_factory=list)
 
@@ -65,7 +65,7 @@ class ContractUpdate(BaseModel):
     firmness: Optional[Firmness] = None
     capacity_mw: Optional[float] = Field(None, ge=0)
     tariff_energy_usd_per_mwh: Optional[float] = Field(None, ge=0)
-    tariff_overall_usd_per_mwh: Optional[float] = Field(None, ge=0)
+    tariff_demand_usd_per_mw_month: Optional[float] = Field(None, ge=0)
     ppi_series: Optional[str] = Field(None, min_length=1)
     custom_fields: Optional[list[ContractCustomField]] = None
 
@@ -91,7 +91,8 @@ class ContractResponse(BaseModel):
     firmness: Firmness
     capacity_mw: float
     tariff_energy_usd_per_mwh: float
-    tariff_overall_usd_per_mwh: float
+    tariff_demand_usd_per_mw_month: Optional[float] = None
+    tariff_overall_usd_per_mwh: Optional[float] = None
     indexation_formula: str
     ppi_series: str
     custom_fields: list[ContractCustomField] = Field(default_factory=list)
