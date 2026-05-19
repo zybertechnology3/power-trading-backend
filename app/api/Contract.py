@@ -4,7 +4,8 @@ Customer contract endpoints.
 
 import base64
 import json
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -61,12 +62,18 @@ def _decode_cursor(cursor: str) -> dict:
 
 
 def _serialize_contract(record: dict) -> dict:
+    effective_date = record["effective_date"]
+    expiration_date = record.get("expiration_date") or effective_date
     return {
         "id": str(record["_id"]),
         "customer": record["customer"],
         "contract_type": record["contract_type"],
-        "effective_date": record["effective_date"],
-        "duration": record["duration"],
+        "effective_date": effective_date,
+        "expiration_date": expiration_date,
+        "duration": record.get("duration") or _derive_duration_text(
+            _parse_contract_date(effective_date),
+            _parse_contract_date(expiration_date),
+        ),
         "firmness": record["firmness"],
         "capacity_mw": record["capacity_mw"],
         "tariff_energy_usd_per_mwh": record["tariff_energy_usd_per_mwh"],
@@ -76,6 +83,7 @@ def _serialize_contract(record: dict) -> dict:
         "tariff_overall_usd_per_mwh": None,
         "indexation_formula": record["indexation_formula"],
         "ppi_series": record["ppi_series"],
+        "expiration_reminder": record.get("expiration_reminder"),
         "custom_fields": record.get("custom_fields", []),
         "files": record.get("files", []),
         "created_at": record["created_at"],
@@ -90,6 +98,58 @@ def _contract_collection():
 
 def _active_contract_filter() -> dict:
     return {"deleted_at": {"$exists": False}}
+
+
+def _parse_contract_date(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(value)
+
+
+def _add_months(value: date, months: int) -> date:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    month_lengths = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day = min(value.day, month_lengths[month - 1])
+    return date(year, month, day)
+
+
+def _derive_duration_text(effective_date: date, expiration_date: date) -> str:
+    return f"{effective_date.isoformat()} to {expiration_date.isoformat()}"
+
+
+def _expiration_from_duration(effective_date: date, duration: str) -> Optional[date]:
+    match = re.fullmatch(
+        r"\s*(\d+)\s*(day|days|week|weeks|month|months|year|years)\s*",
+        duration,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("day"):
+        return effective_date + timedelta(days=amount) - timedelta(days=1)
+    if unit.startswith("week"):
+        return effective_date + timedelta(weeks=amount) - timedelta(days=1)
+    if unit.startswith("month"):
+        return _add_months(effective_date, amount) - timedelta(days=1)
+    return _add_months(effective_date, amount * 12) - timedelta(days=1)
+
+
+def _contract_payload_document(payload: ContractCreate) -> dict:
+    document = payload.model_dump()
+    effective_date = payload.effective_date
+    expiration_date = payload.expiration_date
+    document["effective_date"] = effective_date.isoformat()
+    document["expiration_date"] = expiration_date.isoformat()
+    if not document.get("duration"):
+        document["duration"] = _derive_duration_text(effective_date, expiration_date)
+    return document
 
 
 def _upload_contract_file_to_storage(
@@ -128,8 +188,7 @@ def create_contract(payload: ContractCreate):
     collection = _contract_collection()
     now = _utcnow()
     document = {
-        **payload.model_dump(),
-        "effective_date": payload.effective_date.isoformat(),
+        **_contract_payload_document(payload),
         "indexation_formula": DEFAULT_INDEXATION_FORMULA,
         "files": [],
         "created_at": now,
@@ -208,19 +267,50 @@ def update_contract(contract_id: str, payload: ContractUpdate):
     if not update_data:
         raise HTTPException(status_code=400, detail="No contract fields provided")
 
+    collection = _contract_collection()
+    contract_oid = _parse_object_id(contract_id, "contract")
+    existing = collection.find_one({"_id": contract_oid, **_active_contract_filter()})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    effective_date = update_data.get(
+        "effective_date",
+        _parse_contract_date(existing["effective_date"]),
+    )
+    expiration_date = update_data.get(
+        "expiration_date",
+        _parse_contract_date(existing.get("expiration_date") or existing["effective_date"]),
+    )
+
+    if "duration" in update_data and "expiration_date" not in update_data:
+        parsed_expiration_date = _expiration_from_duration(
+            effective_date,
+            update_data["duration"],
+        )
+        if parsed_expiration_date is not None:
+            expiration_date = parsed_expiration_date
+            update_data["expiration_date"] = parsed_expiration_date
+
+    if expiration_date < effective_date:
+        raise HTTPException(
+            status_code=400,
+            detail="expiration_date must be on or after effective_date",
+        )
+
+    if ("effective_date" in update_data or "expiration_date" in update_data) and "duration" not in update_data:
+        update_data["duration"] = _derive_duration_text(effective_date, expiration_date)
+
     if "effective_date" in update_data:
         update_data["effective_date"] = update_data["effective_date"].isoformat()
+    if "expiration_date" in update_data:
+        update_data["expiration_date"] = update_data["expiration_date"].isoformat()
     update_data["updated_at"] = _utcnow()
 
-    collection = _contract_collection()
     record = collection.find_one_and_update(
-        {"_id": _parse_object_id(contract_id, "contract"), **_active_contract_filter()},
+        {"_id": contract_oid, **_active_contract_filter()},
         {"$set": update_data},
         return_document=ReturnDocument.AFTER,
     )
-    if not record:
-        raise HTTPException(status_code=404, detail="Contract not found")
-
     return _serialize_contract(record)
 
 

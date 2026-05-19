@@ -80,7 +80,22 @@ PATCH /contracts/{contract_id}
 DELETE /contracts/{contract_id}
 POST /contracts/{contract_id}/files
 DELETE /contracts/{contract_id}/files/{file_id}
+GET  /resource-forecasting/reservoirs
+POST /resource-forecasting/level-monitoring/fields
+GET  /resource-forecasting/level-monitoring/fields
+PATCH /resource-forecasting/level-monitoring/fields/{field_id}
+POST /resource-forecasting/level-monitoring/records
+GET  /resource-forecasting/level-monitoring/records
+GET  /resource-forecasting/level-monitoring/records/{record_id}
+PATCH /resource-forecasting/level-monitoring/records/{record_id}
+DELETE /resource-forecasting/level-monitoring/records/{record_id}
+GET  /resource-forecasting/level-monitoring/aggregate
 ```
+
+Contract records require `expiration_date`. If `duration` is omitted, the API
+derives it as a date range from `effective_date` to `expiration_date`. Date
+fields can carry reminder preferences for future alert processing via
+`expiration_reminder` or `custom_fields[].reminder`.
 
 ## SAPP Examples
 
@@ -88,12 +103,14 @@ Scrape one delivery date locally:
 
 ```text
 POST /sapp/scrape?job_name=constrained_area_results&delivery_date=2026-05-16
+POST /sapp/scrape?job_name=constrained_area_results&delivery_date=2026-05-16&page_start=12
 ```
 
 Scrape a delivery date range locally:
 
 ```text
 POST /sapp/scrape-range?job_name=constrained_area_results&start_date=2026-05-10&end_date=2026-05-15
+POST /sapp/scrape-range?job_name=constrained_area_results&start_date=2026-05-10&end_date=2026-05-15&page_start=12
 ```
 
 Read constrained area results:
@@ -125,6 +142,8 @@ GET /sapp/time-of-use-periods?delivery_date=2026-05-18
 GET /sapp/time-of-use-periods?start_date=2026-05-18&end_date=2026-05-24
 GET /sapp/bid-trading-period?market=fpm_w&reference_date=2026-05-18
 GET /sapp/bid-trading-period?market=fpm_m&reference_date=2026-05-18
+GET /sapp/bid-trading-period?market=fpm_w&reference_date=2026-05-18&mode=period
+GET /sapp/bid-trading-period?market=fpm_m&reference_date=2026-05-18&mode=period
 ```
 
 For FPM-W, `reference_date` is the bid placement date. Placement before Friday maps
@@ -136,10 +155,61 @@ the monthly deadline maps to the next calendar month. If the last Wednesday
 before the next month is 5 days or fewer before the 1st, the deadline moves to
 the previous Wednesday.
 
+Use `mode=period` when reconstructing a historical or future bid directly for a
+chosen trading week or month. In that mode the `reference_date` is any date
+inside the desired trading period, and placement deadlines are not used to choose
+the period.
+
 Submitted bid/result comparison endpoints:
 
 ```text
 GET /sapp/submitted-bids/summary?market=dam&start_date=2026-05-01&end_date=2026-05-31
 GET /sapp/submitted-bids/{bid_id}/comparison
 GET /sapp/submitted-bids/{bid_id}/comparison?delivery_date=2026-05-18
+```
+
+## Resource Forecasting
+
+Level monitoring currently supports `mps` and `lps` reservoirs.
+
+Create a persistent extra field:
+
+```text
+POST /resource-forecasting/level-monitoring/fields
+{
+  "reservoir": "mps",
+  "label": "Rainfall",
+  "field_type": "number",
+  "unit": "mm"
+}
+```
+
+Create a daily level record:
+
+```text
+POST /resource-forecasting/level-monitoring/records
+{
+  "reservoir": "mps",
+  "record_date": "2026-05-19",
+  "daily_inflow": 120.5,
+  "unaccounted_inflow": 3.2,
+  "reservoir_level_value": 415.8,
+  "reservoir_level_unit": "ft",
+  "custom_fields": {
+    "rainfall": 8.4
+  }
+}
+```
+
+Read records and configured extra fields:
+
+```text
+GET /resource-forecasting/level-monitoring/records?reservoir=mps&start_date=2026-05-01&end_date=2026-05-31&limit=100
+```
+
+Aggregate records:
+
+```text
+GET /resource-forecasting/level-monitoring/aggregate?reservoir=mps&group_by=week
+GET /resource-forecasting/level-monitoring/aggregate?reservoir=lps&group_by=month&start_date=2026-01-01&end_date=2026-12-31
 ```

@@ -20,6 +20,7 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support import expected_conditions as EC
@@ -52,6 +53,12 @@ MESSAGE_CLICK_TIMEOUT = 3
 NEXT_PAGE_SELECTOR = (
     "button.k-pager-nav[title='Go to the next page'], "
     "button.k-pager-nav[aria-label='Go to the next page']"
+)
+PAGE_NUMBER_INPUT_SELECTOR = (
+    "input[role='spinbutton'][title='Page Number'], "
+    "input[aria-label='Type a page number'], "
+    ".k-pager input.k-input-inner, "
+    ".k-pager input[role='spinbutton']"
 )
 INBOX_GRID_SELECTOR = ".k-grid, [role='grid']"
 INBOX_LOADING_SELECTOR = ".k-loading-mask, .k-i-loading, .k-loading-image"
@@ -591,6 +598,32 @@ def inbox_grid_signature(driver) -> str:
         return ""
 
 
+def get_current_inbox_page_number(driver) -> Optional[int]:
+    try:
+        value = driver.execute_script(
+            """
+            const input = document.querySelector(arguments[0]);
+            const selected = document.querySelector(
+                ".k-pager-numbers .k-selected, .k-pager-numbers .k-state-selected, [aria-current='page']"
+            );
+            return (
+                input?.getAttribute("aria-valuenow") ||
+                input?.value ||
+                selected?.textContent?.trim() ||
+                null
+            );
+            """,
+            PAGE_NUMBER_INPUT_SELECTOR,
+        )
+    except WebDriverException:
+        return None
+
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def find_message_on_current_page(driver, target_subject: str):
     try:
         return driver.execute_script(
@@ -699,10 +732,55 @@ def click_next_inbox_page(driver, page_number: int, timeout: int = INBOX_PAGE_CH
     wait_for_inbox_grid_to_settle(driver)
 
 
-def find_message_and_open(driver, target_subject: str):
-    print(f"[5/7] Looking for message with subject: {target_subject}")
+def go_to_inbox_page(driver, page_start: int):
+    if page_start <= 1:
+        return
 
-    for page_number in range(1, MAX_INBOX_PAGES_TO_SEARCH + 1):
+    print(f"[5/7] Jumping to inbox page {page_start}")
+    wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
+    old_signature = inbox_grid_signature(driver)
+
+    try:
+        page_input = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, PAGE_NUMBER_INPUT_SELECTOR))
+        )
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            page_input,
+        )
+        page_input.click()
+        page_input.send_keys(Keys.CONTROL, "a")
+        page_input.send_keys(str(page_start))
+        page_input.send_keys(Keys.ENTER)
+
+        WebDriverWait(driver, INBOX_PAGE_CHANGE_TIMEOUT).until(
+            lambda d: (
+                get_current_inbox_page_number(d) == page_start
+                or inbox_grid_signature(d) != old_signature
+            )
+        )
+        wait_for_inbox_grid_to_settle(driver)
+        current_page = get_current_inbox_page_number(driver)
+        if current_page == page_start or inbox_grid_signature(driver) != old_signature:
+            print(f"[5/7] Inbox page {page_start} loaded")
+            return
+    except (TimeoutException, WebDriverException):
+        print(
+            f"[5/7] Could not jump directly to inbox page {page_start}; "
+            "falling back to next-page navigation"
+        )
+
+    current_page = get_current_inbox_page_number(driver) or 1
+    while current_page < page_start:
+        click_next_inbox_page(driver, current_page)
+        current_page += 1
+
+
+def find_message_and_open(driver, target_subject: str, page_start: int = 1):
+    print(f"[5/7] Looking for message with subject: {target_subject}")
+    go_to_inbox_page(driver, page_start)
+
+    for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
         wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
         message_span = find_message_on_current_page(driver, target_subject)
         if message_span is not None:
@@ -718,8 +796,8 @@ def find_message_and_open(driver, target_subject: str):
         click_next_inbox_page(driver, page_number)
 
     raise RuntimeError(
-        f"Target message not found after searching up to {MAX_INBOX_PAGES_TO_SEARCH} inbox pages: "
-        f"{target_subject}"
+        f"Target message not found after searching up to {MAX_INBOX_PAGES_TO_SEARCH} "
+        f"inbox pages from page {page_start}: {target_subject}"
     )
 
 def wait_for_new_download_file(
@@ -1448,10 +1526,16 @@ def iter_delivery_dates_descending(start_date: date, end_date: date):
 def run_extraction_job(
     job: SappExtractionJob,
     delivery_date: Optional[date] = None,
+    page_start: int = 1,
 ) -> dict:
     delivery_date = delivery_date or datetime.now().date()
+    if page_start < 1:
+        raise ValueError("page_start must be greater than or equal to 1.")
     target_subject = job.build_subject(delivery_date)
-    print(f"Starting SAPP scraper job '{job.name}' for {delivery_date.isoformat()}")
+    print(
+        f"Starting SAPP scraper job '{job.name}' for {delivery_date.isoformat()} "
+        f"from inbox page {page_start}"
+    )
     username, password = load_config()
     with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
@@ -1459,7 +1543,7 @@ def run_extraction_job(
         try:
             login(driver, username, password)
             navigate_to_inbox(driver)
-            find_message_and_open(driver, target_subject)
+            find_message_and_open(driver, target_subject, page_start=page_start)
             downloaded_file = download_attachment(
                 driver,
                 download_dir,
@@ -1467,6 +1551,7 @@ def run_extraction_job(
             )
             records = job.extractor(downloaded_file, job)
             result = store_records_in_database(records, job)
+            result["page_start"] = page_start
             print(f"SAPP scraper completed successfully: {result}")
             return result
         finally:
@@ -1478,7 +1563,10 @@ def run_extraction_job_for_date_range(
     start_date: date,
     end_date: date,
     continue_on_error: bool = True,
+    page_start: int = 1,
 ) -> dict:
+    if page_start < 1:
+        raise ValueError("page_start must be greater than or equal to 1.")
     delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
     pending_by_subject = {
         job.build_subject(delivery_date): delivery_date
@@ -1487,7 +1575,7 @@ def run_extraction_job_for_date_range(
     print(
         f"Starting SAPP scraper job '{job.name}' for date range "
         f"{start_date.isoformat()} to {end_date.isoformat()} "
-        f"from newest to oldest"
+        f"from newest to oldest, starting at inbox page {page_start}"
     )
 
     username, password = load_config()
@@ -1499,8 +1587,9 @@ def run_extraction_job_for_date_range(
         try:
             login(driver, username, password)
             navigate_to_inbox(driver)
+            go_to_inbox_page(driver, page_start)
 
-            for page_number in range(1, MAX_INBOX_PAGES_TO_SEARCH + 1):
+            for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
                 if not pending_by_subject:
                     break
 
@@ -1584,7 +1673,8 @@ def run_extraction_job_for_date_range(
                     "status": "failed",
                     "error": (
                         "Target message not found after searching up to "
-                        f"{MAX_INBOX_PAGES_TO_SEARCH} inbox pages: {target_subject}"
+                        f"{MAX_INBOX_PAGES_TO_SEARCH} inbox pages from page "
+                        f"{page_start}: {target_subject}"
                     ),
                 }
                 results.append(failure)
@@ -1600,6 +1690,7 @@ def run_extraction_job_for_date_range(
         "job": job.name,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
+        "page_start": page_start,
         "requested_dates": len(delivery_dates),
         "successful_dates": len(successful_results),
         "failed_dates": len(failed_results),
@@ -1609,8 +1700,12 @@ def run_extraction_job_for_date_range(
     }
 
 
-def run_scraper(delivery_date: Optional[date] = None) -> dict:
-    return run_extraction_job(CONSTRAINED_AREA_RESULTS_JOB, delivery_date=delivery_date)
+def run_scraper(delivery_date: Optional[date] = None, page_start: int = 1) -> dict:
+    return run_extraction_job(
+        CONSTRAINED_AREA_RESULTS_JOB,
+        delivery_date=delivery_date,
+        page_start=page_start,
+    )
 
 
 def main():

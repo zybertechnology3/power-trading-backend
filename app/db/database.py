@@ -187,6 +187,40 @@ def _initialize_collections():
         name="idx_contracts_customer",
     )
 
+    if "resource_level_monitoring_records" not in db.list_collection_names():
+        db.create_collection("resource_level_monitoring_records")
+        print("Created 'resource_level_monitoring_records' collection")
+    level_records_collection = db["resource_level_monitoring_records"]
+    level_records_collection.create_index(
+        [("reservoir", ASCENDING), ("record_date", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        partialFilterExpression={"deleted_at": {"$exists": False}},
+        name="idx_resource_level_records_reservoir_date_unique",
+    )
+    level_records_collection.create_index(
+        [("reservoir", ASCENDING), ("record_date", DESCENDING), ("_id", DESCENDING)],
+        name="idx_resource_level_records_reservoir_date",
+    )
+    level_records_collection.create_index(
+        [("created_at", DESCENDING)],
+        name="idx_resource_level_records_created_at",
+    )
+
+    if "resource_level_monitoring_fields" not in db.list_collection_names():
+        db.create_collection("resource_level_monitoring_fields")
+        print("Created 'resource_level_monitoring_fields' collection")
+    level_fields_collection = db["resource_level_monitoring_fields"]
+    level_fields_collection.create_index(
+        [("reservoir", ASCENDING), ("key", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        partialFilterExpression={"deleted_at": {"$exists": False}},
+        name="idx_resource_level_fields_reservoir_key_unique",
+    )
+    level_fields_collection.create_index(
+        [("reservoir", ASCENDING), ("created_at", ASCENDING)],
+        name="idx_resource_level_fields_reservoir_created",
+    )
+
 
 def get_db():
     """Get MongoDB database reference."""

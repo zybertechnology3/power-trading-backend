@@ -14,7 +14,7 @@ if __package__ in (None, ""):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import Contract, health, sapp, telemetry
+from app.api import Contract, health, resource_forecasting, sapp, telemetry
 from app.core.config import settings
 from app.db.database import connect_db, disconnect_db
 
@@ -69,6 +69,7 @@ app.include_router(health.router)
 app.include_router(telemetry.router)
 app.include_router(sapp.router)
 app.include_router(Contract.router)
+app.include_router(resource_forecasting.router)
 
 
 # ===== ROOT ENDPOINT =====

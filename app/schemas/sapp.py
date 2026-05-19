@@ -528,6 +528,7 @@ class SappScrapeResponse(BaseModel):
 
     job: str = "constrained_area_results"
     delivery_date: date
+    page_start: Optional[int] = None
     imported: int
     updated: int
     source_file: str
@@ -551,6 +552,7 @@ class SappScrapeRangeResponse(BaseModel):
     job: str = "constrained_area_results"
     start_date: date
     end_date: date
+    page_start: Optional[int] = None
     requested_dates: int
     successful_dates: int
     failed_dates: int

@@ -5,13 +5,30 @@ Pydantic schemas for customer contracts.
 from datetime import date, datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 ContractType = Literal["ppa", "wheeling"]
 Firmness = Literal["firm", "non-firm"]
+ContractCustomFieldType = Literal["text", "number", "date", "boolean", "json"]
+ReminderDurationUnit = Literal["day", "week", "month", "year"]
 
 DEFAULT_INDEXATION_FORMULA = "T(n) = T(0) × (1 + α·ΔCPI + β·ΔPPI + γ·ΔFX)"
+
+
+class ContractReminderOffset(BaseModel):
+    """Relative reminder duration such as 1 month or 2 weeks."""
+
+    value: int = Field(..., ge=1)
+    unit: ReminderDurationUnit
+
+
+class ContractFieldReminder(BaseModel):
+    """Reminder preferences stored with a date field for future alert processing."""
+
+    enabled: bool = True
+    start_before: ContractReminderOffset
+    repeat_interval: Optional[ContractReminderOffset] = None
 
 
 class ContractCustomField(BaseModel):
@@ -19,7 +36,15 @@ class ContractCustomField(BaseModel):
 
     id: Optional[str] = None
     label: Optional[str] = None
+    field_type: ContractCustomFieldType = "text"
     value: Any = None
+    reminder: Optional[ContractFieldReminder] = None
+
+    @model_validator(mode="after")
+    def validate_reminder_field_type(self):
+        if self.reminder is not None and self.field_type != "date":
+            raise ValueError("reminder can only be set on date custom fields")
+        return self
 
 
 class ContractFileMetadata(BaseModel):
@@ -38,12 +63,14 @@ class ContractCreate(BaseModel):
     customer: str = Field(..., min_length=1)
     contract_type: ContractType
     effective_date: date
-    duration: str = Field(..., min_length=1)
+    expiration_date: date
+    duration: Optional[str] = Field(None, min_length=1)
     firmness: Firmness
     capacity_mw: float = Field(..., ge=0)
     tariff_energy_usd_per_mwh: float = Field(..., ge=0)
     tariff_demand_usd_per_mw_month: float = Field(..., ge=0)
     ppi_series: str = Field(..., min_length=1)
+    expiration_reminder: Optional[ContractFieldReminder] = None
     custom_fields: list[ContractCustomField] = Field(default_factory=list)
 
     @field_validator("customer", "duration", "ppi_series")
@@ -54,6 +81,12 @@ class ContractCreate(BaseModel):
             raise ValueError("field must not be blank")
         return stripped_value
 
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.expiration_date < self.effective_date:
+            raise ValueError("expiration_date must be on or after effective_date")
+        return self
+
 
 class ContractUpdate(BaseModel):
     """Partial update for a customer contract."""
@@ -61,12 +94,14 @@ class ContractUpdate(BaseModel):
     customer: Optional[str] = Field(None, min_length=1)
     contract_type: Optional[ContractType] = None
     effective_date: Optional[date] = None
+    expiration_date: Optional[date] = None
     duration: Optional[str] = Field(None, min_length=1)
     firmness: Optional[Firmness] = None
     capacity_mw: Optional[float] = Field(None, ge=0)
     tariff_energy_usd_per_mwh: Optional[float] = Field(None, ge=0)
     tariff_demand_usd_per_mw_month: Optional[float] = Field(None, ge=0)
     ppi_series: Optional[str] = Field(None, min_length=1)
+    expiration_reminder: Optional[ContractFieldReminder] = None
     custom_fields: Optional[list[ContractCustomField]] = None
 
     @field_validator("customer", "duration", "ppi_series")
@@ -87,6 +122,7 @@ class ContractResponse(BaseModel):
     customer: str
     contract_type: ContractType
     effective_date: date
+    expiration_date: date
     duration: str
     firmness: Firmness
     capacity_mw: float
@@ -95,6 +131,7 @@ class ContractResponse(BaseModel):
     tariff_overall_usd_per_mwh: Optional[float] = None
     indexation_formula: str
     ppi_series: str
+    expiration_reminder: Optional[ContractFieldReminder] = None
     custom_fields: list[ContractCustomField] = Field(default_factory=list)
     files: list[ContractFileMetadata] = Field(default_factory=list)
     created_at: datetime

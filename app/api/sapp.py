@@ -153,6 +153,11 @@ def _fpm_week_start_from_placement(reference_date: date) -> date:
     return next_monday
 
 
+def _fpm_week_start_from_period_date(reference_date: date) -> date:
+    days_since_monday = (reference_date.weekday() - MONDAY) % 7
+    return reference_date - timedelta(days=days_since_monday)
+
+
 def _fpm_week_bid_deadline(week_start_date: date) -> date:
     return week_start_date - timedelta(days=3)
 
@@ -175,6 +180,10 @@ def _fpm_month_start_from_placement(reference_date: date) -> date:
     if reference_date <= deadline:
         return next_month_start
     return _add_one_month(next_month_start)
+
+
+def _fpm_month_start_from_period_date(reference_date: date) -> date:
+    return date(reference_date.year, reference_date.month, 1)
 
 
 def _fpm_month_end(month_start_date: date) -> date:
@@ -697,6 +706,13 @@ def get_time_of_use_periods(
 def get_bid_trading_period(
     market: SappBidMarket = Query(...),
     reference_date: date = Query(...),
+    mode: Literal["placement", "period"] = Query(
+        "placement",
+        description=(
+            "placement applies bid deadline rules; period resolves the trading "
+            "period containing reference_date for reconstruction."
+        ),
+    ),
 ):
     """Resolve the bid trading period from a bid placement/reference date."""
     if market == "dam":
@@ -705,18 +721,25 @@ def get_bid_trading_period(
         request_date_field = "delivery_date"
         bid_deadline_date = reference_date
     elif market == "fpm_w":
-        period_start_date = _fpm_week_start_from_placement(reference_date)
+        if mode == "period":
+            period_start_date = _fpm_week_start_from_period_date(reference_date)
+        else:
+            period_start_date = _fpm_week_start_from_placement(reference_date)
         period_end_date = period_start_date + timedelta(days=6)
         request_date_field = "week_start_date"
         bid_deadline_date = _fpm_week_bid_deadline(period_start_date)
     else:
-        period_start_date = _fpm_month_start_from_placement(reference_date)
+        if mode == "period":
+            period_start_date = _fpm_month_start_from_period_date(reference_date)
+        else:
+            period_start_date = _fpm_month_start_from_placement(reference_date)
         period_end_date = _fpm_month_end(period_start_date)
         request_date_field = "month_start_date"
         bid_deadline_date = _fpm_month_bid_deadline(period_start_date)
 
     return {
         "market": market,
+        "mode": mode,
         "reference_date": reference_date.isoformat(),
         "bid_deadline_date": bid_deadline_date.isoformat(),
         "period_start_date": period_start_date.isoformat(),
@@ -1131,11 +1154,20 @@ def scrape_sapp_results(
         "constrained_area_results",
         description="SAPP extraction job to run.",
     ),
+    page_start: int = Query(
+        1,
+        ge=1,
+        description="Inbox page number to start searching from.",
+    ),
 ):
     """Download, parse, and upsert one SAPP document. Run locally."""
     try:
         job = get_extraction_job(job_name)
-        result = run_extraction_job(job, delivery_date=delivery_date)
+        result = run_extraction_job(
+            job,
+            delivery_date=delivery_date,
+            page_start=page_start,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1167,6 +1199,11 @@ def scrape_sapp_results_for_date_range(
         True,
         description="Continue with later dates if one date fails.",
     ),
+    page_start: int = Query(
+        1,
+        ge=1,
+        description="Inbox page number to start searching from.",
+    ),
 ):
     """Download, parse, and upsert SAPP documents for a date range. Run locally."""
     try:
@@ -1176,6 +1213,7 @@ def scrape_sapp_results_for_date_range(
             start_date=start_date,
             end_date=end_date,
             continue_on_error=continue_on_error,
+            page_start=page_start,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1298,11 +1336,20 @@ def scrape_participant_portfolio_results(
         None,
         description="Delivery date to fetch. Defaults to today's date if omitted.",
     ),
+    page_start: int = Query(
+        1,
+        ge=1,
+        description="Inbox page number to start searching from.",
+    ),
 ):
     """Download, parse, and upsert one SAPP participant portfolio document."""
     try:
         job = get_extraction_job("participant_portfolio_results")
-        result = run_extraction_job(job, delivery_date=delivery_date)
+        result = run_extraction_job(
+            job,
+            delivery_date=delivery_date,
+            page_start=page_start,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1322,6 +1369,11 @@ def scrape_participant_portfolio_results_for_date_range(
         True,
         description="Continue with later dates if one date fails.",
     ),
+    page_start: int = Query(
+        1,
+        ge=1,
+        description="Inbox page number to start searching from.",
+    ),
 ):
     """Download, parse, and upsert SAPP participant portfolio documents for a date range."""
     try:
@@ -1331,6 +1383,7 @@ def scrape_participant_portfolio_results_for_date_range(
             start_date=start_date,
             end_date=end_date,
             continue_on_error=continue_on_error,
+            page_start=page_start,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1409,11 +1462,20 @@ def scrape_trading_invoice_credit_note(
         None,
         description="Delivery date to fetch. Defaults to today's date if omitted.",
     ),
+    page_start: int = Query(
+        1,
+        ge=1,
+        description="Inbox page number to start searching from.",
+    ),
 ):
     """Download, parse, and upsert one SAPP trading invoice / credit note workbook."""
     try:
         job = get_extraction_job("trading_invoice_credit_note")
-        result = run_extraction_job(job, delivery_date=delivery_date)
+        result = run_extraction_job(
+            job,
+            delivery_date=delivery_date,
+            page_start=page_start,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1433,6 +1495,11 @@ def scrape_trading_invoice_credit_notes_for_date_range(
         True,
         description="Continue with later dates if one date fails.",
     ),
+    page_start: int = Query(
+        1,
+        ge=1,
+        description="Inbox page number to start searching from.",
+    ),
 ):
     """Download, parse, and upsert SAPP trading invoice / credit note workbooks."""
     try:
@@ -1442,6 +1509,7 @@ def scrape_trading_invoice_credit_notes_for_date_range(
             start_date=start_date,
             end_date=end_date,
             continue_on_error=continue_on_error,
+            page_start=page_start,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

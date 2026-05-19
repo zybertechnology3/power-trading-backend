@@ -1,0 +1,223 @@
+Implement the frontend integration for the new Resource Forecasting > Level Monitoring backend endpoints.
+
+Base route prefix:
+/resource-forecasting
+
+Reservoirs:
+GET /resource-forecasting/reservoirs
+
+Returns:
+[
+  { "code": "mps", "name": "MPS" },
+  { "code": "lps", "name": "LPS" }
+]
+
+Use this to allow switching between MPS and LPS.
+
+Persistent extra fields:
+POST /resource-forecasting/level-monitoring/fields
+
+Body:
+{
+  "reservoir": "mps",
+  "label": "Rainfall",
+  "field_type": "number",
+  "unit": "mm"
+}
+
+Optional body field:
+key: string
+
+If key is omitted, the backend generates it from the label.
+
+Returns:
+{
+  "id": "...",
+  "reservoir": "mps",
+  "key": "rainfall",
+  "label": "Rainfall",
+  "field_type": "number",
+  "unit": "mm",
+  "created_at": "...",
+  "updated_at": "..."
+}
+
+GET /resource-forecasting/level-monitoring/fields?reservoir=mps
+
+Returns:
+[
+  {
+    "id": "...",
+    "reservoir": "mps",
+    "key": "rainfall",
+    "label": "Rainfall",
+    "field_type": "number",
+    "unit": "mm",
+    "created_at": "...",
+    "updated_at": "..."
+  }
+]
+
+PATCH /resource-forecasting/level-monitoring/fields/{field_id}
+
+Body can contain:
+{
+  "label": "Rainfall",
+  "field_type": "number",
+  "unit": "mm"
+}
+
+Daily level records:
+POST /resource-forecasting/level-monitoring/records
+
+Body:
+{
+  "reservoir": "mps",
+  "record_date": "2026-05-19",
+  "daily_inflow": 120.5,
+  "unaccounted_inflow": 3.2,
+  "reservoir_level_value": 415.8,
+  "reservoir_level_unit": "ft",
+  "custom_fields": {
+    "rainfall": 8.4
+  }
+}
+
+reservoir must be "mps" or "lps".
+reservoir_level_unit must be "ft" or "m3".
+total_daily_inflow is calculated by the backend as daily_inflow + unaccounted_inflow.
+custom_fields keys must match fields created for that reservoir.
+
+Returns:
+{
+  "id": "...",
+  "reservoir": "mps",
+  "record_date": "2026-05-19",
+  "daily_inflow": 120.5,
+  "unaccounted_inflow": 3.2,
+  "total_daily_inflow": 123.7,
+  "reservoir_level_value": 415.8,
+  "reservoir_level_unit": "ft",
+  "reservoir_level_ft": 415.8,
+  "reservoir_level_m3": null,
+  "custom_fields": {
+    "rainfall": 8.4
+  },
+  "created_at": "...",
+  "updated_at": "..."
+}
+
+If reservoir_level_unit is "m3", reservoir_level_m3 is populated and reservoir_level_ft is null.
+The ft/m3 conversion formula is not implemented yet, so do not expect both values to be populated.
+
+List records:
+GET /resource-forecasting/level-monitoring/records?reservoir=mps&start_date=2026-05-01&end_date=2026-05-31&limit=100
+
+Query params:
+reservoir: required, "mps" | "lps"
+start_date: optional ISO date
+end_date: optional ISO date
+limit: optional, default 100
+cursor: optional
+page: optional
+
+If no start_date/end_date is set, return records within the limit.
+
+Returns:
+{
+  "records": [
+    {
+      "id": "...",
+      "reservoir": "mps",
+      "record_date": "2026-05-19",
+      "daily_inflow": 120.5,
+      "unaccounted_inflow": 3.2,
+      "total_daily_inflow": 123.7,
+      "reservoir_level_value": 415.8,
+      "reservoir_level_unit": "ft",
+      "reservoir_level_ft": 415.8,
+      "reservoir_level_m3": null,
+      "custom_fields": {
+        "rainfall": 8.4
+      },
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "fields": [
+    {
+      "id": "...",
+      "reservoir": "mps",
+      "key": "rainfall",
+      "label": "Rainfall",
+      "field_type": "number",
+      "unit": "mm",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "next_cursor": null
+}
+
+Important: use the fields array to render persistent extra columns. Every added extra field should always appear for that reservoir. Older records may have null custom field values.
+
+Fetch one:
+GET /resource-forecasting/level-monitoring/records/{record_id}
+
+Returns the same single record shape as POST.
+
+Update one:
+PATCH /resource-forecasting/level-monitoring/records/{record_id}
+
+Partial body example:
+{
+  "daily_inflow": 130,
+  "unaccounted_inflow": 4,
+  "reservoir_level_value": 416.2,
+  "reservoir_level_unit": "ft",
+  "custom_fields": {
+    "rainfall": 9.1
+  }
+}
+
+Returns the updated record. total_daily_inflow is recalculated by the backend.
+
+Delete one:
+DELETE /resource-forecasting/level-monitoring/records/{record_id}
+
+Returns:
+{
+  "deleted": true
+}
+
+Aggregation:
+GET /resource-forecasting/level-monitoring/aggregate?reservoir=mps&group_by=week
+GET /resource-forecasting/level-monitoring/aggregate?reservoir=mps&group_by=month&start_date=2026-01-01&end_date=2026-12-31
+GET /resource-forecasting/level-monitoring/aggregate?reservoir=mps&group_by=year
+
+Query params:
+reservoir: required, "mps" | "lps"
+group_by: required, "week" | "month" | "year"
+start_date: optional ISO date
+end_date: optional ISO date
+
+Returns:
+{
+  "records": [
+    {
+      "reservoir": "mps",
+      "group_by": "week",
+      "period_start_date": "2026-05-18",
+      "period_end_date": "2026-05-24",
+      "record_count": 7,
+      "daily_inflow": 840.5,
+      "unaccounted_inflow": 20.2,
+      "total_daily_inflow": 860.7,
+      "avg_reservoir_level_ft": 415.9,
+      "avg_reservoir_level_m3": null
+    }
+  ]
+}
+
+Aggregation sums daily_inflow, unaccounted_inflow, and total_daily_inflow.
+Reservoir level is averaged separately by stored unit. Since conversion is not implemented yet, avg_reservoir_level_ft and avg_reservoir_level_m3 are not merged.
