@@ -118,18 +118,45 @@ DAM_CALCULATION_CONFIGS: dict[DamCalculationCode, DamCalculationConfig] = {
 }
 
 
-def list_dam_calculation_configs() -> list[dict]:
-    """Return lightweight dam calculation configuration for frontend setup."""
+def dam_calculation_config_to_dict(
+    config: DamCalculationConfig,
+    include_lookup: bool = False,
+) -> dict:
+    """Serialize one dam calculation config for API responses."""
+    result = {
+        "code": config.code,
+        "name": config.name,
+        "min_level_ft": config.min_level_ft,
+        "max_level_ft": config.max_level_ft,
+        "default_current_level_ft": config.default_current_level_ft,
+        "default_evaporation_rate": config.default_evaporation_rate,
+        "default_production_rate_mw": config.default_production_rate_mw,
+    }
+    if include_lookup:
+        result.update(
+            {
+                "dead_storage_volume_m3": config.dead_storage_volume_m3,
+                "fill_reference_volume_m3": config.fill_reference_volume_m3,
+                "energy_m3_per_kwh": config.energy_m3_per_kwh,
+                "generation_factor": config.generation_factor,
+                "lookup_table": [
+                    {
+                        "lower_level_ft": lookup_range.lower_level_ft,
+                        "upper_level_ft": lookup_range.upper_level_ft,
+                        "lower_volume_m3": lookup_range.lower_volume_m3,
+                        "upper_volume_m3": lookup_range.upper_volume_m3,
+                    }
+                    for lookup_range in config.lookup_table
+                ],
+            }
+        )
+    return result
+
+
+def list_dam_calculation_configs(include_lookup: bool = False) -> list[dict]:
+    """Return dam calculation configuration for frontend setup."""
     return [
-        {
-            "code": config.code,
-            "name": config.name,
-            "min_level_ft": config.min_level_ft,
-            "max_level_ft": config.max_level_ft,
-            "default_current_level_ft": config.default_current_level_ft,
-            "default_evaporation_rate": config.default_evaporation_rate,
-            "default_production_rate_mw": config.default_production_rate_mw,
-        }
+        dam_calculation_config_to_dict(config, include_lookup=include_lookup)
         for config in DAM_CALCULATION_CONFIGS.values()
     ]
 

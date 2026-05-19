@@ -598,9 +598,11 @@ def aggregate_level_monitoring_records(
     "/dam-calculation/configs",
     response_model=list[DamCalculationConfigResponse],
 )
-def list_dam_calculation_tool_configs():
+def list_dam_calculation_tool_configs(
+    include_lookup: bool = Query(False),
+):
     """List available dam calculation tool configurations and defaults."""
-    return list_dam_calculation_configs()
+    return list_dam_calculation_configs(include_lookup=include_lookup)
 
 
 @router.post(

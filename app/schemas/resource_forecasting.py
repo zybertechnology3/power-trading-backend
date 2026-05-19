@@ -163,6 +163,15 @@ class LevelMonitoringAggregationResponse(BaseModel):
     records: list[LevelMonitoringAggregationRecord]
 
 
+class DamCalculationLookupRangeResponse(BaseModel):
+    """Selected level/volume range used for interpolation."""
+
+    lower_level_ft: float
+    upper_level_ft: float
+    lower_volume_m3: float
+    upper_volume_m3: float
+
+
 class DamCalculationConfigResponse(BaseModel):
     """Calculation tool configuration for one dam."""
 
@@ -173,15 +182,11 @@ class DamCalculationConfigResponse(BaseModel):
     default_current_level_ft: float
     default_evaporation_rate: float
     default_production_rate_mw: float
-
-
-class DamCalculationLookupRangeResponse(BaseModel):
-    """Selected level/volume range used for interpolation."""
-
-    lower_level_ft: float
-    upper_level_ft: float
-    lower_volume_m3: float
-    upper_volume_m3: float
+    dead_storage_volume_m3: Optional[float] = None
+    fill_reference_volume_m3: Optional[float] = None
+    energy_m3_per_kwh: Optional[float] = None
+    generation_factor: Optional[float] = None
+    lookup_table: Optional[list[DamCalculationLookupRangeResponse]] = None
 
 
 class DamCalculationInputEcho(BaseModel):

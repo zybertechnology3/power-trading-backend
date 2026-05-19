@@ -220,10 +220,12 @@ Dam calculation tool:
 
 ```text
 GET /resource-forecasting/dam-calculation/configs
+GET /resource-forecasting/dam-calculation/configs?include_lookup=true
 ```
 
 Returns available dams and default input values. Supported dam codes are
-`mita_hills` and `mulungushi`.
+`mita_hills` and `mulungushi`. Use `include_lookup=true` to return the full
+lookup tables and calculation constants for client-side calculations.
 
 ```text
 POST /resource-forecasting/dam-calculation/calculate
@@ -237,5 +239,5 @@ POST /resource-forecasting/dam-calculation/calculate
 
 The calculation returns the selected lookup range, calculated dam volume, useful
 dam volume, percentage fill, equivalent energy, and projected generation days and
-months. The lookup tables are stored in `app/core/dam_calculations.py` so the
-calculation runs in memory without database reads.
+months. The lookup tables are stored in `app/core/dam_calculations.py` so both
+the config endpoint and backend calculation run in memory without database reads.
