@@ -14,8 +14,15 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+from app.core.dam_calculations import (
+    calculate_dam_projection,
+    list_dam_calculation_configs,
+)
 from app.db.database import get_db
 from app.schemas.resource_forecasting import (
+    DamCalculationConfigResponse,
+    DamCalculationRequest,
+    DamCalculationResponse,
     LevelMonitoringAggregationRecord,
     LevelMonitoringAggregationResponse,
     LevelMonitoringFieldCreate,
@@ -32,9 +39,11 @@ from app.schemas.resource_forecasting import (
 
 router = APIRouter(prefix="/resource-forecasting", tags=["resource-forecasting"])
 
-RESERVOIRS: dict[ReservoirCode, str] = {
-    "mps": "MPS",
-    "lps": "LPS",
+FT_TO_M3_FACTOR = 2393.89
+
+RESERVOIRS: dict[ReservoirCode, dict[str, float | str]] = {
+    "mps": {"name": "MPS", "max_level_ft": 630.0},
+    "lps": {"name": "LPS", "max_level_ft": 220.0},
 }
 
 
@@ -127,15 +136,60 @@ def _parse_record_date(value: Any) -> date:
     return date.fromisoformat(value)
 
 
+def _ft_to_m3(value: float) -> float:
+    return value * FT_TO_M3_FACTOR
+
+
+def _m3_to_ft(value: float) -> float:
+    return value / FT_TO_M3_FACTOR
+
+
+def _reservoir_max_level_ft(reservoir: ReservoirCode) -> float:
+    return float(RESERVOIRS[reservoir]["max_level_ft"])
+
+
+def _reservoir_max_level_m3(reservoir: ReservoirCode) -> float:
+    return _ft_to_m3(_reservoir_max_level_ft(reservoir))
+
+
+def _level_to_ft(value: float, unit: str) -> float:
+    return value if unit == "ft" else _m3_to_ft(value)
+
+
+def _level_to_m3(value: float, unit: str) -> float:
+    return value if unit == "m3" else _ft_to_m3(value)
+
+
+def _validate_reservoir_level_limit(
+    reservoir: ReservoirCode,
+    value: float,
+    unit: str,
+) -> None:
+    if value < 0:
+        raise HTTPException(status_code=400, detail="reservoir_level_value must be non-negative")
+
+    level_ft = _level_to_ft(value, unit)
+    max_level_ft = _reservoir_max_level_ft(reservoir)
+    if level_ft > max_level_ft:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{reservoir.upper()} reservoir level exceeds the "
+                f"{max_level_ft:g} ft capacity limit"
+            ),
+        )
+
+
 def _record_response(record: dict, field_definitions: Optional[list[dict]] = None) -> dict:
     if field_definitions is None:
         field_definitions = _field_definitions(record["reservoir"])
 
     level_value = record["reservoir_level_value"]
     level_unit = record["reservoir_level_unit"]
+    reservoir = record["reservoir"]
     return {
         "id": str(record["_id"]),
-        "reservoir": record["reservoir"],
+        "reservoir": reservoir,
         "record_date": record["record_date"],
         "daily_inflow": record["daily_inflow"],
         "unaccounted_inflow": record["unaccounted_inflow"],
@@ -145,8 +199,10 @@ def _record_response(record: dict, field_definitions: Optional[list[dict]] = Non
         ),
         "reservoir_level_value": level_value,
         "reservoir_level_unit": level_unit,
-        "reservoir_level_ft": level_value if level_unit == "ft" else None,
-        "reservoir_level_m3": level_value if level_unit == "m3" else None,
+        "reservoir_level_ft": _level_to_ft(level_value, level_unit),
+        "reservoir_level_m3": _level_to_m3(level_value, level_unit),
+        "max_level_ft": _reservoir_max_level_ft(reservoir),
+        "max_level_m3": _reservoir_max_level_m3(reservoir),
         "custom_fields": _custom_fields_with_defaults(
             record.get("custom_fields"),
             field_definitions,
@@ -194,8 +250,13 @@ def _period_bounds(record_date: date, group_by: ResourceAggregationGroup) -> tup
 def list_reservoirs():
     """List reservoirs available for resource forecasting."""
     return [
-        ReservoirInfo(code=reservoir_code, name=name)
-        for reservoir_code, name in RESERVOIRS.items()
+        ReservoirInfo(
+            code=reservoir_code,
+            name=str(reservoir["name"]),
+            max_level_ft=float(reservoir["max_level_ft"]),
+            max_level_m3=_reservoir_max_level_m3(reservoir_code),
+        )
+        for reservoir_code, reservoir in RESERVOIRS.items()
     ]
 
 
@@ -282,6 +343,11 @@ def update_level_monitoring_field(field_id: str, payload: LevelMonitoringFieldUp
 def create_level_monitoring_record(payload: LevelMonitoringRecordCreate):
     """Create a daily level monitoring record."""
     _validate_custom_field_keys(payload.reservoir, payload.custom_fields)
+    _validate_reservoir_level_limit(
+        payload.reservoir,
+        payload.reservoir_level_value,
+        payload.reservoir_level_unit,
+    )
     now = _utcnow()
     document = payload.model_dump()
     document["record_date"] = payload.record_date.isoformat()
@@ -390,6 +456,20 @@ def update_level_monitoring_record(record_id: str, payload: LevelMonitoringRecor
     if "custom_fields" in update_data:
         _validate_custom_field_keys(reservoir, update_data["custom_fields"])
 
+    reservoir_level_value = update_data.get(
+        "reservoir_level_value",
+        existing["reservoir_level_value"],
+    )
+    reservoir_level_unit = update_data.get(
+        "reservoir_level_unit",
+        existing["reservoir_level_unit"],
+    )
+    _validate_reservoir_level_limit(
+        reservoir,
+        reservoir_level_value,
+        reservoir_level_unit,
+    )
+
     daily_inflow = update_data.get("daily_inflow", existing["daily_inflow"])
     unaccounted_inflow = update_data.get(
         "unaccounted_inflow",
@@ -476,11 +556,15 @@ def aggregate_level_monitoring_records(
             record["daily_inflow"] + record["unaccounted_inflow"],
         )
         if record["reservoir_level_unit"] == "ft":
-            group["level_ft_total"] += record["reservoir_level_value"]
-            group["level_ft_count"] += 1
+            level_ft = record["reservoir_level_value"]
+            level_m3 = _ft_to_m3(level_ft)
         else:
-            group["level_m3_total"] += record["reservoir_level_value"]
-            group["level_m3_count"] += 1
+            level_m3 = record["reservoir_level_value"]
+            level_ft = _m3_to_ft(level_m3)
+        group["level_ft_total"] += level_ft
+        group["level_ft_count"] += 1
+        group["level_m3_total"] += level_m3
+        group["level_m3_count"] += 1
 
     response_records = []
     for (period_start, period_end), group in grouped.items():
@@ -508,3 +592,26 @@ def aggregate_level_monitoring_records(
         )
 
     return LevelMonitoringAggregationResponse(records=response_records)
+
+
+@router.get(
+    "/dam-calculation/configs",
+    response_model=list[DamCalculationConfigResponse],
+)
+def list_dam_calculation_tool_configs():
+    """List available dam calculation tool configurations and defaults."""
+    return list_dam_calculation_configs()
+
+
+@router.post(
+    "/dam-calculation/calculate",
+    response_model=DamCalculationResponse,
+)
+def calculate_dam_calculation_tool(payload: DamCalculationRequest):
+    """Calculate dam volume, useful volume, and projected generation duration."""
+    return calculate_dam_projection(
+        dam=payload.dam,
+        current_level_ft=payload.current_level_ft,
+        evaporation_rate=payload.evaporation_rate,
+        production_rate_mw=payload.production_rate_mw,
+    )

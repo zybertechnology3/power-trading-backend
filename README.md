@@ -90,6 +90,8 @@ GET  /resource-forecasting/level-monitoring/records/{record_id}
 PATCH /resource-forecasting/level-monitoring/records/{record_id}
 DELETE /resource-forecasting/level-monitoring/records/{record_id}
 GET  /resource-forecasting/level-monitoring/aggregate
+GET  /resource-forecasting/dam-calculation/configs
+POST /resource-forecasting/dam-calculation/calculate
 ```
 
 Contract records require `expiration_date`. If `duration` is omitted, the API
@@ -213,3 +215,27 @@ Aggregate records:
 GET /resource-forecasting/level-monitoring/aggregate?reservoir=mps&group_by=week
 GET /resource-forecasting/level-monitoring/aggregate?reservoir=lps&group_by=month&start_date=2026-01-01&end_date=2026-12-31
 ```
+
+Dam calculation tool:
+
+```text
+GET /resource-forecasting/dam-calculation/configs
+```
+
+Returns available dams and default input values. Supported dam codes are
+`mita_hills` and `mulungushi`.
+
+```text
+POST /resource-forecasting/dam-calculation/calculate
+{
+  "dam": "mita_hills",
+  "current_level_ft": 216.95,
+  "evaporation_rate": 0.042,
+  "production_rate_mw": 23.24
+}
+```
+
+The calculation returns the selected lookup range, calculated dam volume, useful
+dam volume, percentage fill, equivalent energy, and projected generation days and
+months. The lookup tables are stored in `app/core/dam_calculations.py` so the
+calculation runs in memory without database reads.

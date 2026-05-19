@@ -12,6 +12,7 @@ ReservoirCode = Literal["mps", "lps"]
 ReservoirLevelUnit = Literal["ft", "m3"]
 ResourceCustomFieldType = Literal["text", "number", "date", "boolean", "json"]
 ResourceAggregationGroup = Literal["week", "month", "year"]
+DamCalculationCode = Literal["mita_hills", "mulungushi"]
 
 
 class ReservoirInfo(BaseModel):
@@ -19,6 +20,8 @@ class ReservoirInfo(BaseModel):
 
     code: ReservoirCode
     name: str
+    max_level_ft: float
+    max_level_m3: float
 
 
 class LevelMonitoringFieldCreate(BaseModel):
@@ -124,6 +127,8 @@ class LevelMonitoringRecordResponse(BaseModel):
     reservoir_level_unit: ReservoirLevelUnit
     reservoir_level_ft: Optional[float] = None
     reservoir_level_m3: Optional[float] = None
+    max_level_ft: float
+    max_level_m3: float
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
@@ -156,3 +161,59 @@ class LevelMonitoringAggregationResponse(BaseModel):
     """Aggregated level monitoring list."""
 
     records: list[LevelMonitoringAggregationRecord]
+
+
+class DamCalculationConfigResponse(BaseModel):
+    """Calculation tool configuration for one dam."""
+
+    code: DamCalculationCode
+    name: str
+    min_level_ft: float
+    max_level_ft: float
+    default_current_level_ft: float
+    default_evaporation_rate: float
+    default_production_rate_mw: float
+
+
+class DamCalculationLookupRangeResponse(BaseModel):
+    """Selected level/volume range used for interpolation."""
+
+    lower_level_ft: float
+    upper_level_ft: float
+    lower_volume_m3: float
+    upper_volume_m3: float
+
+
+class DamCalculationInputEcho(BaseModel):
+    """Inputs echoed back with the calculation result."""
+
+    current_level_ft: float
+    evaporation_rate: float
+    production_rate_mw: float
+
+
+class DamCalculationRequest(BaseModel):
+    """Inputs for the dam volume calculation tool."""
+
+    dam: DamCalculationCode = "mita_hills"
+    current_level_ft: float = Field(..., ge=0)
+    evaporation_rate: float = Field(..., ge=0, lt=1)
+    production_rate_mw: float = Field(..., gt=0)
+
+
+class DamCalculationResponse(BaseModel):
+    """Dam volume and generation projection calculation result."""
+
+    dam: DamCalculationCode
+    dam_name: str
+    is_off_range: bool
+    message: Optional[str] = None
+    input: DamCalculationInputEcho
+    lookup_range: Optional[DamCalculationLookupRangeResponse] = None
+    calculated_dam_volume_m3: Optional[float] = None
+    useful_dam_volume_m3: Optional[float] = None
+    percentage_fill: Optional[float] = None
+    equivalent_energy_kwh: Optional[float] = None
+    equivalent_energy_gwh: Optional[float] = None
+    projected_generation_days: Optional[float] = None
+    projected_generation_months: Optional[float] = None
