@@ -60,6 +60,7 @@ POST /sapp/scrape-range
 GET  /sapp/constrained-area-results
 GET  /sapp/constrained-area-results/{delivery_date}
 POST /sapp/bids
+GET  /sapp/time-of-use-periods
 GET  /sapp/bids/history
 GET  /sapp/bids/{bid_id}
 PATCH /sapp/bids/{bid_id}
@@ -113,3 +114,10 @@ Supported bid markets are `dam`, `fpm_w`, and `fpm_m`.
 - `fpm_m` bids use `month_start_date` and product quantity cells with `product`.
 
 FPM products are `off_peak`, `peak`, and `standard`.
+
+Time-of-use period mappings are available from:
+
+```text
+GET /sapp/time-of-use-periods?delivery_date=2026-05-18
+GET /sapp/time-of-use-periods?start_date=2026-05-18&end_date=2026-05-24
+```

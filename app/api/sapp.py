@@ -13,6 +13,11 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pydantic import ValidationError
 
+from app.core.time_of_use import (
+    build_time_of_use_schedule,
+    count_time_of_use_hours,
+    get_time_of_use_period,
+)
 from app.db.database import get_db
 from app.schemas.sapp import (
     BidStatus,
@@ -102,16 +107,21 @@ def _normalize_quantities(quantities) -> list[dict]:
     return normalized_quantities
 
 
-def _calculate_bid_totals(quantities: list[dict]) -> tuple[float, Optional[float]]:
-    total_energy = sum(quantity["energy_mwh"] for quantity in quantities)
+def _calculate_weighted_average_price(
+    weighted_quantities: list[tuple[dict, int]],
+) -> Optional[float]:
+    total_energy = sum(
+        quantity["energy_mwh"] * hour_count
+        for quantity, hour_count in weighted_quantities
+    )
     if total_energy == 0:
-        return 0, None
+        return None
 
     total_value = sum(
-        quantity["energy_mwh"] * quantity["price_usd_per_mwh"]
-        for quantity in quantities
+        quantity["energy_mwh"] * hour_count * quantity["price_usd_per_mwh"]
+        for quantity, hour_count in weighted_quantities
     )
-    return total_energy, total_value / total_energy
+    return total_value / total_energy
 
 
 def _bid_period_range(payload: SappBidCreate) -> tuple[date, date, int]:
@@ -133,8 +143,32 @@ def _bid_period_range(payload: SappBidCreate) -> tuple[date, date, int]:
 
 def _bid_fields_from_payload(payload: SappBidCreate) -> dict:
     quantities = _normalize_quantities(payload.quantities)
-    daily_energy, weighted_average_price = _calculate_bid_totals(quantities)
     period_start_date, period_end_date, delivery_days = _bid_period_range(payload)
+    period_hour_counts = count_time_of_use_hours(period_start_date, period_end_date)
+
+    if payload.market == "dam":
+        weighted_quantities = [(quantity, 1) for quantity in quantities]
+        daily_energy = sum(quantity["energy_mwh"] for quantity in quantities)
+        total_energy = daily_energy
+        period_energy = {"off_peak": 0, "standard": 0, "peak": 0}
+        for quantity in quantities:
+            product = get_time_of_use_period(payload.delivery_date, quantity["hour"])
+            period_energy[product] += quantity["energy_mwh"]
+    else:
+        weighted_quantities = [
+            (quantity, period_hour_counts[quantity["product"]])
+            for quantity in quantities
+        ]
+        total_energy = sum(
+            quantity["energy_mwh"] * hour_count
+            for quantity, hour_count in weighted_quantities
+        )
+        daily_energy = total_energy / delivery_days if delivery_days else 0
+        period_energy = {"off_peak": 0, "standard": 0, "peak": 0}
+        for quantity, hour_count in weighted_quantities:
+            period_energy[quantity["product"]] += quantity["energy_mwh"] * hour_count
+
+    weighted_average_price = _calculate_weighted_average_price(weighted_quantities)
     return {
         "market": payload.market,
         "delivery_date": payload.delivery_date.isoformat()
@@ -149,12 +183,14 @@ def _bid_fields_from_payload(payload: SappBidCreate) -> dict:
         "period_start_date": period_start_date.isoformat(),
         "period_end_date": period_end_date.isoformat(),
         "delivery_days": delivery_days,
+        "period_hour_counts": period_hour_counts,
+        "period_energy_mwh": period_energy,
         "price_columns": payload.price_columns,
         "quantities": quantities,
         "template_id": payload.template_id,
         "notes": payload.notes,
         "daily_energy_mwh": daily_energy,
-        "total_energy_mwh": daily_energy * delivery_days,
+        "total_energy_mwh": total_energy,
         "weighted_average_price_usd_per_mwh": weighted_average_price,
     }
 
@@ -203,6 +239,28 @@ def _ensure_template_matches_market(template_id: Optional[str], market: str) -> 
             status_code=400,
             detail="Template market must match bid market",
         )
+
+
+def _serialize_bid_result(record: dict) -> dict:
+    serialized_record = _serialize_result(record)
+    serialized_record.setdefault("market", "dam")
+    if "delivery_date" in serialized_record:
+        serialized_record.setdefault("period_start_date", serialized_record["delivery_date"])
+        serialized_record.setdefault("period_end_date", serialized_record["delivery_date"])
+    serialized_record.setdefault("delivery_days", 1)
+    serialized_record.setdefault(
+        "period_hour_counts",
+        {"off_peak": 0, "standard": 0, "peak": 0},
+    )
+    serialized_record.setdefault(
+        "period_energy_mwh",
+        {"off_peak": 0, "standard": 0, "peak": 0},
+    )
+    serialized_record.setdefault(
+        "daily_energy_mwh",
+        serialized_record.get("total_energy_mwh", 0),
+    )
+    return serialized_record
 
 
 def _normalize_trading_invoice_market(market: Optional[str]) -> Optional[str]:
@@ -361,7 +419,45 @@ def create_bid(payload: SappBidCreate):
     }
     result = collection.insert_one(document)
     record = collection.find_one({"_id": result.inserted_id})
-    return _serialize_result(record)
+    return _serialize_bid_result(record)
+
+
+@router.get("/time-of-use-periods")
+def get_time_of_use_periods(
+    delivery_date: Optional[date] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+):
+    """Get time-of-use period rules for one date or an inclusive date range."""
+    if delivery_date:
+        if start_date or end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Use either delivery_date or start_date/end_date, not both",
+            )
+        counts = count_time_of_use_hours(delivery_date, delivery_date)
+        return {
+            "delivery_date": delivery_date.isoformat(),
+            "period_hour_counts": counts,
+            "hours": build_time_of_use_schedule(delivery_date),
+        }
+
+    if not start_date or not end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide delivery_date or both start_date and end_date",
+        )
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+        )
+
+    return {
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "period_hour_counts": count_time_of_use_hours(start_date, end_date),
+    }
 
 
 @router.get("/bids/history", response_model=SappBidList)
@@ -399,7 +495,7 @@ def list_bid_history(
         .skip(skip)
         .limit(limit)
     )
-    records = [_serialize_result(record) for record in records]
+    records = [_serialize_bid_result(record) for record in records]
 
     page = (skip // limit) + 1
     return SappBidList(
@@ -419,7 +515,7 @@ def get_bid(bid_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Bid not found")
 
-    return _serialize_result(record)
+    return _serialize_bid_result(record)
 
 
 @router.patch("/bids/{bid_id}", response_model=SappBidResponse)
@@ -475,7 +571,7 @@ def update_bid(bid_id: str, payload: SappBidUpdate):
         {"$set": update_fields},
         return_document=ReturnDocument.AFTER,
     )
-    return _serialize_result(record)
+    return _serialize_bid_result(record)
 
 
 @router.post("/bids/{bid_id}/submit", response_model=SappBidResponse)
@@ -507,7 +603,7 @@ def submit_bid(bid_id: str):
         },
         return_document=ReturnDocument.AFTER,
     )
-    return _serialize_result(record)
+    return _serialize_bid_result(record)
 
 
 @router.post(

@@ -137,6 +137,8 @@ class SappBidResponse(SappBidBase):
     period_start_date: date
     period_end_date: date
     delivery_days: int = Field(1, ge=1)
+    period_hour_counts: dict[SappBidProduct, int] = Field(default_factory=dict)
+    period_energy_mwh: dict[SappBidProduct, float] = Field(default_factory=dict)
     daily_energy_mwh: float = 0
     total_energy_mwh: float = 0
     weighted_average_price_usd_per_mwh: Optional[float] = None
