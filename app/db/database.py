@@ -194,7 +194,6 @@ def _initialize_collections():
     level_records_collection.create_index(
         [("reservoir", ASCENDING), ("record_date", ASCENDING), ("deleted_at", ASCENDING)],
         unique=True,
-        partialFilterExpression={"deleted_at": {"$exists": False}},
         name="idx_resource_level_records_reservoir_date_unique",
     )
     level_records_collection.create_index(
@@ -213,7 +212,6 @@ def _initialize_collections():
     level_fields_collection.create_index(
         [("reservoir", ASCENDING), ("key", ASCENDING), ("deleted_at", ASCENDING)],
         unique=True,
-        partialFilterExpression={"deleted_at": {"$exists": False}},
         name="idx_resource_level_fields_reservoir_key_unique",
     )
     level_fields_collection.create_index(
