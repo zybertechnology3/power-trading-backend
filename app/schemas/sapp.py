@@ -22,7 +22,13 @@ class SappBidQuantity(BaseModel):
         description="FPM period product: off_peak, peak, or standard",
     )
     price_usd_per_mwh: float = Field(..., ge=0, description="Bid price column")
-    energy_mwh: float = Field(..., ge=0, description="Energy to buy at this hour and price")
+    energy_mwh: float = Field(
+        ...,
+        description=(
+            "Energy at this hour/period and price. Positive values buy power; "
+            "negative values sell power."
+        ),
+    )
 
 
 class SappBidBase(BaseModel):

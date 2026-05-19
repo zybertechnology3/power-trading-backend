@@ -104,7 +104,7 @@ def _normalize_quantities(quantities) -> list[dict]:
             if hasattr(quantity, "model_dump")
             else dict(quantity)
         )
-        if quantity_data["energy_mwh"] > 0:
+        if quantity_data["energy_mwh"] != 0:
             normalized_quantities.append(quantity_data)
     return normalized_quantities
 
@@ -112,18 +112,18 @@ def _normalize_quantities(quantities) -> list[dict]:
 def _calculate_weighted_average_price(
     weighted_quantities: list[tuple[dict, int]],
 ) -> Optional[float]:
-    total_energy = sum(
-        quantity["energy_mwh"] * hour_count
+    total_volume = sum(
+        abs(quantity["energy_mwh"]) * hour_count
         for quantity, hour_count in weighted_quantities
     )
-    if total_energy == 0:
+    if total_volume == 0:
         return None
 
     total_value = sum(
-        quantity["energy_mwh"] * hour_count * quantity["price_usd_per_mwh"]
+        abs(quantity["energy_mwh"]) * hour_count * quantity["price_usd_per_mwh"]
         for quantity, hour_count in weighted_quantities
     )
-    return total_value / total_energy
+    return total_value / total_volume
 
 
 def _bid_period_range(payload: SappBidCreate) -> tuple[date, date, int]:
@@ -854,10 +854,10 @@ def submit_bid(bid_id: str):
         raise HTTPException(status_code=404, detail="Bid not found")
     if existing["status"] != "draft":
         raise HTTPException(status_code=409, detail="Bid has already been submitted")
-    if existing.get("total_energy_mwh", 0) <= 0:
+    if not existing.get("quantities"):
         raise HTTPException(
             status_code=400,
-            detail="Cannot submit a bid with no positive energy quantities",
+            detail="Cannot submit a bid with no non-zero energy quantities",
         )
 
     now = _utcnow()
