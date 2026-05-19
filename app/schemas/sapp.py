@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 BidStatus = Literal["draft", "submitted"]
 SappBidMarket = Literal["dam", "fpm_w", "fpm_m"]
 SappBidProduct = Literal["off_peak", "peak", "standard"]
+MONDAY = 0
 
 
 class SappBidQuantity(BaseModel):
@@ -97,7 +98,7 @@ class SappBidBase(BaseModel):
         elif self.market == "fpm_w":
             if self.week_start_date is None:
                 raise ValueError("week_start_date is required for FPM-W bids")
-            if self.week_start_date.weekday() != 0:
+            if self.week_start_date.weekday() != MONDAY:
                 raise ValueError("week_start_date must be a Monday")
             if self.delivery_date is not None or self.month_start_date is not None:
                 raise ValueError("FPM-W bids must not include delivery_date or month_start_date")

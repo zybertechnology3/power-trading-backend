@@ -61,6 +61,7 @@ GET  /sapp/constrained-area-results
 GET  /sapp/constrained-area-results/{delivery_date}
 POST /sapp/bids
 GET  /sapp/time-of-use-periods
+GET  /sapp/bid-trading-period
 GET  /sapp/submitted-bids/summary
 GET  /sapp/submitted-bids/{bid_id}/comparison
 GET  /sapp/bids/history
@@ -112,8 +113,8 @@ Supported frequencies:
 Supported bid markets are `dam`, `fpm_w`, and `fpm_m`.
 
 - `dam` bids use `delivery_date` and hourly quantity cells with `hour`.
-- `fpm_w` bids use `week_start_date` and product quantity cells with `product`.
-- `fpm_m` bids use `month_start_date` and product quantity cells with `product`.
+- `fpm_w` bids use `week_start_date`, which must be a Monday, and product quantity cells with `product`.
+- `fpm_m` bids use `month_start_date`, which must be the first day of the calendar month, and product quantity cells with `product`.
 
 FPM products are `off_peak`, `peak`, and `standard`.
 
@@ -122,7 +123,18 @@ Time-of-use period mappings are available from:
 ```text
 GET /sapp/time-of-use-periods?delivery_date=2026-05-18
 GET /sapp/time-of-use-periods?start_date=2026-05-18&end_date=2026-05-24
+GET /sapp/bid-trading-period?market=fpm_w&reference_date=2026-05-18
+GET /sapp/bid-trading-period?market=fpm_m&reference_date=2026-05-18
 ```
+
+For FPM-W, `reference_date` is the bid placement date. Placement before Friday maps
+to the next Monday-Sunday trading week; Friday or later maps to the following
+Monday-Sunday week.
+
+For FPM-M, `reference_date` is the bid placement date. Placement on or before
+the monthly deadline maps to the next calendar month. If the last Wednesday
+before the next month is 5 days or fewer before the 1st, the deadline moves to
+the previous Wednesday.
 
 Submitted bid/result comparison endpoints:
 

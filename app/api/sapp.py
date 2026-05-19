@@ -2,7 +2,6 @@
 SAPP MTP constrained area result endpoints.
 """
 
-from calendar import monthrange
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, Optional
 
@@ -53,6 +52,9 @@ from sapp_scraper import (
 router = APIRouter(prefix="/sapp", tags=["sapp"])
 
 Frequency = Literal["1h", "4h", "1d", "1w", "1mo", "1y"]
+MONDAY = 0
+FRIDAY = 4
+WEDNESDAY = 2
 TRADING_INVOICE_MARKETS = ("fpm_m", "fpm_w", "dam", "idm", "bm_up", "bm_down")
 TRADING_INVOICE_MARKET_ALIASES = {
     "fpm-m": "fpm_m",
@@ -126,21 +128,68 @@ def _calculate_weighted_average_price(
     return total_value / total_volume
 
 
+def _add_one_month(value: date) -> date:
+    if value.month == 12:
+        return date(value.year + 1, 1, 1)
+    return date(value.year, value.month + 1, 1)
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    next_month_first = _add_one_month(date(year, month, 1))
+    current_date = next_month_first - timedelta(days=1)
+    while current_date.weekday() != weekday:
+        current_date -= timedelta(days=1)
+    return current_date
+
+
+def _fpm_week_start_from_placement(reference_date: date) -> date:
+    days_until_next_monday = (7 - reference_date.weekday()) % 7
+    if days_until_next_monday == 0:
+        days_until_next_monday = 7
+    next_monday = reference_date + timedelta(days=days_until_next_monday)
+
+    if reference_date.weekday() >= FRIDAY:
+        return next_monday + timedelta(days=7)
+    return next_monday
+
+
+def _fpm_week_bid_deadline(week_start_date: date) -> date:
+    return week_start_date - timedelta(days=3)
+
+
+def _fpm_month_bid_deadline(month_start_date: date) -> date:
+    previous_month_last_day = month_start_date - timedelta(days=1)
+    last_wednesday = _last_weekday_of_month(
+        previous_month_last_day.year,
+        previous_month_last_day.month,
+        WEDNESDAY,
+    )
+    if (month_start_date - last_wednesday).days <= 5:
+        return last_wednesday - timedelta(days=7)
+    return last_wednesday
+
+
+def _fpm_month_start_from_placement(reference_date: date) -> date:
+    next_month_start = _add_one_month(date(reference_date.year, reference_date.month, 1))
+    deadline = _fpm_month_bid_deadline(next_month_start)
+    if reference_date <= deadline:
+        return next_month_start
+    return _add_one_month(next_month_start)
+
+
+def _fpm_month_end(month_start_date: date) -> date:
+    return _add_one_month(month_start_date) - timedelta(days=1)
+
+
 def _bid_period_range(payload: SappBidCreate) -> tuple[date, date, int]:
     if payload.market == "dam":
         return payload.delivery_date, payload.delivery_date, 1
     if payload.market == "fpm_w":
         return payload.week_start_date, payload.week_start_date + timedelta(days=6), 7
 
-    days_in_month = monthrange(
-        payload.month_start_date.year,
-        payload.month_start_date.month,
-    )[1]
-    return (
-        payload.month_start_date,
-        payload.month_start_date + timedelta(days=days_in_month - 1),
-        days_in_month,
-    )
+    period_end_date = _fpm_month_end(payload.month_start_date)
+    delivery_days = (period_end_date - payload.month_start_date).days + 1
+    return payload.month_start_date, period_end_date, delivery_days
 
 
 def _bid_fields_from_payload(payload: SappBidCreate) -> dict:
@@ -641,6 +690,44 @@ def get_time_of_use_periods(
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "period_hour_counts": count_time_of_use_hours(start_date, end_date),
+    }
+
+
+@router.get("/bid-trading-period")
+def get_bid_trading_period(
+    market: SappBidMarket = Query(...),
+    reference_date: date = Query(...),
+):
+    """Resolve the bid trading period from a bid placement/reference date."""
+    if market == "dam":
+        period_start_date = reference_date
+        period_end_date = reference_date
+        request_date_field = "delivery_date"
+        bid_deadline_date = reference_date
+    elif market == "fpm_w":
+        period_start_date = _fpm_week_start_from_placement(reference_date)
+        period_end_date = period_start_date + timedelta(days=6)
+        request_date_field = "week_start_date"
+        bid_deadline_date = _fpm_week_bid_deadline(period_start_date)
+    else:
+        period_start_date = _fpm_month_start_from_placement(reference_date)
+        period_end_date = _fpm_month_end(period_start_date)
+        request_date_field = "month_start_date"
+        bid_deadline_date = _fpm_month_bid_deadline(period_start_date)
+
+    return {
+        "market": market,
+        "reference_date": reference_date.isoformat(),
+        "bid_deadline_date": bid_deadline_date.isoformat(),
+        "period_start_date": period_start_date.isoformat(),
+        "period_end_date": period_end_date.isoformat(),
+        "delivery_days": (period_end_date - period_start_date).days + 1,
+        "request_date_field": request_date_field,
+        "request_date_value": period_start_date.isoformat(),
+        "period_hour_counts": count_time_of_use_hours(
+            period_start_date,
+            period_end_date,
+        ),
     }
 
 
