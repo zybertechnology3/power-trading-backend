@@ -23,8 +23,10 @@ from app.schemas.sapp import (
     BidStatus,
     SappBidMarket,
     SappBidCreate,
+    SappBidComparisonResponse,
     SappBidList,
     SappBidResponse,
+    SappSubmittedBidSummaryList,
     SappBidTemplateCreate,
     SappBidTemplateList,
     SappBidTemplateResponse,
@@ -263,6 +265,188 @@ def _serialize_bid_result(record: dict) -> dict:
     return serialized_record
 
 
+def _price_key(price: float) -> str:
+    if float(price).is_integer():
+        return str(int(price))
+    return str(price)
+
+
+def _hour_label(hour: int) -> str:
+    return f"{hour - 1:02d}-{hour:02d}" if hour < 24 else "23-24"
+
+
+def _to_float(value) -> float:
+    return float(value) if value is not None else 0
+
+
+def _date_from_bid_field(bid: dict, field_name: str) -> Optional[date]:
+    value = bid.get(field_name)
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(value)
+
+
+def _bid_date_range(bid: dict) -> tuple[date, date]:
+    start_date = _date_from_bid_field(bid, "period_start_date")
+    end_date = _date_from_bid_field(bid, "period_end_date")
+    if start_date and end_date:
+        return start_date, end_date
+
+    delivery_date = _date_from_bid_field(bid, "delivery_date")
+    if delivery_date:
+        return delivery_date, delivery_date
+
+    raise HTTPException(status_code=400, detail="Bid does not have a usable date range")
+
+
+def _invoice_hourly_records(db, market: str, start_date: date, end_date: date) -> list[dict]:
+    query_filter = {
+        "market": market,
+        "delivery_date": {
+            "$gte": start_date.isoformat(),
+            "$lte": end_date.isoformat(),
+        },
+    }
+    return list(
+        db["sapp_trading_invoice_hourly_details"]
+        .find(query_filter)
+        .sort([("delivery_date", 1), ("hour", 1)])
+    )
+
+
+def _portfolio_hourly_records(db, delivery_date: date) -> list[dict]:
+    return list(
+        db["sapp_participant_portfolio_results"]
+        .find({"delivery_date": delivery_date.isoformat()})
+        .sort("hour", 1)
+    )
+
+
+def _summarize_invoice_results(records: list[dict]) -> dict:
+    purchase_mwh = sum(_to_float(record.get("traded_purchases_mwh")) for record in records)
+    sale_mwh = sum(_to_float(record.get("traded_sales_mwh")) for record in records)
+    purchase_amount = sum(_to_float(record.get("purchase_turnover_usd")) for record in records)
+    sale_amount = sum(_to_float(record.get("sale_turnover_usd")) for record in records)
+    return {
+        "result_purchase_mwh": purchase_mwh,
+        "result_sale_mwh": sale_mwh,
+        "result_purchase_amount_usd": purchase_amount,
+        "result_sale_amount_usd": sale_amount,
+        "result_net_mwh": purchase_mwh - sale_mwh,
+        "result_net_amount_usd": purchase_amount - sale_amount,
+        "results_available": bool(records),
+    }
+
+
+def _submitted_bid_summary(bid: dict, db) -> dict:
+    start_date, end_date = _bid_date_range(bid)
+    invoice_summary = _summarize_invoice_results(
+        _invoice_hourly_records(db, bid.get("market", "dam"), start_date, end_date)
+    )
+    return {
+        "id": str(bid["_id"]),
+        "market": bid.get("market", "dam"),
+        "delivery_date": bid.get("delivery_date"),
+        "week_start_date": bid.get("week_start_date"),
+        "month_start_date": bid.get("month_start_date"),
+        "period_start_date": bid.get("period_start_date") or bid.get("delivery_date"),
+        "period_end_date": bid.get("period_end_date") or bid.get("delivery_date"),
+        "delivery_days": bid.get("delivery_days", 1),
+        "total_bid_energy_mwh": bid.get("total_energy_mwh", 0),
+        "weighted_average_bid_price_usd_per_mwh": bid.get(
+            "weighted_average_price_usd_per_mwh"
+        ),
+        "submitted_at": bid.get("submitted_at"),
+        "created_at": bid["created_at"],
+        "updated_at": bid["updated_at"],
+        **invoice_summary,
+    }
+
+
+def _build_bid_hour_rows(bid: dict, delivery_date: date) -> list[dict]:
+    quantities = bid.get("quantities", [])
+    price_columns = bid.get("price_columns", [])
+    market = bid.get("market", "dam")
+    rows = []
+
+    for hour in range(1, 25):
+        product = get_time_of_use_period(delivery_date, hour)
+        quantities_by_price = {_price_key(price): 0 for price in price_columns}
+
+        for quantity in quantities:
+            if market == "dam" and quantity.get("hour") != hour:
+                continue
+            if market != "dam" and quantity.get("product") != product:
+                continue
+            price_key = _price_key(quantity["price_usd_per_mwh"])
+            quantities_by_price[price_key] = (
+                quantities_by_price.get(price_key, 0) + quantity["energy_mwh"]
+            )
+
+        rows.append(
+            {
+                "delivery_date": delivery_date.isoformat(),
+                "hour": hour,
+                "hour_label": _hour_label(hour),
+                "product": product,
+                "quantities_by_price": quantities_by_price,
+                "total_energy_mwh": sum(quantities_by_price.values()),
+            }
+        )
+
+    return rows
+
+
+def _build_result_hour_rows(db, market: str, delivery_date: date) -> list[dict]:
+    invoice_records = {
+        record.get("hour"): record
+        for record in _invoice_hourly_records(db, market, delivery_date, delivery_date)
+    }
+    portfolio_records = {
+        record.get("hour"): record for record in _portfolio_hourly_records(db, delivery_date)
+    }
+    rows = []
+
+    for hour in range(1, 25):
+        product = get_time_of_use_period(delivery_date, hour)
+        invoice_record = invoice_records.get(hour, {})
+        portfolio_record = portfolio_records.get(hour, {})
+        purchase_mwh = invoice_record.get("traded_purchases_mwh")
+        sale_mwh = invoice_record.get("traded_sales_mwh")
+        area_price = portfolio_record.get("area_price_usd_per_mwh")
+        participant_schedule = portfolio_record.get("participant_total_area_schedule_mwh")
+
+        rows.append(
+            {
+                "delivery_date": delivery_date.isoformat(),
+                "hour": hour,
+                "hour_label": _hour_label(hour),
+                "product": product,
+                "market": market,
+                "purchase_mwh": purchase_mwh,
+                "sale_mwh": sale_mwh,
+                "net_mwh": (
+                    _to_float(purchase_mwh) - _to_float(sale_mwh)
+                    if purchase_mwh is not None or sale_mwh is not None
+                    else None
+                ),
+                "purchase_amount_usd": invoice_record.get("purchase_turnover_usd"),
+                "sale_amount_usd": invoice_record.get("sale_turnover_usd"),
+                "area_price_usd_per_mwh": area_price,
+                "unconstrained_market_price_usd_per_mwh": portfolio_record.get(
+                    "unconstrained_market_price_usd_per_mwh"
+                ),
+                "participant_total_area_schedule_mwh": participant_schedule,
+                "admin_fees_usd": invoice_record.get("admin_fees_usd"),
+                "wheeling_cost_usd": invoice_record.get("wheeling_cost_usd"),
+            }
+        )
+
+    return rows
+
+
 def _normalize_trading_invoice_market(market: Optional[str]) -> Optional[str]:
     if market is None:
         return None
@@ -457,6 +641,91 @@ def get_time_of_use_periods(
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "period_hour_counts": count_time_of_use_hours(start_date, end_date),
+    }
+
+
+@router.get("/submitted-bids/summary", response_model=SappSubmittedBidSummaryList)
+def list_submitted_bid_summaries(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    market: Optional[SappBidMarket] = Query(None),
+    delivery_date: Optional[date] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+):
+    """List submitted bid summaries without hourly bid construction data."""
+    db = get_db()
+    collection = db["sapp_bids"]
+
+    query_filter = {"status": "submitted"}
+    if market:
+        query_filter["market"] = market
+    if delivery_date:
+        query_filter["period_start_date"] = delivery_date.isoformat()
+    elif start_date or end_date:
+        query_filter["period_start_date"] = {}
+        if start_date:
+            query_filter["period_start_date"]["$gte"] = start_date.isoformat()
+        if end_date:
+            query_filter["period_start_date"]["$lte"] = end_date.isoformat()
+
+    total = collection.count_documents(query_filter)
+    records = list(
+        collection.find(query_filter)
+        .sort([("period_start_date", -1), ("submitted_at", -1), ("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+
+    page = (skip // limit) + 1
+    return SappSubmittedBidSummaryList(
+        records=[_submitted_bid_summary(record, db) for record in records],
+        total=total,
+        page=page,
+        page_size=limit,
+    )
+
+
+@router.get(
+    "/submitted-bids/{bid_id}/comparison",
+    response_model=SappBidComparisonResponse,
+)
+def get_submitted_bid_comparison(
+    bid_id: str,
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Required for a specific FPM-W/FPM-M day; defaults to bid date for DAM.",
+    ),
+):
+    """Get hourly bid construction and matching SAPP purchase/sale results."""
+    db = get_db()
+    collection = db["sapp_bids"]
+    bid = collection.find_one(
+        {"_id": _parse_object_id(bid_id, "bid"), "status": "submitted"}
+    )
+    if not bid:
+        raise HTTPException(status_code=404, detail="Submitted bid not found")
+
+    start_date, end_date = _bid_date_range(bid)
+    comparison_date = delivery_date
+    if comparison_date is None:
+        comparison_date = start_date
+    if comparison_date < start_date or comparison_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="delivery_date must fall inside the submitted bid period",
+        )
+
+    return {
+        "bid": _serialize_bid_result(dict(bid)),
+        "summary": _submitted_bid_summary(bid, db),
+        "delivery_date": comparison_date.isoformat(),
+        "bid_hours": _build_bid_hour_rows(bid, comparison_date),
+        "result_hours": _build_result_hour_rows(
+            db,
+            bid.get("market", "dam"),
+            comparison_date,
+        ),
     }
 
 

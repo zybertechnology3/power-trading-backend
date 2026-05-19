@@ -61,6 +61,8 @@ GET  /sapp/constrained-area-results
 GET  /sapp/constrained-area-results/{delivery_date}
 POST /sapp/bids
 GET  /sapp/time-of-use-periods
+GET  /sapp/submitted-bids/summary
+GET  /sapp/submitted-bids/{bid_id}/comparison
 GET  /sapp/bids/history
 GET  /sapp/bids/{bid_id}
 PATCH /sapp/bids/{bid_id}
@@ -120,4 +122,12 @@ Time-of-use period mappings are available from:
 ```text
 GET /sapp/time-of-use-periods?delivery_date=2026-05-18
 GET /sapp/time-of-use-periods?start_date=2026-05-18&end_date=2026-05-24
+```
+
+Submitted bid/result comparison endpoints:
+
+```text
+GET /sapp/submitted-bids/summary?market=dam&start_date=2026-05-01&end_date=2026-05-31
+GET /sapp/submitted-bids/{bid_id}/comparison
+GET /sapp/submitted-bids/{bid_id}/comparison?delivery_date=2026-05-18
 ```

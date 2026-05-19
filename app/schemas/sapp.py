@@ -160,6 +160,81 @@ class SappBidList(BaseModel):
     page_size: int
 
 
+class SappSubmittedBidSummary(BaseModel):
+    """Submitted bid summary without hourly bid construction cells."""
+
+    id: str
+    market: SappBidMarket
+    delivery_date: Optional[date] = None
+    week_start_date: Optional[date] = None
+    month_start_date: Optional[date] = None
+    period_start_date: date
+    period_end_date: date
+    delivery_days: int = Field(1, ge=1)
+    total_bid_energy_mwh: float = 0
+    weighted_average_bid_price_usd_per_mwh: Optional[float] = None
+    result_purchase_mwh: float = 0
+    result_sale_mwh: float = 0
+    result_purchase_amount_usd: float = 0
+    result_sale_amount_usd: float = 0
+    result_net_mwh: float = 0
+    result_net_amount_usd: float = 0
+    results_available: bool = False
+    submitted_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SappSubmittedBidSummaryList(BaseModel):
+    """Paginated submitted bid summaries."""
+
+    records: list[SappSubmittedBidSummary]
+    total: int
+    page: int
+    page_size: int
+
+
+class SappBidComparisonBidHour(BaseModel):
+    """Hourly bid construction row for comparing against SAPP results."""
+
+    delivery_date: date
+    hour: int = Field(..., ge=1, le=24)
+    hour_label: str
+    product: SappBidProduct
+    quantities_by_price: dict[str, float] = Field(default_factory=dict)
+    total_energy_mwh: float = 0
+
+
+class SappBidComparisonResultHour(BaseModel):
+    """Hourly SAPP result row aligned with a submitted bid."""
+
+    delivery_date: date
+    hour: int = Field(..., ge=1, le=24)
+    hour_label: str
+    product: SappBidProduct
+    market: SappBidMarket
+    purchase_mwh: Optional[float] = None
+    sale_mwh: Optional[float] = None
+    net_mwh: Optional[float] = None
+    purchase_amount_usd: Optional[float] = None
+    sale_amount_usd: Optional[float] = None
+    area_price_usd_per_mwh: Optional[float] = None
+    unconstrained_market_price_usd_per_mwh: Optional[float] = None
+    participant_total_area_schedule_mwh: Optional[float] = None
+    admin_fees_usd: Optional[float] = None
+    wheeling_cost_usd: Optional[float] = None
+
+
+class SappBidComparisonResponse(BaseModel):
+    """Submitted bid with hourly bid construction and matching SAPP results."""
+
+    bid: SappBidResponse
+    summary: SappSubmittedBidSummary
+    delivery_date: Optional[date] = None
+    bid_hours: list[SappBidComparisonBidHour]
+    result_hours: list[SappBidComparisonResultHour]
+
+
 class SappBidTemplateBase(BaseModel):
     """Reusable bid grid template."""
 
