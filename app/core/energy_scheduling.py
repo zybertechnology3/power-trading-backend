@@ -57,6 +57,8 @@ POWER_SOURCE_ROW_DEFINITIONS = (
     BudgetRowDefinition("lps_solar_gwh", "LPS - Sol -MWh", "GWh", "energy", "sum", "computed"),
     BudgetRowDefinition("sapp_purchase_gwh", "SAPP Purch. MWh", "GWh", "energy", "sum", "computed"),
     BudgetRowDefinition("total_generation_gwh", "Total Gen.MWh", "GWh", "energy", "sum", "computed"),
+    BudgetRowDefinition("lps_equivalent_water_volume_mm3", "Equ. Volume of Water LPS", "Mm3", "water_volume", "sum", "computed"),
+    BudgetRowDefinition("mps_equivalent_water_volume_mm3", "Equ. Volume of Water MPS", "Mm3", "water_volume", "sum", "computed"),
 )
 
 DEFAULT_YEARLY_BUDGET_INPUTS = {
@@ -365,6 +367,30 @@ def calculate_yearly_power_sources_budget(payload: dict) -> dict:
             for index, month_key in enumerate(MONTH_KEYS)
         },
     }
+    mps_equivalent_water_volume_mm3 = [
+        equivalent_water_volume["mps"][month_key]["water_volume_mm3"]
+        for month_key in MONTH_KEYS
+    ]
+    lps_equivalent_water_volume_mm3 = [
+        equivalent_water_volume["lps"][month_key]["water_volume_mm3"]
+        for month_key in MONTH_KEYS
+    ]
+    rows.extend(
+        [
+            _row(
+                definitions["lps_equivalent_water_volume_mm3"],
+                lps_equivalent_water_volume_mm3,
+                prior_year,
+                formula="LPS GWh * 1,000,000 kWh/GWh * 4.71 m3/kWh / 1,000,000",
+            ),
+            _row(
+                definitions["mps_equivalent_water_volume_mm3"],
+                mps_equivalent_water_volume_mm3,
+                prior_year,
+                formula="MPS GWh * 1,000,000 kWh/GWh * 1.35 m3/kWh / 1,000,000",
+            ),
+        ]
+    )
 
     return {
         "year": year,
