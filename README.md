@@ -92,6 +92,16 @@ DELETE /resource-forecasting/level-monitoring/records/{record_id}
 GET  /resource-forecasting/level-monitoring/aggregate
 GET  /resource-forecasting/dam-calculation/configs
 POST /resource-forecasting/dam-calculation/calculate
+GET  /energy-scheduling/yearly-budget/defaults
+POST /energy-scheduling/yearly-budget/calculate
+GET  /energy-scheduling/yearly-budgets/budgetable
+PUT  /energy-scheduling/yearly-budgets/budgetable/{year}
+POST /energy-scheduling/yearly-budgets
+GET  /energy-scheduling/yearly-budgets
+GET  /energy-scheduling/yearly-budgets/{budget_id}
+PATCH /energy-scheduling/yearly-budgets/{budget_id}
+DELETE /energy-scheduling/yearly-budgets/{budget_id}
+POST /energy-scheduling/equivalent-water-volume
 ```
 
 Contract records require `expiration_date`. If `duration` is omitted, the API
@@ -241,3 +251,56 @@ The calculation returns the selected lookup range, calculated dam volume, useful
 dam volume, percentage fill, equivalent energy, and projected generation days and
 months. The lookup tables are stored in `app/core/dam_calculations.py` so both
 the config endpoint and backend calculation run in memory without database reads.
+
+## Energy Scheduling
+
+Yearly Power Sources budget defaults:
+
+```text
+GET /energy-scheduling/yearly-budget/defaults?year=2026
+```
+
+Calculate without saving:
+
+```text
+POST /energy-scheduling/yearly-budget/calculate
+```
+
+Current and next year budget page:
+
+```text
+GET /energy-scheduling/yearly-budgets/budgetable
+GET /energy-scheduling/yearly-budgets/budgetable?base_year=2026
+PUT /energy-scheduling/yearly-budgets/budgetable/2026
+PUT /energy-scheduling/yearly-budgets/budgetable/2027?base_year=2026
+```
+
+The budgetable endpoint returns exactly two records: current year and next year.
+If a saved budget exists for a year, the latest saved budget is returned;
+otherwise the response contains default calculated values with `is_saved=false`.
+The PUT endpoint upserts the latest budget for one of those two years.
+
+Save and manage yearly budgets:
+
+```text
+POST /energy-scheduling/yearly-budgets
+GET /energy-scheduling/yearly-budgets?year=2026
+GET /energy-scheduling/yearly-budgets/{budget_id}
+PATCH /energy-scheduling/yearly-budgets/{budget_id}
+DELETE /energy-scheduling/yearly-budgets/{budget_id}
+```
+
+Equivalent water-volume backpass:
+
+```text
+POST /energy-scheduling/equivalent-water-volume
+{
+  "dam": "mulungushi",
+  "generation_mw": 24.074074074,
+  "hours": 720
+}
+```
+
+The Power Sources calculation mirrors the workbook table from rows 7-19 and
+returns all computed rows in one response. MPS water-volume conversion uses the
+Mulungushi factor, and LPS uses the Mita Hills factor.

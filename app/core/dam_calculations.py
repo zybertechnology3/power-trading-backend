@@ -259,3 +259,52 @@ def calculate_dam_projection(
         "projected_generation_days": projected_days,
         "projected_generation_months": projected_days / 30,
     }
+
+
+def calculate_equivalent_water_volume(
+    dam: DamCalculationCode,
+    generation_mw: float,
+    hours: float = 720,
+) -> dict:
+    """
+    Convert generation in MW over a duration to equivalent water volume.
+
+    The workbook factors are stored as cubic metres per kWh:
+    - Mulungushi / MPS: 1.35 m3/kWh
+    - Mita Hills / LPS: 4.71 m3/kWh
+    """
+    config = get_dam_calculation_config(dam)
+    energy_mwh = generation_mw * hours
+    energy_kwh = energy_mwh * 1_000
+    water_volume_m3 = energy_kwh * config.energy_m3_per_kwh
+    return {
+        "dam": config.code,
+        "dam_name": config.name,
+        "generation_mw": generation_mw,
+        "hours": hours,
+        "energy_mwh": energy_mwh,
+        "energy_gwh": energy_mwh / 1_000,
+        "energy_kwh": energy_kwh,
+        "energy_m3_per_kwh": config.energy_m3_per_kwh,
+        "water_volume_m3": water_volume_m3,
+        "water_volume_mm3": water_volume_m3 / 1_000_000,
+    }
+
+
+def calculate_equivalent_water_volume_from_energy_gwh(
+    dam: DamCalculationCode,
+    energy_gwh: float,
+) -> dict:
+    """Convert generated energy in GWh to equivalent water volume."""
+    config = get_dam_calculation_config(dam)
+    energy_kwh = energy_gwh * 1_000_000
+    water_volume_m3 = energy_kwh * config.energy_m3_per_kwh
+    return {
+        "dam": config.code,
+        "dam_name": config.name,
+        "energy_gwh": energy_gwh,
+        "energy_kwh": energy_kwh,
+        "energy_m3_per_kwh": config.energy_m3_per_kwh,
+        "water_volume_m3": water_volume_m3,
+        "water_volume_mm3": water_volume_m3 / 1_000_000,
+    }

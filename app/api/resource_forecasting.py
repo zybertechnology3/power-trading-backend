@@ -42,8 +42,8 @@ router = APIRouter(prefix="/resource-forecasting", tags=["resource-forecasting"]
 FT_TO_M3_FACTOR = 2393.89
 
 RESERVOIRS: dict[ReservoirCode, dict[str, float | str]] = {
-    "mps": {"name": "MPS", "max_level_ft": 630.0},
-    "lps": {"name": "LPS", "max_level_ft": 220.0},
+    "mps": {"name": "MPS", "min_level_ft": 570.0, "max_level_ft": 641.5},
+    "lps": {"name": "LPS", "min_level_ft": 140.0, "max_level_ft": 233.0},
 }
 
 
@@ -148,8 +148,16 @@ def _reservoir_max_level_ft(reservoir: ReservoirCode) -> float:
     return float(RESERVOIRS[reservoir]["max_level_ft"])
 
 
+def _reservoir_min_level_ft(reservoir: ReservoirCode) -> float:
+    return float(RESERVOIRS[reservoir]["min_level_ft"])
+
+
 def _reservoir_max_level_m3(reservoir: ReservoirCode) -> float:
     return _ft_to_m3(_reservoir_max_level_ft(reservoir))
+
+
+def _reservoir_min_level_m3(reservoir: ReservoirCode) -> float:
+    return _ft_to_m3(_reservoir_min_level_ft(reservoir))
 
 
 def _level_to_ft(value: float, unit: str) -> float:
@@ -169,13 +177,14 @@ def _validate_reservoir_level_limit(
         raise HTTPException(status_code=400, detail="reservoir_level_value must be non-negative")
 
     level_ft = _level_to_ft(value, unit)
+    min_level_ft = _reservoir_min_level_ft(reservoir)
     max_level_ft = _reservoir_max_level_ft(reservoir)
-    if level_ft > max_level_ft:
+    if level_ft < min_level_ft or level_ft > max_level_ft:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"{reservoir.upper()} reservoir level exceeds the "
-                f"{max_level_ft:g} ft capacity limit"
+                f"{reservoir.upper()} reservoir level must be between "
+                f"{min_level_ft:g} ft and {max_level_ft:g} ft"
             ),
         )
 
@@ -201,6 +210,8 @@ def _record_response(record: dict, field_definitions: Optional[list[dict]] = Non
         "reservoir_level_unit": level_unit,
         "reservoir_level_ft": _level_to_ft(level_value, level_unit),
         "reservoir_level_m3": _level_to_m3(level_value, level_unit),
+        "min_level_ft": _reservoir_min_level_ft(reservoir),
+        "min_level_m3": _reservoir_min_level_m3(reservoir),
         "max_level_ft": _reservoir_max_level_ft(reservoir),
         "max_level_m3": _reservoir_max_level_m3(reservoir),
         "custom_fields": _custom_fields_with_defaults(
@@ -253,6 +264,8 @@ def list_reservoirs():
         ReservoirInfo(
             code=reservoir_code,
             name=str(reservoir["name"]),
+            min_level_ft=float(reservoir["min_level_ft"]),
+            min_level_m3=_reservoir_min_level_m3(reservoir_code),
             max_level_ft=float(reservoir["max_level_ft"]),
             max_level_m3=_reservoir_max_level_m3(reservoir_code),
         )

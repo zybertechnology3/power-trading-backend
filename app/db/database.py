@@ -219,6 +219,19 @@ def _initialize_collections():
         name="idx_resource_level_fields_reservoir_created",
     )
 
+    if "energy_yearly_budgets" not in db.list_collection_names():
+        db.create_collection("energy_yearly_budgets")
+        print("Created 'energy_yearly_budgets' collection")
+    energy_yearly_budgets_collection = db["energy_yearly_budgets"]
+    energy_yearly_budgets_collection.create_index(
+        [("deleted_at", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)],
+        name="idx_energy_yearly_budgets_active_created",
+    )
+    energy_yearly_budgets_collection.create_index(
+        [("year", ASCENDING), ("created_at", DESCENDING)],
+        name="idx_energy_yearly_budgets_year_created",
+    )
+
 
 def get_db():
     """Get MongoDB database reference."""

@@ -20,6 +20,8 @@ class ReservoirInfo(BaseModel):
 
     code: ReservoirCode
     name: str
+    min_level_ft: float
+    min_level_m3: float
     max_level_ft: float
     max_level_m3: float
 
@@ -127,6 +129,8 @@ class LevelMonitoringRecordResponse(BaseModel):
     reservoir_level_unit: ReservoirLevelUnit
     reservoir_level_ft: Optional[float] = None
     reservoir_level_m3: Optional[float] = None
+    min_level_ft: float
+    min_level_m3: float
     max_level_ft: float
     max_level_m3: float
     custom_fields: dict[str, Any] = Field(default_factory=dict)
