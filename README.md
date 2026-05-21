@@ -237,10 +237,11 @@ GET /resource-forecasting/hydrology-forecasting?base_date=2026-05-21
 
 Returns a 24-month forecast for the current year and next year for both MPS and
 LPS. Months before the current month use the latest monitoring record in that
-month as the month-end level. The current month and future months use the latest
-level record on or before `base_date` as the projection start, then subtract the
-monthly equivalent water volume from the latest saved yearly budget. If no saved
-budget exists for a year, the default yearly budget is used.
+month as the month-end level. The current month and future months start from the
+latest monitoring level before the current month. Each projected month is then
+calculated as previous month level minus that month's equivalent water volume
+from the yearly budget. If no saved budget exists for a year, the default yearly
+budget is used.
 
 Use rainfall allocations to calculate the red rainfall-adjusted line/bar:
 

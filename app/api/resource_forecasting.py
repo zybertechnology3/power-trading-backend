@@ -410,10 +410,12 @@ def _projection_start_for_reservoir(
     base_date: date,
 ) -> dict:
     dam = RESERVOIR_DAM_CODES[reservoir]
-    latest_record = _latest_level_record_on_or_before(reservoir, base_date)
+    current_month_start = _month_start(base_date.year, base_date.month)
+    previous_month_end = current_month_start - timedelta(days=1)
+    latest_record = _latest_level_record_on_or_before(reservoir, previous_month_end)
     if latest_record:
         level_ft = _record_level_ft(latest_record)
-        source = f"monitoring:{latest_record['record_date']}"
+        source = f"previous_month_monitoring:{latest_record['record_date']}"
     else:
         config = get_dam_calculation_config(dam)
         level_ft = config.default_current_level_ft
