@@ -13,6 +13,7 @@ ReservoirLevelUnit = Literal["ft", "m3"]
 ResourceCustomFieldType = Literal["text", "number", "date", "boolean", "json"]
 ResourceAggregationGroup = Literal["week", "month", "year"]
 DamCalculationCode = Literal["mita_hills", "mulungushi"]
+HydrologyForecastSource = Literal["monitoring", "projected"]
 
 
 class ReservoirInfo(BaseModel):
@@ -226,3 +227,86 @@ class DamCalculationResponse(BaseModel):
     equivalent_energy_gwh: Optional[float] = None
     projected_generation_days: Optional[float] = None
     projected_generation_months: Optional[float] = None
+
+
+class HydrologyRainfallAllocationInput(BaseModel):
+    """Rainfall volume forecast allocated by calendar month."""
+
+    total_volume_mm3: float = Field(0, ge=0)
+    monthly_allocations_mm3: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_monthly_allocations(self):
+        for month_key, value in self.monthly_allocations_mm3.items():
+            try:
+                date.fromisoformat(f"{month_key}-01")
+            except ValueError:
+                raise ValueError("monthly allocation keys must use YYYY-MM format")
+            if value < 0:
+                raise ValueError("monthly allocation values must be non-negative")
+        if sum(self.monthly_allocations_mm3.values()) > self.total_volume_mm3:
+            raise ValueError("monthly allocations cannot exceed total_volume_mm3")
+        return self
+
+
+class HydrologyForecastRequest(BaseModel):
+    """Calculate current and next year hydrology level forecast."""
+
+    base_date: Optional[date] = None
+    rainfall: dict[ReservoirCode, HydrologyRainfallAllocationInput] = Field(
+        default_factory=dict
+    )
+
+
+class HydrologyForecastMonthResponse(BaseModel):
+    """One month in the hydrology forecast chart."""
+
+    reservoir: ReservoirCode
+    dam: DamCalculationCode
+    month_key: str
+    year: int
+    month: int
+    period_start_date: date
+    period_end_date: date
+    source: HydrologyForecastSource
+    is_past_month: bool
+    monitoring_record_id: Optional[str] = None
+    monitoring_record_date: Optional[date] = None
+    observed_level_ft: Optional[float] = None
+    projected_level_ft: Optional[float] = None
+    rainfall_adjusted_level_ft: Optional[float] = None
+    projected_volume_m3: Optional[float] = None
+    rainfall_adjusted_volume_m3: Optional[float] = None
+    budget_water_volume_m3: float = 0
+    budget_water_volume_mm3: float = 0
+    rainfall_volume_m3: float = 0
+    rainfall_volume_mm3: float = 0
+    budget_energy_gwh: Optional[float] = None
+    projected_level_clamped: bool = False
+    rainfall_adjusted_level_clamped: bool = False
+
+
+class HydrologyForecastReservoirResponse(BaseModel):
+    """Hydrology forecast for one reservoir."""
+
+    reservoir: ReservoirCode
+    reservoir_name: str
+    dam: DamCalculationCode
+    dam_name: str
+    min_level_ft: float
+    max_level_ft: float
+    projection_start_level_ft: float
+    projection_start_volume_m3: float
+    projection_start_source: str
+    rainfall_total_volume_mm3: float
+    rainfall_allocated_volume_mm3: float
+    rainfall_remaining_volume_mm3: float
+    months: list[HydrologyForecastMonthResponse]
+
+
+class HydrologyForecastResponse(BaseModel):
+    """Hydrology forecast response for both dams."""
+
+    base_date: date
+    years: list[int]
+    records: list[HydrologyForecastReservoirResponse]

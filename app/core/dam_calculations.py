@@ -180,6 +180,20 @@ def find_lookup_range(
     return None
 
 
+def find_volume_lookup_range(
+    config: DamCalculationConfig,
+    volume_m3: float,
+) -> DamLookupRange | None:
+    """Find the interpolation range containing a dam volume."""
+    for lookup_range in config.lookup_table:
+        if (
+            lookup_range.lower_volume_m3 <= volume_m3 < lookup_range.upper_volume_m3
+            or volume_m3 == lookup_range.upper_volume_m3 == config.lookup_table[-1].upper_volume_m3
+        ):
+            return lookup_range
+    return None
+
+
 def interpolate_volume_m3(lookup_range: DamLookupRange, current_level_ft: float) -> float:
     """Linearly interpolate dam volume for the current level."""
     slope = (
@@ -189,6 +203,80 @@ def interpolate_volume_m3(lookup_range: DamLookupRange, current_level_ft: float)
     return slope * current_level_ft + (
         lookup_range.upper_volume_m3 - slope * lookup_range.upper_level_ft
     )
+
+
+def interpolate_level_ft(lookup_range: DamLookupRange, volume_m3: float) -> float:
+    """Linearly interpolate dam level for the current volume."""
+    slope = (
+        (lookup_range.upper_level_ft - lookup_range.lower_level_ft)
+        / (lookup_range.upper_volume_m3 - lookup_range.lower_volume_m3)
+    )
+    return slope * volume_m3 + (
+        lookup_range.upper_level_ft - slope * lookup_range.upper_volume_m3
+    )
+
+
+def calculate_dam_volume_at_level(
+    dam: DamCalculationCode,
+    level_ft: float,
+) -> dict:
+    """Convert a dam level in feet to an interpolated volume in cubic metres."""
+    config = get_dam_calculation_config(dam)
+    lookup_range = find_lookup_range(config, level_ft)
+    if lookup_range is None:
+        return {
+            "dam": config.code,
+            "dam_name": config.name,
+            "is_off_range": True,
+            "level_ft": level_ft,
+            "volume_m3": None,
+        }
+    return {
+        "dam": config.code,
+        "dam_name": config.name,
+        "is_off_range": False,
+        "level_ft": level_ft,
+        "volume_m3": interpolate_volume_m3(lookup_range, level_ft),
+    }
+
+
+def calculate_dam_level_at_volume(
+    dam: DamCalculationCode,
+    volume_m3: float,
+    clamp: bool = False,
+) -> dict:
+    """Convert a dam volume in cubic metres to an interpolated level in feet."""
+    config = get_dam_calculation_config(dam)
+    lookup_range = find_volume_lookup_range(config, volume_m3)
+    is_clamped = False
+    calculation_volume_m3 = volume_m3
+
+    if lookup_range is None and clamp:
+        min_volume_m3 = config.lookup_table[0].lower_volume_m3
+        max_volume_m3 = config.lookup_table[-1].upper_volume_m3
+        calculation_volume_m3 = min(max(volume_m3, min_volume_m3), max_volume_m3)
+        is_clamped = calculation_volume_m3 != volume_m3
+        lookup_range = find_volume_lookup_range(config, calculation_volume_m3)
+
+    if lookup_range is None:
+        return {
+            "dam": config.code,
+            "dam_name": config.name,
+            "is_off_range": True,
+            "is_clamped": False,
+            "volume_m3": volume_m3,
+            "level_ft": None,
+        }
+
+    return {
+        "dam": config.code,
+        "dam_name": config.name,
+        "is_off_range": False,
+        "is_clamped": is_clamped,
+        "volume_m3": volume_m3,
+        "calculation_volume_m3": calculation_volume_m3,
+        "level_ft": interpolate_level_ft(lookup_range, calculation_volume_m3),
+    }
 
 
 def calculate_dam_projection(

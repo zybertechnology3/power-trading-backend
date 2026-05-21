@@ -90,6 +90,8 @@ GET  /resource-forecasting/level-monitoring/records/{record_id}
 PATCH /resource-forecasting/level-monitoring/records/{record_id}
 DELETE /resource-forecasting/level-monitoring/records/{record_id}
 GET  /resource-forecasting/level-monitoring/aggregate
+GET  /resource-forecasting/hydrology-forecasting
+POST /resource-forecasting/hydrology-forecasting/calculate
 GET  /resource-forecasting/dam-calculation/configs
 POST /resource-forecasting/dam-calculation/calculate
 GET  /energy-scheduling/yearly-budget/defaults
@@ -225,6 +227,54 @@ Aggregate records:
 GET /resource-forecasting/level-monitoring/aggregate?reservoir=mps&group_by=week
 GET /resource-forecasting/level-monitoring/aggregate?reservoir=lps&group_by=month&start_date=2026-01-01&end_date=2026-12-31
 ```
+
+Hydrology forecasting:
+
+```text
+GET /resource-forecasting/hydrology-forecasting
+GET /resource-forecasting/hydrology-forecasting?base_date=2026-05-21
+```
+
+Returns a 24-month forecast for the current year and next year for both MPS and
+LPS. Months before the current month use the latest monitoring record in that
+month as the month-end level. The current month and future months use the latest
+level record on or before `base_date` as the projection start, then subtract the
+monthly equivalent water volume from the latest saved yearly budget. If no saved
+budget exists for a year, the default yearly budget is used.
+
+Use rainfall allocations to calculate the red rainfall-adjusted line/bar:
+
+```text
+POST /resource-forecasting/hydrology-forecasting/calculate
+{
+  "base_date": "2026-05-21",
+  "rainfall": {
+    "mps": {
+      "total_volume_mm3": 30,
+      "monthly_allocations_mm3": {
+        "2026-06": 10,
+        "2026-12": 20
+      }
+    },
+    "lps": {
+      "total_volume_mm3": 12,
+      "monthly_allocations_mm3": {
+        "2026-11": 12
+      }
+    }
+  }
+}
+```
+
+Rainfall volumes are in `Mm3`, matching the yearly budget equivalent water-volume
+unit. Allocations may be less than the total while the user is editing; the
+response includes `rainfall_remaining_volume_mm3`. Allocations cannot exceed the
+total or target months before the current month.
+
+Each reservoir response includes monthly `projected_level_ft` for the green
+forecast and `rainfall_adjusted_level_ft` for the red rainfall-adjusted forecast.
+MPS uses the Mulungushi dam computation model and LPS uses the Mita Hills model
+to convert between water volume and feet.
 
 Dam calculation tool:
 

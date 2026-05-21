@@ -15,14 +15,24 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.core.dam_calculations import (
+    calculate_dam_level_at_volume,
     calculate_dam_projection,
+    calculate_dam_volume_at_level,
+    get_dam_calculation_config,
     list_dam_calculation_configs,
+)
+from app.core.energy_scheduling import (
+    MONTH_KEYS,
+    calculate_yearly_power_sources_budget,
+    default_yearly_budget_payload,
 )
 from app.db.database import get_db
 from app.schemas.resource_forecasting import (
     DamCalculationConfigResponse,
     DamCalculationRequest,
     DamCalculationResponse,
+    HydrologyForecastRequest,
+    HydrologyForecastResponse,
     LevelMonitoringAggregationRecord,
     LevelMonitoringAggregationResponse,
     LevelMonitoringFieldCreate,
@@ -44,6 +54,11 @@ FT_TO_M3_FACTOR = 2393.89
 RESERVOIRS: dict[ReservoirCode, dict[str, float | str]] = {
     "mps": {"name": "MPS", "min_level_ft": 570.0, "max_level_ft": 641.5},
     "lps": {"name": "LPS", "min_level_ft": 140.0, "max_level_ft": 233.0},
+}
+
+RESERVOIR_DAM_CODES: dict[ReservoirCode, str] = {
+    "mps": "mulungushi",
+    "lps": "mita_hills",
 }
 
 
@@ -257,6 +272,218 @@ def _period_bounds(record_date: date, group_by: ResourceAggregationGroup) -> tup
     return date(record_date.year, 1, 1), date(record_date.year, 12, 31)
 
 
+def _energy_yearly_budgets_collection():
+    return get_db()["energy_yearly_budgets"]
+
+
+def _month_start(year: int, month: int) -> date:
+    return date(year, month, 1)
+
+
+def _month_end(year: int, month: int) -> date:
+    next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return next_month - timedelta(days=1)
+
+
+def _month_key(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def _forecast_months(base_date: date) -> list[dict[str, Any]]:
+    years = [base_date.year, base_date.year + 1]
+    return [
+        {
+            "year": year,
+            "month": month,
+            "month_key": _month_key(year, month),
+            "period_start_date": _month_start(year, month),
+            "period_end_date": _month_end(year, month),
+        }
+        for year in years
+        for month in range(1, 13)
+    ]
+
+
+def _latest_budget_record_for_year(year: int) -> Optional[dict]:
+    return _energy_yearly_budgets_collection().find_one(
+        {"year": year, **_active_filter()},
+        sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+    )
+
+
+def _budget_payload_from_record(record: dict) -> dict:
+    return {
+        "year": record["year"],
+        "name": record.get("name"),
+        "target_year": record.get("target_year") or record["year"],
+        "comparison_year": record.get("comparison_year") or record["year"] - 1,
+        **record["inputs"],
+    }
+
+
+def _calculated_budget_for_year(year: int) -> dict:
+    record = _latest_budget_record_for_year(year)
+    if record:
+        return calculate_yearly_power_sources_budget(_budget_payload_from_record(record))
+    return calculate_yearly_power_sources_budget(default_yearly_budget_payload(year))
+
+
+def _calculated_budgets_by_year(years: list[int]) -> dict[int, dict]:
+    return {year: _calculated_budget_for_year(year) for year in years}
+
+
+def _budget_water_for_month(
+    budgets_by_year: dict[int, dict],
+    reservoir: ReservoirCode,
+    year: int,
+    month: int,
+) -> dict[str, Optional[float]]:
+    month_name = MONTH_KEYS[month - 1]
+    water_record = budgets_by_year[year]["equivalent_water_volume"][reservoir][month_name]
+    gwh_row_code = "mps_gwh" if reservoir == "mps" else "lps_gwh"
+    energy_gwh = None
+    for row in budgets_by_year[year]["rows"]:
+        if row["code"] == gwh_row_code:
+            energy_gwh = row["months"][month_name]
+            break
+    return {
+        "water_volume_m3": float(water_record["water_volume_m3"]),
+        "water_volume_mm3": float(water_record["water_volume_mm3"]),
+        "energy_gwh": energy_gwh,
+    }
+
+
+def _latest_records_by_month_before(
+    reservoir: ReservoirCode,
+    start_date: date,
+    before_date: date,
+) -> dict[str, dict]:
+    records = list(
+        _records_collection()
+        .find(
+            {
+                "reservoir": reservoir,
+                "record_date": {
+                    "$gte": start_date.isoformat(),
+                    "$lt": before_date.isoformat(),
+                },
+                **_active_filter(),
+            }
+        )
+        .sort([("record_date", 1), ("_id", 1)])
+    )
+    records_by_month: dict[str, dict] = {}
+    for record in records:
+        record_date = _parse_record_date(record["record_date"])
+        records_by_month[_month_key(record_date.year, record_date.month)] = record
+    return records_by_month
+
+
+def _latest_level_record_on_or_before(
+    reservoir: ReservoirCode,
+    target_date: date,
+) -> Optional[dict]:
+    return _records_collection().find_one(
+        {
+            "reservoir": reservoir,
+            "record_date": {"$lte": target_date.isoformat()},
+            **_active_filter(),
+        },
+        sort=[("record_date", -1), ("_id", -1)],
+    )
+
+
+def _record_level_ft(record: dict) -> float:
+    return _level_to_ft(record["reservoir_level_value"], record["reservoir_level_unit"])
+
+
+def _volume_to_level_for_forecast(dam: str, volume_m3: float) -> dict:
+    level_result = calculate_dam_level_at_volume(dam, volume_m3, clamp=True)
+    return {
+        "level_ft": level_result["level_ft"],
+        "is_clamped": level_result["is_clamped"],
+    }
+
+
+def _projection_start_for_reservoir(
+    reservoir: ReservoirCode,
+    base_date: date,
+) -> dict:
+    dam = RESERVOIR_DAM_CODES[reservoir]
+    latest_record = _latest_level_record_on_or_before(reservoir, base_date)
+    if latest_record:
+        level_ft = _record_level_ft(latest_record)
+        source = f"monitoring:{latest_record['record_date']}"
+    else:
+        config = get_dam_calculation_config(dam)
+        level_ft = config.default_current_level_ft
+        source = "dam_default"
+
+    volume_result = calculate_dam_volume_at_level(dam, level_ft)
+    if volume_result["is_off_range"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{reservoir.upper()} projection start level is outside the "
+                "configured dam calculation range"
+            ),
+        )
+    return {
+        "level_ft": level_ft,
+        "volume_m3": volume_result["volume_m3"],
+        "source": source,
+    }
+
+
+def _rainfall_input_for_reservoir(
+    payload: HydrologyForecastRequest,
+    reservoir: ReservoirCode,
+) -> dict:
+    rainfall = payload.rainfall.get(reservoir)
+    if not rainfall:
+        return {
+            "total_volume_mm3": 0.0,
+            "monthly_allocations_mm3": {},
+            "allocated_volume_mm3": 0.0,
+            "remaining_volume_mm3": 0.0,
+        }
+
+    allocations = dict(rainfall.monthly_allocations_mm3)
+    allocated = sum(allocations.values())
+    return {
+        "total_volume_mm3": rainfall.total_volume_mm3,
+        "monthly_allocations_mm3": allocations,
+        "allocated_volume_mm3": allocated,
+        "remaining_volume_mm3": rainfall.total_volume_mm3 - allocated,
+    }
+
+
+def _validate_rainfall_months(
+    payload: HydrologyForecastRequest,
+    base_date: date,
+) -> None:
+    valid_months = {month["month_key"] for month in _forecast_months(base_date)}
+    current_month_key = _month_key(base_date.year, base_date.month)
+    for reservoir, rainfall in payload.rainfall.items():
+        for allocation_month in rainfall.monthly_allocations_mm3:
+            if allocation_month not in valid_months:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{reservoir} rainfall allocation month {allocation_month} "
+                        "is outside the current/next year forecast window"
+                    ),
+                )
+            if allocation_month < current_month_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{reservoir} rainfall allocation month {allocation_month} "
+                        "cannot be before the current month"
+                    ),
+                )
+
+
 @router.get("/reservoirs", response_model=list[ReservoirInfo])
 def list_reservoirs():
     """List reservoirs available for resource forecasting."""
@@ -271,6 +498,170 @@ def list_reservoirs():
         )
         for reservoir_code, reservoir in RESERVOIRS.items()
     ]
+
+
+def _calculate_hydrology_forecast_response(
+    payload: HydrologyForecastRequest,
+) -> HydrologyForecastResponse:
+    base_date = payload.base_date or _utcnow().date()
+    _validate_rainfall_months(payload, base_date)
+
+    years = [base_date.year, base_date.year + 1]
+    months = _forecast_months(base_date)
+    budgets_by_year = _calculated_budgets_by_year(years)
+    current_month_start = _month_start(base_date.year, base_date.month)
+
+    forecast_records = []
+    for reservoir in RESERVOIRS:
+        dam = RESERVOIR_DAM_CODES[reservoir]
+        dam_config = get_dam_calculation_config(dam)
+        historical_records = _latest_records_by_month_before(
+            reservoir,
+            date(base_date.year, 1, 1),
+            current_month_start,
+        )
+        projection_start = _projection_start_for_reservoir(reservoir, base_date)
+        rainfall = _rainfall_input_for_reservoir(payload, reservoir)
+
+        projected_volume_m3 = float(projection_start["volume_m3"])
+        rainfall_adjusted_volume_m3 = projected_volume_m3
+        response_months = []
+
+        for month_info in months:
+            month_key = month_info["month_key"]
+            is_past_month = month_info["period_start_date"] < current_month_start
+            budget_water = {
+                "water_volume_m3": 0.0,
+                "water_volume_mm3": 0.0,
+                "energy_gwh": None,
+            }
+            rainfall_volume_mm3 = 0.0
+            rainfall_volume_m3 = 0.0
+            monitoring_record = None
+            observed_level_ft = None
+            projected_level_ft = None
+            rainfall_adjusted_level_ft = None
+            projected_level_clamped = False
+            rainfall_adjusted_level_clamped = False
+            response_projected_volume_m3 = None
+            response_rainfall_adjusted_volume_m3 = None
+
+            if is_past_month:
+                monitoring_record = historical_records.get(month_key)
+                if monitoring_record:
+                    observed_level_ft = _record_level_ft(monitoring_record)
+                    projected_level_ft = observed_level_ft
+                    observed_volume = calculate_dam_volume_at_level(dam, observed_level_ft)
+                    if not observed_volume["is_off_range"]:
+                        response_projected_volume_m3 = observed_volume["volume_m3"]
+            else:
+                budget_water = _budget_water_for_month(
+                    budgets_by_year,
+                    reservoir,
+                    month_info["year"],
+                    month_info["month"],
+                )
+                rainfall_volume_mm3 = rainfall["monthly_allocations_mm3"].get(month_key, 0.0)
+                rainfall_volume_m3 = rainfall_volume_mm3 * 1_000_000
+
+                projected_volume_m3 -= float(budget_water["water_volume_m3"])
+                rainfall_adjusted_volume_m3 = (
+                    rainfall_adjusted_volume_m3
+                    - float(budget_water["water_volume_m3"])
+                    + rainfall_volume_m3
+                )
+
+                projected_level = _volume_to_level_for_forecast(dam, projected_volume_m3)
+                rainfall_adjusted_level = _volume_to_level_for_forecast(
+                    dam,
+                    rainfall_adjusted_volume_m3,
+                )
+                projected_level_ft = projected_level["level_ft"]
+                rainfall_adjusted_level_ft = rainfall_adjusted_level["level_ft"]
+                projected_level_clamped = projected_level["is_clamped"]
+                rainfall_adjusted_level_clamped = rainfall_adjusted_level["is_clamped"]
+                response_projected_volume_m3 = projected_volume_m3
+                response_rainfall_adjusted_volume_m3 = rainfall_adjusted_volume_m3
+
+            response_months.append(
+                {
+                    "reservoir": reservoir,
+                    "dam": dam,
+                    "month_key": month_key,
+                    "year": month_info["year"],
+                    "month": month_info["month"],
+                    "period_start_date": month_info["period_start_date"],
+                    "period_end_date": month_info["period_end_date"],
+                    "source": "monitoring" if is_past_month else "projected",
+                    "is_past_month": is_past_month,
+                    "monitoring_record_id": (
+                        str(monitoring_record["_id"]) if monitoring_record else None
+                    ),
+                    "monitoring_record_date": (
+                        _parse_record_date(monitoring_record["record_date"])
+                        if monitoring_record
+                        else None
+                    ),
+                    "observed_level_ft": observed_level_ft,
+                    "projected_level_ft": projected_level_ft,
+                    "rainfall_adjusted_level_ft": rainfall_adjusted_level_ft,
+                    "projected_volume_m3": response_projected_volume_m3,
+                    "rainfall_adjusted_volume_m3": response_rainfall_adjusted_volume_m3,
+                    "budget_water_volume_m3": float(budget_water["water_volume_m3"]),
+                    "budget_water_volume_mm3": float(budget_water["water_volume_mm3"]),
+                    "rainfall_volume_m3": rainfall_volume_m3,
+                    "rainfall_volume_mm3": rainfall_volume_mm3,
+                    "budget_energy_gwh": budget_water["energy_gwh"],
+                    "projected_level_clamped": projected_level_clamped,
+                    "rainfall_adjusted_level_clamped": rainfall_adjusted_level_clamped,
+                }
+            )
+
+        forecast_records.append(
+            {
+                "reservoir": reservoir,
+                "reservoir_name": str(RESERVOIRS[reservoir]["name"]),
+                "dam": dam,
+                "dam_name": dam_config.name,
+                "min_level_ft": dam_config.min_level_ft,
+                "max_level_ft": dam_config.max_level_ft,
+                "projection_start_level_ft": projection_start["level_ft"],
+                "projection_start_volume_m3": projection_start["volume_m3"],
+                "projection_start_source": projection_start["source"],
+                "rainfall_total_volume_mm3": rainfall["total_volume_mm3"],
+                "rainfall_allocated_volume_mm3": rainfall["allocated_volume_mm3"],
+                "rainfall_remaining_volume_mm3": rainfall["remaining_volume_mm3"],
+                "months": response_months,
+            }
+        )
+
+    return HydrologyForecastResponse(
+        base_date=base_date,
+        years=years,
+        records=forecast_records,
+    )
+
+
+@router.get(
+    "/hydrology-forecasting",
+    response_model=HydrologyForecastResponse,
+)
+def get_hydrology_forecast(
+    base_date: Optional[date] = Query(None),
+):
+    """Return current and next year hydrology forecast without rainfall allocations."""
+    return _calculate_hydrology_forecast_response(
+        HydrologyForecastRequest(base_date=base_date)
+    )
+
+
+@router.post(
+    "/hydrology-forecasting/calculate",
+    response_model=HydrologyForecastResponse,
+)
+def calculate_hydrology_forecast(payload: HydrologyForecastRequest):
+    """Return current and next year hydrology forecast with rainfall allocations."""
+    return _calculate_hydrology_forecast_response(payload)
 
 
 @router.post(
