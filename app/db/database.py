@@ -2,6 +2,9 @@
 MongoDB database connection and collection setup.
 """
 
+import math
+from datetime import date, datetime, timedelta, timezone
+
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
 
@@ -13,6 +16,67 @@ class MongoDB:
 
     client = None
     db = None
+
+
+DEFAULT_MONTHLY_SOLAR_IRRADIATION_W_M2 = [
+    760.0,
+    740.0,
+    700.0,
+    660.0,
+    620.0,
+    590.0,
+    610.0,
+    660.0,
+    720.0,
+    780.0,
+    800.0,
+    790.0,
+]
+
+
+def _solar_weather_condition(value: float) -> str:
+    if value >= 760:
+        return "sunny"
+    if value >= 680:
+        return "partly_cloudy"
+    if value >= 610:
+        return "cloudy"
+    return "overcast"
+
+
+def _seed_solar_irradiation_records(collection):
+    """Seed deterministic daily solar irradiation readings for demo use."""
+    if collection.count_documents({}) > 0:
+        return
+
+    today = datetime.now(timezone.utc).date()
+    start_date = date(today.year - 1, 1, 1)
+    end_date = today
+    now = datetime.now(timezone.utc)
+    records = []
+    current_date = start_date
+
+    while current_date <= end_date:
+        monthly_base = DEFAULT_MONTHLY_SOLAR_IRRADIATION_W_M2[current_date.month - 1]
+        day_wave = math.sin((current_date.timetuple().tm_yday / 365) * math.tau)
+        short_wave = math.sin(current_date.day * 1.7)
+        irradiation_w_m2 = round(monthly_base + day_wave * 22 + short_wave * 28, 2)
+        irradiation_w_m2 = max(0.0, irradiation_w_m2)
+        records.append(
+            {
+                "plant": "lps_solar",
+                "record_date": current_date.isoformat(),
+                "irradiation_w_m2": irradiation_w_m2,
+                "weather_condition": _solar_weather_condition(irradiation_w_m2),
+                "notes": "Seeded demo irradiation reading",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        current_date += timedelta(days=1)
+
+    if records:
+        collection.insert_many(records, ordered=False)
 
 
 def connect_db():
@@ -232,6 +296,25 @@ def _initialize_collections():
         [("updated_at", DESCENDING)],
         name="idx_resource_hydrology_forecasts_updated_at",
     )
+
+    if "resource_solar_irradiation_records" not in db.list_collection_names():
+        db.create_collection("resource_solar_irradiation_records")
+        print("Created 'resource_solar_irradiation_records' collection")
+    solar_irradiation_collection = db["resource_solar_irradiation_records"]
+    solar_irradiation_collection.create_index(
+        [("plant", ASCENDING), ("record_date", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        name="idx_resource_solar_irradiation_plant_date_unique",
+    )
+    solar_irradiation_collection.create_index(
+        [("plant", ASCENDING), ("record_date", DESCENDING), ("_id", DESCENDING)],
+        name="idx_resource_solar_irradiation_plant_date",
+    )
+    solar_irradiation_collection.create_index(
+        [("created_at", DESCENDING)],
+        name="idx_resource_solar_irradiation_created_at",
+    )
+    _seed_solar_irradiation_records(solar_irradiation_collection)
 
     if "energy_yearly_budgets" not in db.list_collection_names():
         db.create_collection("energy_yearly_budgets")

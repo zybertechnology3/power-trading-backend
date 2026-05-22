@@ -93,6 +93,14 @@ GET  /resource-forecasting/level-monitoring/aggregate
 GET  /resource-forecasting/hydrology-forecasting
 PUT  /resource-forecasting/hydrology-forecasting
 POST /resource-forecasting/hydrology-forecasting/calculate
+GET  /resource-forecasting/solar-forecasting
+GET  /resource-forecasting/solar-forecasting/plants
+POST /resource-forecasting/solar-forecasting/records
+GET  /resource-forecasting/solar-forecasting/records
+GET  /resource-forecasting/solar-forecasting/records/{record_id}
+PATCH /resource-forecasting/solar-forecasting/records/{record_id}
+DELETE /resource-forecasting/solar-forecasting/records/{record_id}
+GET  /resource-forecasting/solar-forecasting/aggregate
 GET  /resource-forecasting/dam-calculation/configs
 POST /resource-forecasting/dam-calculation/calculate
 GET  /energy-scheduling/yearly-budget/defaults
@@ -309,6 +317,42 @@ Each reservoir response includes monthly `projected_level_ft` for the green
 forecast and `rainfall_adjusted_level_ft` for the red rainfall-adjusted forecast.
 MPS uses the Mulungushi dam computation model and LPS uses the Mita Hills model
 to convert between water volume and feet.
+
+Solar forecasting:
+
+```text
+GET /resource-forecasting/solar-forecasting/plants
+GET /resource-forecasting/solar-forecasting?plant=lps_solar&base_date=2026-05-21
+```
+
+Returns a 24-month solar irradiation series for the current year and next year.
+Previous months and the current month use stored daily irradiation records as
+actuals. Future months use predicted irradiation from historical same-month
+averages, falling back to a seasonal default curve if no historical data exists.
+Irradiation values are in `W/m2`. The response includes a `weather_condition`
+hint (`sunny`, `partly_cloudy`, `cloudy`, or `overcast`) that the frontend can
+map to its own weather graphic.
+
+Daily irradiation records:
+
+```text
+POST /resource-forecasting/solar-forecasting/records
+{
+  "plant": "lps_solar",
+  "record_date": "2026-05-21",
+  "irradiation_w_m2": 742.5,
+  "weather_condition": "sunny",
+  "notes": "Morning station reading"
+}
+
+GET /resource-forecasting/solar-forecasting/records?plant=lps_solar&start_date=2026-05-01&end_date=2026-05-31&limit=100
+PATCH /resource-forecasting/solar-forecasting/records/{record_id}
+DELETE /resource-forecasting/solar-forecasting/records/{record_id}
+GET /resource-forecasting/solar-forecasting/aggregate?plant=lps_solar&group_by=month&start_date=2026-01-01&end_date=2026-12-31
+```
+
+Fresh databases are seeded with deterministic demo daily irradiation readings for
+`lps_solar` from January 1 of the previous year through the current date.
 
 Dam calculation tool:
 

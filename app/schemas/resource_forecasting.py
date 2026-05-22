@@ -9,11 +9,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 ReservoirCode = Literal["mps", "lps"]
+SolarPlantCode = Literal["lps_solar"]
 ReservoirLevelUnit = Literal["ft", "m3"]
 ResourceCustomFieldType = Literal["text", "number", "date", "boolean", "json"]
 ResourceAggregationGroup = Literal["week", "month", "year"]
 DamCalculationCode = Literal["mita_hills", "mulungushi"]
 HydrologyForecastSource = Literal["monitoring", "projected"]
+SolarForecastSource = Literal["actual", "predicted"]
 
 
 class ReservoirInfo(BaseModel):
@@ -166,6 +168,120 @@ class LevelMonitoringAggregationResponse(BaseModel):
     """Aggregated level monitoring list."""
 
     records: list[LevelMonitoringAggregationRecord]
+
+
+class SolarPlantInfo(BaseModel):
+    """Solar plant option returned to the frontend."""
+
+    code: SolarPlantCode
+    name: str
+    irradiation_unit: str = "W/m2"
+
+
+class SolarIrradiationRecordCreate(BaseModel):
+    """Create a daily solar irradiation reading."""
+
+    plant: SolarPlantCode = "lps_solar"
+    record_date: date
+    irradiation_w_m2: float = Field(..., ge=0)
+    weather_condition: Optional[str] = Field(None, min_length=1)
+    notes: Optional[str] = Field(None, min_length=1)
+
+    @field_validator("weather_condition", "notes")
+    @classmethod
+    def strip_optional_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        stripped_value = value.strip()
+        if not stripped_value:
+            raise ValueError("field must not be blank")
+        return stripped_value
+
+
+class SolarIrradiationRecordUpdate(BaseModel):
+    """Partial update for a daily solar irradiation reading."""
+
+    record_date: Optional[date] = None
+    irradiation_w_m2: Optional[float] = Field(None, ge=0)
+    weather_condition: Optional[str] = Field(None, min_length=1)
+    notes: Optional[str] = Field(None, min_length=1)
+
+    @field_validator("weather_condition", "notes")
+    @classmethod
+    def strip_optional_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        stripped_value = value.strip()
+        if not stripped_value:
+            raise ValueError("field must not be blank")
+        return stripped_value
+
+
+class SolarIrradiationRecordResponse(BaseModel):
+    """Daily solar irradiation record returned by the API."""
+
+    id: str
+    plant: SolarPlantCode
+    plant_name: str
+    record_date: date
+    irradiation_w_m2: float
+    weather_condition: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SolarIrradiationListResponse(BaseModel):
+    """Cursor-paginated solar irradiation records."""
+
+    records: list[SolarIrradiationRecordResponse]
+    next_cursor: Optional[str] = None
+
+
+class SolarIrradiationAggregationRecord(BaseModel):
+    """Aggregated solar irradiation values."""
+
+    plant: SolarPlantCode
+    group_by: ResourceAggregationGroup
+    period_start_date: date
+    period_end_date: date
+    record_count: int
+    avg_irradiation_w_m2: Optional[float] = None
+    min_irradiation_w_m2: Optional[float] = None
+    max_irradiation_w_m2: Optional[float] = None
+
+
+class SolarIrradiationAggregationResponse(BaseModel):
+    """Aggregated solar irradiation list."""
+
+    records: list[SolarIrradiationAggregationRecord]
+
+
+class SolarForecastMonthResponse(BaseModel):
+    """One month in the solar irradiation forecast chart."""
+
+    plant: SolarPlantCode
+    plant_name: str
+    month_key: str
+    year: int
+    month: int
+    period_start_date: date
+    period_end_date: date
+    source: SolarForecastSource
+    irradiation_w_m2: float
+    actual_record_count: int = 0
+    weather_condition: Optional[str] = None
+
+
+class SolarForecastResponse(BaseModel):
+    """Solar irradiation actuals and projections."""
+
+    base_date: date
+    years: list[int]
+    plant: SolarPlantCode
+    plant_name: str
+    irradiation_unit: str = "W/m2"
+    records: list[SolarForecastMonthResponse]
 
 
 class DamCalculationLookupRangeResponse(BaseModel):

@@ -45,6 +45,15 @@ from app.schemas.resource_forecasting import (
     ReservoirCode,
     ReservoirInfo,
     ResourceAggregationGroup,
+    SolarForecastResponse,
+    SolarIrradiationAggregationRecord,
+    SolarIrradiationAggregationResponse,
+    SolarIrradiationListResponse,
+    SolarIrradiationRecordCreate,
+    SolarIrradiationRecordResponse,
+    SolarIrradiationRecordUpdate,
+    SolarPlantCode,
+    SolarPlantInfo,
 )
 
 router = APIRouter(prefix="/resource-forecasting", tags=["resource-forecasting"])
@@ -60,6 +69,25 @@ RESERVOIR_DAM_CODES: dict[ReservoirCode, str] = {
     "mps": "mulungushi",
     "lps": "mita_hills",
 }
+
+SOLAR_PLANTS: dict[SolarPlantCode, dict[str, str]] = {
+    "lps_solar": {"name": "LPS Solar Plant"},
+}
+
+DEFAULT_MONTHLY_SOLAR_IRRADIATION_W_M2 = [
+    760.0,
+    740.0,
+    700.0,
+    660.0,
+    620.0,
+    590.0,
+    610.0,
+    660.0,
+    720.0,
+    780.0,
+    800.0,
+    790.0,
+]
 
 
 def _utcnow() -> datetime:
@@ -83,6 +111,10 @@ def _fields_collection():
 
 def _hydrology_forecasts_collection():
     return get_db()["resource_hydrology_forecasts"]
+
+
+def _solar_records_collection():
+    return get_db()["resource_solar_irradiation_records"]
 
 
 def _active_filter() -> dict:
@@ -547,6 +579,398 @@ def list_reservoirs():
         )
         for reservoir_code, reservoir in RESERVOIRS.items()
     ]
+
+
+def _solar_plant_name(plant: SolarPlantCode) -> str:
+    return SOLAR_PLANTS[plant]["name"]
+
+
+def _solar_record_response(record: dict) -> dict:
+    plant = record["plant"]
+    return {
+        "id": str(record["_id"]),
+        "plant": plant,
+        "plant_name": _solar_plant_name(plant),
+        "record_date": record["record_date"],
+        "irradiation_w_m2": record["irradiation_w_m2"],
+        "weather_condition": record.get("weather_condition"),
+        "notes": record.get("notes"),
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+    }
+
+
+def _solar_weather_condition(value: float) -> str:
+    if value >= 760:
+        return "sunny"
+    if value >= 680:
+        return "partly_cloudy"
+    if value >= 610:
+        return "cloudy"
+    return "overcast"
+
+
+def _solar_monthly_actuals(
+    plant: SolarPlantCode,
+    start_date: date,
+    end_date: date,
+) -> dict[str, dict[str, Any]]:
+    records = list(
+        _solar_records_collection()
+        .find(
+            {
+                "plant": plant,
+                "record_date": {
+                    "$gte": start_date.isoformat(),
+                    "$lte": end_date.isoformat(),
+                },
+                **_active_filter(),
+            }
+        )
+        .sort([("record_date", 1), ("_id", 1)])
+    )
+    monthly: dict[str, dict[str, Any]] = {}
+    for record in records:
+        record_date = _parse_record_date(record["record_date"])
+        month_key = _month_key(record_date.year, record_date.month)
+        bucket = monthly.setdefault(
+            month_key,
+            {
+                "total": 0.0,
+                "count": 0,
+                "weather_counts": {},
+            },
+        )
+        bucket["total"] += float(record["irradiation_w_m2"])
+        bucket["count"] += 1
+        weather_condition = record.get("weather_condition")
+        if weather_condition:
+            bucket["weather_counts"][weather_condition] = (
+                bucket["weather_counts"].get(weather_condition, 0) + 1
+            )
+    return monthly
+
+
+def _solar_historical_month_averages(
+    plant: SolarPlantCode,
+    before_date: date,
+) -> dict[int, float]:
+    records = list(
+        _solar_records_collection().find(
+            {
+                "plant": plant,
+                "record_date": {"$lt": before_date.isoformat()},
+                **_active_filter(),
+            }
+        )
+    )
+    monthly: dict[int, dict[str, float]] = {}
+    for record in records:
+        record_date = _parse_record_date(record["record_date"])
+        bucket = monthly.setdefault(record_date.month, {"total": 0.0, "count": 0})
+        bucket["total"] += float(record["irradiation_w_m2"])
+        bucket["count"] += 1
+    return {
+        month: bucket["total"] / bucket["count"]
+        for month, bucket in monthly.items()
+        if bucket["count"]
+    }
+
+
+def _solar_prediction_w_m2(
+    month: int,
+    historical_month_averages: dict[int, float],
+) -> float:
+    return historical_month_averages.get(
+        month,
+        DEFAULT_MONTHLY_SOLAR_IRRADIATION_W_M2[month - 1],
+    )
+
+
+def _dominant_weather_condition(
+    weather_counts: dict[str, int],
+    fallback_value: float,
+) -> str:
+    if weather_counts:
+        return max(weather_counts.items(), key=lambda item: (item[1], item[0]))[0]
+    return _solar_weather_condition(fallback_value)
+
+
+@router.get(
+    "/solar-forecasting/plants",
+    response_model=list[SolarPlantInfo],
+)
+def list_solar_plants():
+    """List solar plants available for resource forecasting."""
+    return [
+        SolarPlantInfo(code=plant_code, name=plant["name"])
+        for plant_code, plant in SOLAR_PLANTS.items()
+    ]
+
+
+@router.post(
+    "/solar-forecasting/records",
+    response_model=SolarIrradiationRecordResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_solar_irradiation_record(payload: SolarIrradiationRecordCreate):
+    """Create a daily solar irradiation record."""
+    now = _utcnow()
+    document = payload.model_dump()
+    document["record_date"] = payload.record_date.isoformat()
+    document["created_at"] = now
+    document["updated_at"] = now
+
+    try:
+        result = _solar_records_collection().insert_one(document)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="A solar irradiation record already exists for this plant and date",
+        )
+
+    record = _solar_records_collection().find_one({"_id": result.inserted_id})
+    return _solar_record_response(record)
+
+
+@router.get(
+    "/solar-forecasting/records",
+    response_model=SolarIrradiationListResponse,
+)
+def list_solar_irradiation_records(
+    plant: SolarPlantCode = Query("lps_solar"),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: Optional[str] = Query(None),
+    page: Optional[int] = Query(None, ge=1),
+):
+    """List solar irradiation records by date range."""
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+
+    query_filter = {"plant": plant, **_active_filter()}
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            date_filter["$gte"] = start_date.isoformat()
+        if end_date:
+            date_filter["$lte"] = end_date.isoformat()
+        query_filter["record_date"] = date_filter
+    if cursor:
+        decoded_cursor = _decode_cursor(cursor)
+        query_filter["$or"] = [
+            {"record_date": {"$lt": decoded_cursor["record_date"]}},
+            {
+                "record_date": decoded_cursor["record_date"],
+                "_id": {"$lt": decoded_cursor["_id"]},
+            },
+        ]
+
+    skip = ((page - 1) * limit) if page and not cursor else 0
+    records = list(
+        _solar_records_collection()
+        .find(query_filter)
+        .sort([("record_date", -1), ("_id", -1)])
+        .skip(skip)
+        .limit(limit + 1)
+    )
+
+    next_cursor = None
+    if len(records) > limit:
+        next_cursor = _encode_cursor(records[limit - 1])
+        records = records[:limit]
+
+    return SolarIrradiationListResponse(
+        records=[_solar_record_response(record) for record in records],
+        next_cursor=next_cursor,
+    )
+
+
+@router.get(
+    "/solar-forecasting/records/{record_id}",
+    response_model=SolarIrradiationRecordResponse,
+)
+def get_solar_irradiation_record(record_id: str):
+    """Fetch one solar irradiation record."""
+    record = _solar_records_collection().find_one(
+        {"_id": _parse_object_id(record_id, "record"), **_active_filter()}
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return _solar_record_response(record)
+
+
+@router.patch(
+    "/solar-forecasting/records/{record_id}",
+    response_model=SolarIrradiationRecordResponse,
+)
+def update_solar_irradiation_record(
+    record_id: str,
+    payload: SolarIrradiationRecordUpdate,
+):
+    """Partially update a solar irradiation record."""
+    update_data = payload.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No record values provided")
+
+    if "record_date" in update_data:
+        update_data["record_date"] = update_data["record_date"].isoformat()
+    update_data["updated_at"] = _utcnow()
+
+    try:
+        record = _solar_records_collection().find_one_and_update(
+            {"_id": _parse_object_id(record_id, "record"), **_active_filter()},
+            {"$set": update_data},
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="A solar irradiation record already exists for this plant and date",
+        )
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return _solar_record_response(record)
+
+
+@router.delete("/solar-forecasting/records/{record_id}")
+def delete_solar_irradiation_record(record_id: str):
+    """Soft delete a solar irradiation record."""
+    result = _solar_records_collection().update_one(
+        {"_id": _parse_object_id(record_id, "record"), **_active_filter()},
+        {"$set": {"deleted_at": _utcnow(), "updated_at": _utcnow()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return {"deleted": True}
+
+
+@router.get(
+    "/solar-forecasting/aggregate",
+    response_model=SolarIrradiationAggregationResponse,
+)
+def aggregate_solar_irradiation_records(
+    plant: SolarPlantCode = Query("lps_solar"),
+    group_by: ResourceAggregationGroup = Query(...),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+):
+    """Aggregate solar irradiation records to weeks, months, or years."""
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+
+    query_filter = {"plant": plant, **_active_filter()}
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            date_filter["$gte"] = start_date.isoformat()
+        if end_date:
+            date_filter["$lte"] = end_date.isoformat()
+        query_filter["record_date"] = date_filter
+
+    records = list(_solar_records_collection().find(query_filter).sort([("record_date", 1)]))
+    grouped: dict[tuple[date, date], dict[str, Any]] = {}
+
+    for record in records:
+        record_date = _parse_record_date(record["record_date"])
+        period_start, period_end = _period_bounds(record_date, group_by)
+        group = grouped.setdefault(
+            (period_start, period_end),
+            {
+                "count": 0,
+                "total": 0.0,
+                "min": None,
+                "max": None,
+            },
+        )
+        value = float(record["irradiation_w_m2"])
+        group["count"] += 1
+        group["total"] += value
+        group["min"] = value if group["min"] is None else min(group["min"], value)
+        group["max"] = value if group["max"] is None else max(group["max"], value)
+
+    response_records = [
+        SolarIrradiationAggregationRecord(
+            plant=plant,
+            group_by=group_by,
+            period_start_date=period_start,
+            period_end_date=period_end,
+            record_count=group["count"],
+            avg_irradiation_w_m2=group["total"] / group["count"] if group["count"] else None,
+            min_irradiation_w_m2=group["min"],
+            max_irradiation_w_m2=group["max"],
+        )
+        for (period_start, period_end), group in grouped.items()
+    ]
+    return SolarIrradiationAggregationResponse(records=response_records)
+
+
+@router.get(
+    "/solar-forecasting",
+    response_model=SolarForecastResponse,
+)
+def get_solar_forecast(
+    plant: SolarPlantCode = Query("lps_solar"),
+    base_date: Optional[date] = Query(None),
+):
+    """Return current and next year solar irradiation actuals and projections."""
+    resolved_base_date = base_date or _utcnow().date()
+    years = [resolved_base_date.year, resolved_base_date.year + 1]
+    months = _forecast_months(resolved_base_date)
+    current_month_start = _month_start(resolved_base_date.year, resolved_base_date.month)
+    actuals = _solar_monthly_actuals(
+        plant,
+        date(resolved_base_date.year, 1, 1),
+        _month_end(resolved_base_date.year, resolved_base_date.month),
+    )
+    historical_averages = _solar_historical_month_averages(plant, current_month_start)
+
+    response_records = []
+    for month_info in months:
+        month_key = month_info["month_key"]
+        is_actual_month = month_info["period_start_date"] <= current_month_start
+        actual = actuals.get(month_key)
+        if is_actual_month and actual and actual["count"]:
+            irradiation_w_m2 = actual["total"] / actual["count"]
+            source = "actual"
+            actual_record_count = actual["count"]
+            weather_condition = _dominant_weather_condition(
+                actual["weather_counts"],
+                irradiation_w_m2,
+            )
+        else:
+            irradiation_w_m2 = _solar_prediction_w_m2(
+                month_info["month"],
+                historical_averages,
+            )
+            source = "predicted"
+            actual_record_count = 0
+            weather_condition = _solar_weather_condition(irradiation_w_m2)
+
+        response_records.append(
+            {
+                "plant": plant,
+                "plant_name": _solar_plant_name(plant),
+                "month_key": month_key,
+                "year": month_info["year"],
+                "month": month_info["month"],
+                "period_start_date": month_info["period_start_date"],
+                "period_end_date": month_info["period_end_date"],
+                "source": source,
+                "irradiation_w_m2": irradiation_w_m2,
+                "actual_record_count": actual_record_count,
+                "weather_condition": weather_condition,
+            }
+        )
+
+    return SolarForecastResponse(
+        base_date=resolved_base_date,
+        years=years,
+        plant=plant,
+        plant_name=_solar_plant_name(plant),
+        records=response_records,
+    )
 
 
 def _calculate_hydrology_forecast_response(
