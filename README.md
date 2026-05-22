@@ -113,6 +113,14 @@ GET  /energy-scheduling/yearly-budgets/{budget_id}
 PATCH /energy-scheduling/yearly-budgets/{budget_id}
 DELETE /energy-scheduling/yearly-budgets/{budget_id}
 POST /energy-scheduling/equivalent-water-volume
+GET  /metering/sites
+GET  /metering/meters
+PATCH /metering/meters/{meter_id}
+POST /metering/meter-capture/readings
+GET  /metering/meter-capture/readings
+GET  /metering/meter-capture/readings/{record_id}
+PATCH /metering/meter-capture/readings/{record_id}
+DELETE /metering/meter-capture/readings/{record_id}
 ```
 
 Contract records require `expiration_date`. If `duration` is omitted, the API
@@ -432,3 +440,48 @@ POST /energy-scheduling/equivalent-water-volume
 The Power Sources calculation mirrors the workbook table from rows 7-19 and
 returns all computed rows in one response. MPS water-volume conversion uses the
 Mulungushi factor, and LPS uses the Mita Hills factor.
+
+## Metering
+
+Meter Capture supports 30-minute interval readings for MPS and LPS. Each site has
+four meters, and each meter can be set to `manual` or `automatic` entry mode.
+Automatic capture is only a mode flag for now; automatic ingestion can be added
+later without changing the table contract.
+
+```text
+GET /metering/sites
+GET /metering/meters?site=mps
+PATCH /metering/meters/mps_meter_1
+{
+  "entry_mode": "manual"
+}
+```
+
+Meter capture rows:
+
+```text
+GET /metering/meter-capture/readings?site=mps&limit=100
+GET /metering/meter-capture/readings?site=lps&start_time=2026-05-21T00:00:00Z&end_time=2026-05-21T23:30:00Z
+
+POST /metering/meter-capture/readings
+{
+  "site": "mps",
+  "interval_start": "2026-05-21T10:30:00Z",
+  "source": "manual",
+  "readings": {
+    "mps_meter_1": 24.125,
+    "mps_meter_2": 25.8,
+    "mps_meter_3": 28.4,
+    "mps_meter_4": 30.05
+  },
+  "notes": "Manual meter capture"
+}
+
+PATCH /metering/meter-capture/readings/{record_id}
+DELETE /metering/meter-capture/readings/{record_id}
+```
+
+List responses include `meters` for table columns and `records` for interval
+rows. `interval_start` must be aligned to `:00` or `:30`. Fresh databases are
+seeded with deterministic half-hourly dummy readings for both MPS and LPS across
+the previous seven days.

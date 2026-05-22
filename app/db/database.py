@@ -79,6 +79,73 @@ def _seed_solar_irradiation_records(collection):
         collection.insert_many(records, ordered=False)
 
 
+def _seed_metering_meters(collection):
+    """Seed the default four metering columns for each site."""
+    if collection.count_documents({}) > 0:
+        return
+
+    now = datetime.now(timezone.utc)
+    records = []
+    for site, site_name in {"mps": "MPS", "lps": "LPS"}.items():
+        for index in range(1, 5):
+            records.append(
+                {
+                    "meter_id": f"{site}_meter_{index}",
+                    "site": site,
+                    "name": f"{site_name} Meter {index}",
+                    "column_key": f"meter_{index}",
+                    "entry_mode": "manual",
+                    "unit": "MWh",
+                    "sort_order": index,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+    collection.insert_many(records, ordered=False)
+
+
+def _floor_to_meter_interval(value: datetime) -> datetime:
+    minute = 30 if value.minute >= 30 else 0
+    return value.replace(minute=minute, second=0, microsecond=0)
+
+
+def _seed_metering_interval_readings(collection):
+    """Seed recent deterministic 30-minute meter capture rows for demo use."""
+    if collection.count_documents({}) > 0:
+        return
+
+    now = datetime.now(timezone.utc)
+    end_time = _floor_to_meter_interval(now)
+    start_time = end_time - timedelta(days=7)
+    records = []
+    current_time = start_time
+
+    while current_time <= end_time:
+        interval_index = int((current_time - start_time).total_seconds() / 1800)
+        day_factor = math.sin((current_time.hour + current_time.minute / 60) / 24 * math.tau)
+        for site, site_offset in {"mps": 0.0, "lps": 3.5}.items():
+            readings = {}
+            for meter_index in range(1, 5):
+                base_value = 18 + meter_index * 2.75 + site_offset
+                variation = day_factor * 4.5 + math.sin(interval_index / 5 + meter_index) * 1.2
+                readings[f"{site}_meter_{meter_index}"] = round(max(0.0, base_value + variation), 3)
+            records.append(
+                {
+                    "site": site,
+                    "interval_start": current_time.isoformat(),
+                    "readings": readings,
+                    "source": "manual",
+                    "notes": "Seeded demo meter capture row",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        current_time += timedelta(minutes=30)
+
+    if records:
+        collection.insert_many(records, ordered=False)
+
+
 def connect_db():
     """Establish MongoDB connection and initialize required collections."""
     try:
@@ -315,6 +382,40 @@ def _initialize_collections():
         name="idx_resource_solar_irradiation_created_at",
     )
     _seed_solar_irradiation_records(solar_irradiation_collection)
+
+    if "metering_meters" not in db.list_collection_names():
+        db.create_collection("metering_meters")
+        print("Created 'metering_meters' collection")
+    metering_meters_collection = db["metering_meters"]
+    metering_meters_collection.create_index(
+        [("meter_id", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        name="idx_metering_meters_meter_id_unique",
+    )
+    metering_meters_collection.create_index(
+        [("site", ASCENDING), ("sort_order", ASCENDING)],
+        name="idx_metering_meters_site_sort",
+    )
+    _seed_metering_meters(metering_meters_collection)
+
+    if "metering_interval_readings" not in db.list_collection_names():
+        db.create_collection("metering_interval_readings")
+        print("Created 'metering_interval_readings' collection")
+    metering_readings_collection = db["metering_interval_readings"]
+    metering_readings_collection.create_index(
+        [("site", ASCENDING), ("interval_start", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        name="idx_metering_readings_site_interval_unique",
+    )
+    metering_readings_collection.create_index(
+        [("site", ASCENDING), ("interval_start", DESCENDING), ("_id", DESCENDING)],
+        name="idx_metering_readings_site_interval",
+    )
+    metering_readings_collection.create_index(
+        [("created_at", DESCENDING)],
+        name="idx_metering_readings_created_at",
+    )
+    _seed_metering_interval_readings(metering_readings_collection)
 
     if "energy_yearly_budgets" not in db.list_collection_names():
         db.create_collection("energy_yearly_budgets")
