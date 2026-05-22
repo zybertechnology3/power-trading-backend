@@ -409,17 +409,6 @@ def _volume_to_level_for_forecast(dam: str, volume_m3: float) -> dict:
     }
 
 
-def _adjusted_level_for_forecast(dam: str, level_ft: float) -> dict:
-    config = get_dam_calculation_config(dam)
-    calculation_level_ft = min(max(level_ft, config.min_level_ft), config.max_level_ft)
-    volume_result = calculate_dam_volume_at_level(dam, calculation_level_ft)
-    return {
-        "level_ft": calculation_level_ft,
-        "volume_m3": volume_result["volume_m3"],
-        "is_clamped": calculation_level_ft != level_ft or volume_result["is_off_range"],
-    }
-
-
 def _projection_start_for_reservoir(
     reservoir: ReservoirCode,
     base_date: date,
@@ -461,20 +450,17 @@ def _rainfall_input_for_reservoir(
         return {
             "total_volume_mm3": 0.0,
             "monthly_allocations_mm3": {},
-            "monthly_level_adjustments_ft": {},
             "allocated_volume_mm3": 0.0,
             "remaining_volume_mm3": 0.0,
             "overallocated_volume_mm3": 0.0,
         }
 
     allocations = dict(rainfall.monthly_allocations_mm3)
-    level_adjustments = dict(rainfall.monthly_level_adjustments_ft)
     allocated = sum(allocations.values())
     remaining = rainfall.total_volume_mm3 - allocated
     return {
         "total_volume_mm3": rainfall.total_volume_mm3,
         "monthly_allocations_mm3": allocations,
-        "monthly_level_adjustments_ft": level_adjustments,
         "allocated_volume_mm3": allocated,
         "remaining_volume_mm3": remaining,
         "overallocated_volume_mm3": max(abs(remaining), 0.0) if remaining < 0 else 0.0,
@@ -487,10 +473,7 @@ def _validate_rainfall_months(
 ) -> None:
     valid_months = {month["month_key"] for month in _forecast_months(base_date)}
     for reservoir, rainfall in payload.rainfall.items():
-        configured_months = set(rainfall.monthly_allocations_mm3) | set(
-            rainfall.monthly_level_adjustments_ft
-        )
-        for allocation_month in configured_months:
+        for allocation_month in rainfall.monthly_allocations_mm3:
             if allocation_month not in valid_months:
                 raise HTTPException(
                     status_code=400,
@@ -630,23 +613,25 @@ def _calculate_hydrology_forecast_response(
                 )
                 rainfall_volume_mm3 = rainfall["monthly_allocations_mm3"].get(month_key, 0.0)
                 rainfall_volume_m3 = rainfall_volume_mm3 * 1_000_000
-                rainfall_level_adjustment_ft = rainfall["monthly_level_adjustments_ft"].get(
-                    month_key,
-                    0.0,
-                )
 
                 projected_volume_m3 -= float(budget_water["water_volume_m3"])
                 projected_level = _volume_to_level_for_forecast(dam, projected_volume_m3)
                 projected_level_ft = projected_level["level_ft"]
-                rainfall_adjusted_level = _adjusted_level_for_forecast(
+                rainfall_adjusted_volume_m3 = projected_volume_m3 + rainfall_volume_m3
+                rainfall_adjusted_level = _volume_to_level_for_forecast(
                     dam,
-                    projected_level_ft + rainfall_level_adjustment_ft,
+                    rainfall_adjusted_volume_m3,
                 )
                 rainfall_adjusted_level_ft = rainfall_adjusted_level["level_ft"]
+                rainfall_level_adjustment_ft = (
+                    rainfall_adjusted_level_ft - projected_level_ft
+                    if rainfall_adjusted_level_ft is not None and projected_level_ft is not None
+                    else 0.0
+                )
                 projected_level_clamped = projected_level["is_clamped"]
                 rainfall_adjusted_level_clamped = rainfall_adjusted_level["is_clamped"]
                 response_projected_volume_m3 = projected_volume_m3
-                response_rainfall_adjusted_volume_m3 = rainfall_adjusted_level["volume_m3"]
+                response_rainfall_adjusted_volume_m3 = rainfall_adjusted_volume_m3
 
             response_months.append(
                 {

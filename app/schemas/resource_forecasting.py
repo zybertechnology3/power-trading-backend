@@ -234,7 +234,6 @@ class HydrologyRainfallAllocationInput(BaseModel):
 
     total_volume_mm3: float = Field(0, ge=0)
     monthly_allocations_mm3: dict[str, float] = Field(default_factory=dict)
-    monthly_level_adjustments_ft: dict[str, float] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_monthly_allocations(self):
@@ -245,13 +244,6 @@ class HydrologyRainfallAllocationInput(BaseModel):
                 raise ValueError("monthly allocation keys must use YYYY-MM format")
             if value < 0:
                 raise ValueError("monthly allocation values must be non-negative")
-        for month_key, value in self.monthly_level_adjustments_ft.items():
-            try:
-                date.fromisoformat(f"{month_key}-01")
-            except ValueError:
-                raise ValueError("monthly level adjustment keys must use YYYY-MM format")
-            if value < 0:
-                raise ValueError("monthly level adjustment values must be non-negative")
         return self
 
 
