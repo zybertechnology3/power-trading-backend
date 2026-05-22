@@ -81,6 +81,10 @@ def _fields_collection():
     return get_db()["resource_level_monitoring_fields"]
 
 
+def _hydrology_forecasts_collection():
+    return get_db()["resource_hydrology_forecasts"]
+
+
 def _active_filter() -> dict:
     return {"deleted_at": {"$exists": False}}
 
@@ -405,6 +409,17 @@ def _volume_to_level_for_forecast(dam: str, volume_m3: float) -> dict:
     }
 
 
+def _adjusted_level_for_forecast(dam: str, level_ft: float) -> dict:
+    config = get_dam_calculation_config(dam)
+    calculation_level_ft = min(max(level_ft, config.min_level_ft), config.max_level_ft)
+    volume_result = calculate_dam_volume_at_level(dam, calculation_level_ft)
+    return {
+        "level_ft": calculation_level_ft,
+        "volume_m3": volume_result["volume_m3"],
+        "is_clamped": calculation_level_ft != level_ft or volume_result["is_off_range"],
+    }
+
+
 def _projection_start_for_reservoir(
     reservoir: ReservoirCode,
     base_date: date,
@@ -446,17 +461,23 @@ def _rainfall_input_for_reservoir(
         return {
             "total_volume_mm3": 0.0,
             "monthly_allocations_mm3": {},
+            "monthly_level_adjustments_ft": {},
             "allocated_volume_mm3": 0.0,
             "remaining_volume_mm3": 0.0,
+            "overallocated_volume_mm3": 0.0,
         }
 
     allocations = dict(rainfall.monthly_allocations_mm3)
+    level_adjustments = dict(rainfall.monthly_level_adjustments_ft)
     allocated = sum(allocations.values())
+    remaining = rainfall.total_volume_mm3 - allocated
     return {
         "total_volume_mm3": rainfall.total_volume_mm3,
         "monthly_allocations_mm3": allocations,
+        "monthly_level_adjustments_ft": level_adjustments,
         "allocated_volume_mm3": allocated,
-        "remaining_volume_mm3": rainfall.total_volume_mm3 - allocated,
+        "remaining_volume_mm3": remaining,
+        "overallocated_volume_mm3": max(abs(remaining), 0.0) if remaining < 0 else 0.0,
     }
 
 
@@ -465,9 +486,11 @@ def _validate_rainfall_months(
     base_date: date,
 ) -> None:
     valid_months = {month["month_key"] for month in _forecast_months(base_date)}
-    current_month_key = _month_key(base_date.year, base_date.month)
     for reservoir, rainfall in payload.rainfall.items():
-        for allocation_month in rainfall.monthly_allocations_mm3:
+        configured_months = set(rainfall.monthly_allocations_mm3) | set(
+            rainfall.monthly_level_adjustments_ft
+        )
+        for allocation_month in configured_months:
             if allocation_month not in valid_months:
                 raise HTTPException(
                     status_code=400,
@@ -476,14 +499,55 @@ def _validate_rainfall_months(
                         "is outside the current/next year forecast window"
                     ),
                 )
-            if allocation_month < current_month_key:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"{reservoir} rainfall allocation month {allocation_month} "
-                        "cannot be before the current month"
-                    ),
-                )
+
+
+def _saved_hydrology_forecast_for_base_date(base_date: date) -> Optional[dict]:
+    return _hydrology_forecasts_collection().find_one(
+        {"start_year": base_date.year, **_active_filter()},
+        sort=[("updated_at", -1), ("_id", -1)],
+    )
+
+
+def _hydrology_request_from_saved_forecast(
+    base_date: date,
+    saved_forecast: Optional[dict],
+) -> HydrologyForecastRequest:
+    if not saved_forecast:
+        return HydrologyForecastRequest(base_date=base_date)
+    return HydrologyForecastRequest(
+        base_date=base_date,
+        rainfall=saved_forecast.get("rainfall") or {},
+    )
+
+
+def _save_hydrology_forecast(payload: HydrologyForecastRequest) -> dict:
+    base_date = payload.base_date or _utcnow().date()
+    payload = HydrologyForecastRequest(
+        base_date=base_date,
+        rainfall=payload.rainfall,
+    )
+    _validate_rainfall_months(payload, base_date)
+
+    now = _utcnow()
+    rainfall = {
+        reservoir: forecast.model_dump()
+        for reservoir, forecast in payload.rainfall.items()
+    }
+    return _hydrology_forecasts_collection().find_one_and_update(
+        {"start_year": base_date.year, **_active_filter()},
+        {
+            "$set": {
+                "start_year": base_date.year,
+                "years": [base_date.year, base_date.year + 1],
+                "base_date": base_date.isoformat(),
+                "rainfall": rainfall,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
 
 
 @router.get("/reservoirs", response_model=list[ReservoirInfo])
@@ -504,6 +568,7 @@ def list_reservoirs():
 
 def _calculate_hydrology_forecast_response(
     payload: HydrologyForecastRequest,
+    saved_forecast: Optional[dict] = None,
 ) -> HydrologyForecastResponse:
     base_date = payload.base_date or _utcnow().date()
     _validate_rainfall_months(payload, base_date)
@@ -526,7 +591,6 @@ def _calculate_hydrology_forecast_response(
         rainfall = _rainfall_input_for_reservoir(payload, reservoir)
 
         projected_volume_m3 = float(projection_start["volume_m3"])
-        rainfall_adjusted_volume_m3 = projected_volume_m3
         response_months = []
 
         for month_info in months:
@@ -539,6 +603,7 @@ def _calculate_hydrology_forecast_response(
             }
             rainfall_volume_mm3 = 0.0
             rainfall_volume_m3 = 0.0
+            rainfall_level_adjustment_ft = 0.0
             monitoring_record = None
             observed_level_ft = None
             projected_level_ft = None
@@ -565,25 +630,23 @@ def _calculate_hydrology_forecast_response(
                 )
                 rainfall_volume_mm3 = rainfall["monthly_allocations_mm3"].get(month_key, 0.0)
                 rainfall_volume_m3 = rainfall_volume_mm3 * 1_000_000
+                rainfall_level_adjustment_ft = rainfall["monthly_level_adjustments_ft"].get(
+                    month_key,
+                    0.0,
+                )
 
                 projected_volume_m3 -= float(budget_water["water_volume_m3"])
-                rainfall_adjusted_volume_m3 = (
-                    rainfall_adjusted_volume_m3
-                    - float(budget_water["water_volume_m3"])
-                    + rainfall_volume_m3
-                )
-
                 projected_level = _volume_to_level_for_forecast(dam, projected_volume_m3)
-                rainfall_adjusted_level = _volume_to_level_for_forecast(
-                    dam,
-                    rainfall_adjusted_volume_m3,
-                )
                 projected_level_ft = projected_level["level_ft"]
+                rainfall_adjusted_level = _adjusted_level_for_forecast(
+                    dam,
+                    projected_level_ft + rainfall_level_adjustment_ft,
+                )
                 rainfall_adjusted_level_ft = rainfall_adjusted_level["level_ft"]
                 projected_level_clamped = projected_level["is_clamped"]
                 rainfall_adjusted_level_clamped = rainfall_adjusted_level["is_clamped"]
                 response_projected_volume_m3 = projected_volume_m3
-                response_rainfall_adjusted_volume_m3 = rainfall_adjusted_volume_m3
+                response_rainfall_adjusted_volume_m3 = rainfall_adjusted_level["volume_m3"]
 
             response_months.append(
                 {
@@ -613,6 +676,7 @@ def _calculate_hydrology_forecast_response(
                     "budget_water_volume_mm3": float(budget_water["water_volume_mm3"]),
                     "rainfall_volume_m3": rainfall_volume_m3,
                     "rainfall_volume_mm3": rainfall_volume_mm3,
+                    "rainfall_level_adjustment_ft": rainfall_level_adjustment_ft,
                     "budget_energy_gwh": budget_water["energy_gwh"],
                     "projected_level_clamped": projected_level_clamped,
                     "rainfall_adjusted_level_clamped": rainfall_adjusted_level_clamped,
@@ -633,6 +697,7 @@ def _calculate_hydrology_forecast_response(
                 "rainfall_total_volume_mm3": rainfall["total_volume_mm3"],
                 "rainfall_allocated_volume_mm3": rainfall["allocated_volume_mm3"],
                 "rainfall_remaining_volume_mm3": rainfall["remaining_volume_mm3"],
+                "rainfall_overallocated_volume_mm3": rainfall["overallocated_volume_mm3"],
                 "months": response_months,
             }
         )
@@ -640,6 +705,8 @@ def _calculate_hydrology_forecast_response(
     return HydrologyForecastResponse(
         base_date=base_date,
         years=years,
+        saved_forecast_id=str(saved_forecast["_id"]) if saved_forecast else None,
+        saved_forecast_updated_at=saved_forecast.get("updated_at") if saved_forecast else None,
         records=forecast_records,
     )
 
@@ -651,9 +718,26 @@ def _calculate_hydrology_forecast_response(
 def get_hydrology_forecast(
     base_date: Optional[date] = Query(None),
 ):
-    """Return current and next year hydrology forecast without rainfall allocations."""
+    """Return current and next year hydrology forecast with the saved rainfall forecast."""
+    resolved_base_date = base_date or _utcnow().date()
+    saved_forecast = _saved_hydrology_forecast_for_base_date(resolved_base_date)
     return _calculate_hydrology_forecast_response(
-        HydrologyForecastRequest(base_date=base_date)
+        _hydrology_request_from_saved_forecast(resolved_base_date, saved_forecast),
+        saved_forecast=saved_forecast,
+    )
+
+
+@router.put(
+    "/hydrology-forecasting",
+    response_model=HydrologyForecastResponse,
+)
+def save_hydrology_forecast(payload: HydrologyForecastRequest):
+    """Persist rainfall forecast adjustments and return the resulting forecast."""
+    saved_forecast = _save_hydrology_forecast(payload)
+    base_date = payload.base_date or _utcnow().date()
+    return _calculate_hydrology_forecast_response(
+        _hydrology_request_from_saved_forecast(base_date, saved_forecast),
+        saved_forecast=saved_forecast,
     )
 
 

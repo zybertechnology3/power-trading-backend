@@ -234,6 +234,7 @@ class HydrologyRainfallAllocationInput(BaseModel):
 
     total_volume_mm3: float = Field(0, ge=0)
     monthly_allocations_mm3: dict[str, float] = Field(default_factory=dict)
+    monthly_level_adjustments_ft: dict[str, float] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_monthly_allocations(self):
@@ -244,8 +245,13 @@ class HydrologyRainfallAllocationInput(BaseModel):
                 raise ValueError("monthly allocation keys must use YYYY-MM format")
             if value < 0:
                 raise ValueError("monthly allocation values must be non-negative")
-        if sum(self.monthly_allocations_mm3.values()) > self.total_volume_mm3:
-            raise ValueError("monthly allocations cannot exceed total_volume_mm3")
+        for month_key, value in self.monthly_level_adjustments_ft.items():
+            try:
+                date.fromisoformat(f"{month_key}-01")
+            except ValueError:
+                raise ValueError("monthly level adjustment keys must use YYYY-MM format")
+            if value < 0:
+                raise ValueError("monthly level adjustment values must be non-negative")
         return self
 
 
@@ -281,6 +287,7 @@ class HydrologyForecastMonthResponse(BaseModel):
     budget_water_volume_mm3: float = 0
     rainfall_volume_m3: float = 0
     rainfall_volume_mm3: float = 0
+    rainfall_level_adjustment_ft: float = 0
     budget_energy_gwh: Optional[float] = None
     projected_level_clamped: bool = False
     rainfall_adjusted_level_clamped: bool = False
@@ -301,6 +308,7 @@ class HydrologyForecastReservoirResponse(BaseModel):
     rainfall_total_volume_mm3: float
     rainfall_allocated_volume_mm3: float
     rainfall_remaining_volume_mm3: float
+    rainfall_overallocated_volume_mm3: float = 0
     months: list[HydrologyForecastMonthResponse]
 
 
@@ -309,4 +317,6 @@ class HydrologyForecastResponse(BaseModel):
 
     base_date: date
     years: list[int]
+    saved_forecast_id: Optional[str] = None
+    saved_forecast_updated_at: Optional[datetime] = None
     records: list[HydrologyForecastReservoirResponse]

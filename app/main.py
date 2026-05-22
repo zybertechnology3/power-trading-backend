@@ -113,3 +113,7 @@ if __name__ == "__main__":
 
 #TODO - scrape from "MTP - DAM - Participant Portfolio Results for 2026/05/15"
 #TODO - scrape from "MTP-Trading-Invoice-Credit-Note_LHPC-ZAML-C1_2026-04-08_1"
+
+#TODO - YEARLY BUDGET SHOULD COMMUNICATE WITH THE FORECASTED LEVELS TO INDICATE SPILLAGE OR SHORTAGES
+
+#TODO - YEARLY BUDGET - SPILLAGE QTY(in MW) AND SPILLAGE COST

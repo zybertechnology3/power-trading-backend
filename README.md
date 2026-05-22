@@ -91,6 +91,7 @@ PATCH /resource-forecasting/level-monitoring/records/{record_id}
 DELETE /resource-forecasting/level-monitoring/records/{record_id}
 GET  /resource-forecasting/level-monitoring/aggregate
 GET  /resource-forecasting/hydrology-forecasting
+PUT  /resource-forecasting/hydrology-forecasting
 POST /resource-forecasting/hydrology-forecasting/calculate
 GET  /resource-forecasting/dam-calculation/configs
 POST /resource-forecasting/dam-calculation/calculate
@@ -241,9 +242,12 @@ month as the month-end level. The current month and future months start from the
 latest monitoring level before the current month. Each projected month is then
 calculated as previous month level minus that month's equivalent water volume
 from the yearly budget. If no saved budget exists for a year, the default yearly
-budget is used.
+budget is used. If a saved hydrology rainfall forecast exists for the selected
+base year, `GET /resource-forecasting/hydrology-forecasting` applies it and
+returns `saved_forecast_id` plus `saved_forecast_updated_at`.
 
-Use rainfall allocations to calculate the red rainfall-adjusted line/bar:
+Use rainfall allocations to preview the red rainfall-adjusted line/bar without
+saving:
 
 ```text
 POST /resource-forecasting/hydrology-forecasting/calculate
@@ -255,12 +259,19 @@ POST /resource-forecasting/hydrology-forecasting/calculate
       "monthly_allocations_mm3": {
         "2026-06": 10,
         "2026-12": 20
+      },
+      "monthly_level_adjustments_ft": {
+        "2026-06": 10,
+        "2026-12": 4
       }
     },
     "lps": {
       "total_volume_mm3": 12,
       "monthly_allocations_mm3": {
         "2026-11": 12
+      },
+      "monthly_level_adjustments_ft": {
+        "2026-11": 3
       }
     }
   }
@@ -269,8 +280,39 @@ POST /resource-forecasting/hydrology-forecasting/calculate
 
 Rainfall volumes are in `Mm3`, matching the yearly budget equivalent water-volume
 unit. Allocations may be less than the total while the user is editing; the
-response includes `rainfall_remaining_volume_mm3`. Allocations cannot exceed the
-total or target months before the current month.
+response includes `rainfall_remaining_volume_mm3`. If monthly allocations exceed
+the total, the API no longer rejects the request; it returns a negative remaining
+value and `rainfall_overallocated_volume_mm3` for the frontend to display.
+
+Rainfall level adjustments are in feet via `monthly_level_adjustments_ft`. The
+red line is calculated as `projected_level_ft + rainfall_level_adjustment_ft` for
+that month and is clamped to the dam calculation min/max level if it exceeds the
+configured range.
+
+Save the hydrologist's forecast with:
+
+```text
+PUT /resource-forecasting/hydrology-forecasting
+{
+  "base_date": "2026-05-21",
+  "rainfall": {
+    "mps": {
+      "total_volume_mm3": 30,
+      "monthly_allocations_mm3": {
+        "2026-06": 10,
+        "2026-12": 20
+      },
+      "monthly_level_adjustments_ft": {
+        "2026-06": 10,
+        "2026-12": 4
+      }
+    }
+  }
+}
+```
+
+The saved forecast is keyed by the base year and is reused by later GET requests
+until it is overwritten by another PUT for the same base year.
 
 Each reservoir response includes monthly `projected_level_ft` for the green
 forecast and `rainfall_adjusted_level_ft` for the red rainfall-adjusted forecast.

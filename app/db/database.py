@@ -219,6 +219,20 @@ def _initialize_collections():
         name="idx_resource_level_fields_reservoir_created",
     )
 
+    if "resource_hydrology_forecasts" not in db.list_collection_names():
+        db.create_collection("resource_hydrology_forecasts")
+        print("Created 'resource_hydrology_forecasts' collection")
+    hydrology_forecasts_collection = db["resource_hydrology_forecasts"]
+    hydrology_forecasts_collection.create_index(
+        [("start_year", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        name="idx_resource_hydrology_forecasts_start_year_unique",
+    )
+    hydrology_forecasts_collection.create_index(
+        [("updated_at", DESCENDING)],
+        name="idx_resource_hydrology_forecasts_updated_at",
+    )
+
     if "energy_yearly_budgets" not in db.list_collection_names():
         db.create_collection("energy_yearly_budgets")
         print("Created 'energy_yearly_budgets' collection")
