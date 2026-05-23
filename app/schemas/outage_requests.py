@@ -1,37 +1,38 @@
 """
-Pydantic schemas for power outage requests.
+Pydantic schemas for power outage records.
 """
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-OutageRequestStatus = Literal["draft", "submitted", "approved", "rejected", "completed"]
 OutageReason = Literal["PM", "CM", "SF", "CO"]
 
 
 class GeneratingUnitResponse(BaseModel):
-    """Generating unit option used by outage requests."""
+    """Generating unit option used by outage records."""
 
     unit_code: str
     unit_name: str
 
 
-class OutageItemInput(BaseModel):
-    """Create or replace one outage request line."""
+class OutageRequestCreate(BaseModel):
+    """Create one outage window."""
 
     unit_code: str = Field(..., min_length=1)
     reason: OutageReason
     start_at: datetime
     restore_at: datetime
     expected_mw_reduction: Optional[float] = Field(None, ge=0)
-    description: str = Field(..., min_length=1)
+    description: Optional[str] = Field(None, min_length=1)
 
     @field_validator("unit_code", "description")
     @classmethod
-    def strip_required_text(cls, value: str) -> str:
+    def strip_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         stripped_value = value.strip()
         if not stripped_value:
             raise ValueError("field must not be blank")
@@ -44,60 +45,14 @@ class OutageItemInput(BaseModel):
         return self
 
 
-class OutageRequestCreate(BaseModel):
-    """Create an outage request with one or more items."""
-
-    document_no: str = Field(..., min_length=1)
-    revision_no: str = Field(..., min_length=1)
-    implementation_date: date
-    document_owner: str = Field(..., min_length=1)
-    approver: str = Field(..., min_length=1)
-    date_approved: Optional[date] = None
-    status: OutageRequestStatus = "draft"
-    created_by: str = Field(..., min_length=1)
-    items: list[OutageItemInput] = Field(..., min_length=1)
-
-    @field_validator("document_no", "revision_no", "document_owner", "approver", "created_by")
-    @classmethod
-    def strip_required_text(cls, value: str) -> str:
-        stripped_value = value.strip()
-        if not stripped_value:
-            raise ValueError("field must not be blank")
-        return stripped_value
+class OutageRequestReplace(OutageRequestCreate):
+    """Replace one outage window."""
 
 
-class OutageRequestReplace(BaseModel):
-    """Replace an outage request header and items."""
+class OutageRequestResponse(BaseModel):
+    """Outage record returned by the API."""
 
-    document_no: str = Field(..., min_length=1)
-    revision_no: str = Field(..., min_length=1)
-    implementation_date: date
-    document_owner: str = Field(..., min_length=1)
-    approver: str = Field(..., min_length=1)
-    date_approved: Optional[date] = None
-    status: OutageRequestStatus
-    created_by: str = Field(..., min_length=1)
-    items: list[OutageItemInput] = Field(..., min_length=1)
-
-    @field_validator("document_no", "revision_no", "document_owner", "approver", "created_by")
-    @classmethod
-    def strip_required_text(cls, value: str) -> str:
-        stripped_value = value.strip()
-        if not stripped_value:
-            raise ValueError("field must not be blank")
-        return stripped_value
-
-
-class OutageStatusUpdate(BaseModel):
-    """Workflow status transition request."""
-
-    status: OutageRequestStatus
-
-
-class OutageItemResponse(BaseModel):
-    """One outage request line returned by the API."""
-
-    outage_no: int
+    id: str
     unit_code: str
     unit_name: str
     reason: OutageReason
@@ -105,35 +60,12 @@ class OutageItemResponse(BaseModel):
     restore_at: datetime
     duration_hrs: float
     expected_mw_reduction: Optional[float] = None
-    description: str
-
-
-class OutageRequestSummary(BaseModel):
-    """Per-request outage summary."""
-
-    total_duration_hrs: float
-    total_expected_mw_reduction: float
-
-
-class OutageRequestResponse(BaseModel):
-    """Outage request returned by the API."""
-
-    id: str
-    document_no: str
-    revision_no: str
-    implementation_date: date
-    document_owner: str
-    approver: str
-    date_approved: Optional[date] = None
-    status: OutageRequestStatus
-    created_by: str
+    description: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-    items: list[OutageItemResponse]
-    summary: OutageRequestSummary
 
 
 class OutageRequestListResponse(BaseModel):
-    """Outage request list response."""
+    """Outage record list response."""
 
     records: list[OutageRequestResponse]

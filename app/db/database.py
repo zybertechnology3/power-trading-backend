@@ -322,18 +322,21 @@ def _initialize_collections():
         db.create_collection("outage_requests")
         print("Created 'outage_requests' collection")
     outage_requests_collection = db["outage_requests"]
+    outage_index_names = outage_requests_collection.index_information()
+    for obsolete_index_name in (
+        "idx_outage_requests_document_no_unique",
+        "idx_outage_requests_status_implementation_created",
+        "idx_outage_requests_items_unit_window",
+    ):
+        if obsolete_index_name in outage_index_names:
+            outage_requests_collection.drop_index(obsolete_index_name)
     outage_requests_collection.create_index(
-        [("document_no", ASCENDING), ("deleted_at", ASCENDING)],
-        unique=True,
-        name="idx_outage_requests_document_no_unique",
+        [("unit_code", ASCENDING), ("start_at", ASCENDING), ("restore_at", ASCENDING)],
+        name="idx_outage_requests_unit_window",
     )
     outage_requests_collection.create_index(
-        [("status", ASCENDING), ("implementation_date", DESCENDING), ("created_at", DESCENDING)],
-        name="idx_outage_requests_status_implementation_created",
-    )
-    outage_requests_collection.create_index(
-        [("items.unit_code", ASCENDING), ("items.start_at", ASCENDING), ("items.restore_at", ASCENDING)],
-        name="idx_outage_requests_items_unit_window",
+        [("start_at", DESCENDING), ("_id", DESCENDING)],
+        name="idx_outage_requests_start",
     )
 
     if "resource_level_monitoring_records" not in db.list_collection_names():
