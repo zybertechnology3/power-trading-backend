@@ -14,7 +14,16 @@ if __package__ in (None, ""):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import Contract, energy_scheduling, health, metering, resource_forecasting, sapp, telemetry
+from app.api import (
+    Contract,
+    energy_scheduling,
+    health,
+    metering,
+    outage_requests,
+    resource_forecasting,
+    sapp,
+    telemetry,
+)
 from app.core.config import settings
 from app.db.database import connect_db, disconnect_db
 
@@ -72,6 +81,7 @@ app.include_router(Contract.router)
 app.include_router(resource_forecasting.router)
 app.include_router(energy_scheduling.router)
 app.include_router(metering.router)
+app.include_router(outage_requests.router)
 
 
 # ===== ROOT ENDPOINT =====
@@ -110,10 +120,6 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=settings.DEBUG,
     )
-
-
-#TODO - scrape from "MTP - DAM - Participant Portfolio Results for 2026/05/15"
-#TODO - scrape from "MTP-Trading-Invoice-Credit-Note_LHPC-ZAML-C1_2026-04-08_1"
 
 #TODO - YEARLY BUDGET SHOULD COMMUNICATE WITH THE FORECASTED LEVELS TO INDICATE SPILLAGE OR SHORTAGES
 

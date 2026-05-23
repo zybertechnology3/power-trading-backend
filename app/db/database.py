@@ -318,6 +318,24 @@ def _initialize_collections():
         name="idx_contracts_customer",
     )
 
+    if "outage_requests" not in db.list_collection_names():
+        db.create_collection("outage_requests")
+        print("Created 'outage_requests' collection")
+    outage_requests_collection = db["outage_requests"]
+    outage_requests_collection.create_index(
+        [("document_no", ASCENDING), ("deleted_at", ASCENDING)],
+        unique=True,
+        name="idx_outage_requests_document_no_unique",
+    )
+    outage_requests_collection.create_index(
+        [("status", ASCENDING), ("implementation_date", DESCENDING), ("created_at", DESCENDING)],
+        name="idx_outage_requests_status_implementation_created",
+    )
+    outage_requests_collection.create_index(
+        [("items.unit_code", ASCENDING), ("items.start_at", ASCENDING), ("items.restore_at", ASCENDING)],
+        name="idx_outage_requests_items_unit_window",
+    )
+
     if "resource_level_monitoring_records" not in db.list_collection_names():
         db.create_collection("resource_level_monitoring_records")
         print("Created 'resource_level_monitoring_records' collection")

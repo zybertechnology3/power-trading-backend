@@ -80,6 +80,13 @@ PATCH /contracts/{contract_id}
 DELETE /contracts/{contract_id}
 POST /contracts/{contract_id}/files
 DELETE /contracts/{contract_id}/files/{file_id}
+GET  /outage-requests/generating-units
+GET  /outage-requests
+GET  /outage-requests/{id}
+POST /outage-requests
+PUT  /outage-requests/{id}
+PATCH /outage-requests/{id}/status
+DELETE /outage-requests/{id}
 GET  /resource-forecasting/reservoirs
 POST /resource-forecasting/level-monitoring/fields
 GET  /resource-forecasting/level-monitoring/fields
@@ -127,6 +134,52 @@ Contract records require `expiration_date`. If `duration` is omitted, the API
 derives it as a date range from `effective_date` to `expiration_date`. Date
 fields can carry reminder preferences for future alert processing via
 `expiration_reminder` or `custom_fields[].reminder`.
+
+## Contract Operations
+
+Power outage requests:
+
+```text
+GET /outage-requests/generating-units
+GET /outage-requests?status=approved&unit=MPS%20UNIT%204&from=2026-06-01T00:00:00Z&to=2026-06-30T23:59:59Z
+GET /outage-requests/{id}
+
+POST /outage-requests
+{
+  "document_no": "LHPC-XXX-PRO-001",
+  "revision_no": "0",
+  "implementation_date": "2026-06-01",
+  "document_owner": "Operations",
+  "approver": "Plant Manager",
+  "status": "draft",
+  "created_by": "planner@example.com",
+  "items": [
+    {
+      "unit_code": "MPS UNIT 4",
+      "reason": "PM",
+      "start_at": "2026-06-10T08:00:00Z",
+      "restore_at": "2026-06-10T14:30:00Z",
+      "expected_mw_reduction": 24.5,
+      "description": "Preventive maintenance outage"
+    }
+  ]
+}
+
+PUT /outage-requests/{id}
+PATCH /outage-requests/{id}/status
+{
+  "status": "submitted"
+}
+DELETE /outage-requests/{id}
+```
+
+Items are embedded under each outage request. `outage_no` is assigned from line
+order, `unit_name` is denormalized from the generating-unit lookup, and
+`duration_hrs` is derived from `restore_at - start_at`. Requests validate
+`restore_at > start_at`; approval auto-stamps `date_approved`; approved requests
+cannot overlap another approved outage for the same `unit_code`. Deletes are only
+allowed while a request is in `draft`. List responses include each request's
+`summary.total_duration_hrs` and `summary.total_expected_mw_reduction`.
 
 ## SAPP Examples
 
