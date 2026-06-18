@@ -50,7 +50,7 @@ def _outage_collection():
 
 
 def _active_filter() -> dict:
-    return {"deleted_at": {"$exists": False}}
+    return {"deleted_at": {"$exists": False}, "unit_code": {"$exists": True}}
 
 
 def _parse_datetime(value: Any) -> datetime:

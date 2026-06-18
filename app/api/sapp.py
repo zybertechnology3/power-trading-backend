@@ -5,6 +5,7 @@ SAPP MTP constrained area result endpoints.
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, Optional
 
+import httpx
 from bson.errors import InvalidId
 from bson.objectid import ObjectId
 from fastapi import APIRouter, HTTPException, Query, status
@@ -17,6 +18,7 @@ from app.core.time_of_use import (
     count_time_of_use_hours,
     get_time_of_use_period,
 )
+from app.core.config import settings
 from app.db.database import get_db
 from app.schemas.sapp import (
     BidStatus,
@@ -35,6 +37,7 @@ from app.schemas.sapp import (
     SappConstrainedAreaResultResponse,
     SappParticipantPortfolioResultList,
     SappParticipantPortfolioResultResponse,
+    SappPublicHolidayResponse,
     SappScrapeRangeResponse,
     SappScrapeResponse,
     SappTradingInvoiceCreditNoteList,
@@ -52,6 +55,7 @@ from sapp_scraper import (
 router = APIRouter(prefix="/sapp", tags=["sapp"])
 
 Frequency = Literal["1h", "4h", "1d", "1w", "1mo", "1y"]
+BOTSWANA_COUNTRY_CODE = "BW"
 MONDAY = 0
 FRIDAY = 4
 WEDNESDAY = 2
@@ -77,6 +81,8 @@ FREQUENCY_BUCKETS = {
     "1y": {"unit": "year", "binSize": 1},
 }
 
+PUBLIC_HOLIDAY_TYPES = {"Public"}
+
 
 def _serialize_result(record: dict) -> dict:
     record["_id"] = str(record["_id"])
@@ -85,6 +91,27 @@ def _serialize_result(record: dict) -> dict:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _public_holidays_api_url(year: int) -> str:
+    return (
+        f"{settings.PUBLIC_HOLIDAYS_API_BASE_URL.rstrip('/')}"
+        f"/PublicHolidays/{year}/{BOTSWANA_COUNTRY_CODE}"
+    )
+
+
+def _normalize_public_holiday(record: dict) -> dict:
+    return {
+        "date": record["date"],
+        "local_name": record.get("localName") or record.get("local_name") or record["name"],
+        "name": record["name"],
+        "country_code": record.get("countryCode") or record.get("country_code") or BOTSWANA_COUNTRY_CODE,
+        "fixed": bool(record.get("fixed", False)),
+        "global_holiday": bool(record.get("global", record.get("global_holiday", True))),
+        "counties": record.get("counties"),
+        "launch_year": record.get("launchYear") or record.get("launch_year"),
+        "types": record.get("types") or [],
+    }
 
 
 def _parse_object_id(record_id: str, record_name: str) -> ObjectId:
@@ -126,6 +153,43 @@ def _calculate_weighted_average_price(
         for quantity, hour_count in weighted_quantities
     )
     return total_value / total_volume
+
+
+@router.get(
+    "/public-holidays",
+    response_model=list[SappPublicHolidayResponse],
+)
+def list_botswana_public_holidays(
+    year: int = Query(..., ge=1900, le=2100),
+    public_only: bool = Query(True),
+):
+    """List Botswana public holidays for SAPP market calendar use."""
+    try:
+        response = httpx.get(_public_holidays_api_url(year), timeout=10)
+        response.raise_for_status()
+        records = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Public holidays provider returned "
+                f"{exc.response.status_code}"
+            ),
+        )
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(
+            status_code=502,
+            detail="Public holidays provider is unavailable",
+        )
+
+    holidays = [_normalize_public_holiday(record) for record in records]
+    if public_only:
+        holidays = [
+            holiday
+            for holiday in holidays
+            if not holiday["types"] or PUBLIC_HOLIDAY_TYPES.intersection(holiday["types"])
+        ]
+    return holidays
 
 
 def _add_one_month(value: date) -> date:

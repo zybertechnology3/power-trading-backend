@@ -14,6 +14,20 @@ SappBidProduct = Literal["off_peak", "peak", "standard"]
 MONDAY = 0
 
 
+class SappPublicHolidayResponse(BaseModel):
+    """Public holiday returned by the Botswana/SAPP market calendar endpoint."""
+
+    date: date
+    local_name: str
+    name: str
+    country_code: str
+    fixed: bool
+    global_holiday: bool
+    counties: Optional[list[str]] = None
+    launch_year: Optional[int] = None
+    types: list[str] = Field(default_factory=list)
+
+
 class SappBidQuantity(BaseModel):
     """Sparse bid cell value for one DAM hour or FPM product and one price column."""
 

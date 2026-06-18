@@ -57,6 +57,7 @@ GET  /health/db
 GET  /sapp/scrape-jobs
 POST /sapp/scrape
 POST /sapp/scrape-range
+GET  /sapp/public-holidays
 GET  /sapp/constrained-area-results
 GET  /sapp/constrained-area-results/{delivery_date}
 POST /sapp/bids
@@ -163,6 +164,20 @@ is derived from `restore_at - start_at`. Requests validate `restore_at >
 start_at` and reject overlapping outage windows for the same `unit_code`.
 
 ## SAPP Examples
+
+Botswana public holidays for SAPP market calendar logic:
+
+```text
+GET /sapp/public-holidays?year=2026
+GET /sapp/public-holidays?year=2026&public_only=false
+```
+
+The endpoint fetches Botswana (`BW`) holidays from the configured public
+holidays provider and normalizes the response to snake_case fields:
+`date`, `local_name`, `name`, `country_code`, `fixed`, `global_holiday`,
+`counties`, `launch_year`, and `types`. The provider base URL defaults to
+`https://date.nager.at/api/v3` and can be overridden with
+`PUBLIC_HOLIDAYS_API_BASE_URL`.
 
 Scrape one delivery date locally:
 

@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
+    # External public calendar APIs
+    PUBLIC_HOLIDAYS_API_BASE_URL: str = "https://date.nager.at/api/v3"
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug_value(cls, value):
