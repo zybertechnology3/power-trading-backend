@@ -33,6 +33,10 @@ INBOX_URL = f"{BASE_URL}/mdd/message-inbox"
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 CONSTRAINED_AREA_SUBJECT_TEMPLATE = "MTP - DAM - Constrained Area Results for {delivery_date}"
 CONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
+UNCONSTRAINED_AREA_SUBJECT_TEMPLATE = (
+    "MTP - DAM - Unconstrained Results for {delivery_date}"
+)
+UNCONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_UNCONSTRAINED_RESULTS"
 PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE = (
     "MTP - DAM - Participant Portfolio Results for {delivery_date}"
 )
@@ -46,7 +50,7 @@ TRADING_INVOICE_HOURLY_COLLECTION = "sapp_trading_invoice_hourly_details"
 INTERNAL_COLLECTION_FIELD = "_collection_name"
 INTERNAL_UNIQUE_KEY_FIELDS_FIELD = "_unique_key_fields"
 INTERNAL_UNSET_FIELDS_FIELD = "_unset_fields"
-MAX_INBOX_PAGES_TO_SEARCH = 50
+MAX_INBOX_PAGES_TO_SEARCH = 75
 INBOX_GRID_READY_TIMEOUT = 10
 INBOX_PAGE_CHANGE_TIMEOUT = 10
 MESSAGE_CLICK_TIMEOUT = 3
@@ -995,6 +999,98 @@ def extract_constrained_area_job(file_path: Path, job: SappExtractionJob) -> lis
     return extract_constrained_area_results(file_path, data_source=job.data_source)
 
 
+def extract_unconstrained_area_results(
+    file_path: Path,
+    data_source: str = UNCONSTRAINED_AREA_DATA_SOURCE,
+) -> list[dict]:
+    print(f"[7/7] Extracting SAPP unconstrained rows from downloaded file: {file_path.name}")
+    workbook = openpyxl.load_workbook(file_path, data_only=True)
+    sheet = workbook.active
+
+    delivery_date = find_delivery_date_in_sheet(sheet)
+    if delivery_date is None:
+        raise RuntimeError("Could not find the delivery date in the downloaded file.")
+
+    required_headers = {
+        "hour": "hour",
+        "total_purchase_volume_mw": "total purchase volume (mw)",
+        "total_sales_volume_mw": "total sales volume (mw)",
+        "price_usd_per_mwh": "price (usd/mwh)",
+        "price_zar_per_mwh": "price (zar/mwh)",
+    }
+    header_row_index = None
+    column_indexes = None
+    for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+        normalized = [normalize_excel_header(value) for value in row]
+        indexes = {}
+        for field_name, header in required_headers.items():
+            try:
+                indexes[field_name] = normalized.index(header)
+            except ValueError:
+                indexes = {}
+                break
+        if indexes:
+            header_row_index = row_idx
+            column_indexes = indexes
+            break
+
+    if header_row_index is None or column_indexes is None:
+        raise RuntimeError("Could not find the unconstrained hourly data header row.")
+
+    records = []
+    for row in sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
+        hour_col = column_indexes["hour"]
+        if not row or hour_col >= len(row) or row[hour_col] is None:
+            continue
+
+        hour = parse_hour(row[hour_col])
+        if hour is None:
+            continue
+
+        def cell(field_name: str):
+            col_idx = column_indexes[field_name]
+            return row[col_idx] if col_idx < len(row) else None
+
+        records.append(
+            {
+                "timestamp": delivery_timestamp(delivery_date, hour),
+                "delivery_date": delivery_date.isoformat(),
+                "hour": hour,
+                "hour_label": str(row[hour_col]).strip(),
+                "total_purchase_volume_mw": to_float(cell("total_purchase_volume_mw")),
+                "total_sales_volume_mw": to_float(cell("total_sales_volume_mw")),
+                "price_usd_per_mwh": to_float(cell("price_usd_per_mwh")),
+                "price_zar_per_mwh": to_float(cell("price_zar_per_mwh")),
+                "metadata": {
+                    "data_source": data_source,
+                    "source_file": file_path.name,
+                },
+                "source_file": file_path.name,
+            }
+        )
+
+    if not records:
+        raise RuntimeError("No hourly rows were extracted from the downloaded file.")
+
+    extracted_hours = {record["hour"] for record in records}
+    expected_hours = set(range(1, 25))
+    if extracted_hours != expected_hours:
+        missing_hours = sorted(expected_hours - extracted_hours)
+        extra_hours = sorted(extracted_hours - expected_hours)
+        raise RuntimeError(
+            "Expected 24 hourly unconstrained rows for the delivery day, "
+            f"but extracted {len(records)}. "
+            f"Missing hours: {missing_hours or 'none'}. "
+            f"Unexpected hours: {extra_hours or 'none'}."
+        )
+
+    return records
+
+
+def extract_unconstrained_area_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
+    return extract_unconstrained_area_results(file_path, data_source=job.data_source)
+
+
 def extract_participant_portfolio_results(
     file_path: Path,
     data_source: str = PARTICIPANT_PORTFOLIO_DATA_SOURCE,
@@ -1468,6 +1564,15 @@ CONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
     extractor=extract_constrained_area_job,
 )
 
+UNCONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
+    name="unconstrained_area_results",
+    subject_template=UNCONSTRAINED_AREA_SUBJECT_TEMPLATE,
+    data_source=UNCONSTRAINED_AREA_DATA_SOURCE,
+    collection_name="sapp_unconstrained_area_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_unconstrained_area_job,
+)
+
 PARTICIPANT_PORTFOLIO_RESULTS_JOB = SappExtractionJob(
     name="participant_portfolio_results",
     subject_template=PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE,
@@ -1488,6 +1593,7 @@ TRADING_INVOICE_RESULTS_JOB = SappExtractionJob(
 
 SAPP_EXTRACTION_JOBS: dict[str, SappExtractionJob] = {
     CONSTRAINED_AREA_RESULTS_JOB.name: CONSTRAINED_AREA_RESULTS_JOB,
+    UNCONSTRAINED_AREA_RESULTS_JOB.name: UNCONSTRAINED_AREA_RESULTS_JOB,
     PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_RESULTS_JOB,
     TRADING_INVOICE_RESULTS_JOB.name: TRADING_INVOICE_RESULTS_JOB,
 }

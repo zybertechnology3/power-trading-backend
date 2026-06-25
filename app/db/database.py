@@ -208,6 +208,24 @@ def _initialize_collections():
         )
         print("Created 'sapp_constrained_area_results' collection")
 
+    if "sapp_unconstrained_area_results" not in db.list_collection_names():
+        db.create_collection("sapp_unconstrained_area_results")
+        unconstrained_collection = db["sapp_unconstrained_area_results"]
+        unconstrained_collection.create_index(
+            [("timestamp", DESCENDING)],
+            name="idx_sapp_unconstrained_timestamp",
+        )
+        unconstrained_collection.create_index(
+            [("delivery_date", ASCENDING), ("hour", ASCENDING)],
+            unique=True,
+            name="idx_sapp_unconstrained_delivery_date_hour_unique",
+        )
+        unconstrained_collection.create_index(
+            [("metadata.data_source", ASCENDING)],
+            name="idx_sapp_unconstrained_data_source",
+        )
+        print("Created 'sapp_unconstrained_area_results' collection")
+
     if "sapp_participant_portfolio_results" not in db.list_collection_names():
         db.create_collection("sapp_participant_portfolio_results")
         participant_portfolio_collection = db["sapp_participant_portfolio_results"]

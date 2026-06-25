@@ -5,7 +5,7 @@ FastAPI backend for SAPP data ingestion and time series access.
 ## Features
 
 - SAPP MTP document scraping with Selenium and Firefox
-- SAPP constrained area result extraction and MongoDB upserts
+- SAPP constrained and unconstrained area result extraction and MongoDB upserts
 - Date range scraping for multiple SAPP documents in one run
 - Frequency-based aggregation for constrained area time series data
 - Power system telemetry endpoints
@@ -203,6 +203,32 @@ Supported frequencies:
 
 ```text
 1h, 4h, 1d, 1w, 1mo, 1y
+```
+
+The constrained scrape job also imports the matching DAM unconstrained results
+document for the same delivery date:
+
+```text
+POST /sapp/scrape?job_name=constrained_area_results&delivery_date=2026-06-26
+POST /sapp/scrape-range?job_name=constrained_area_results&start_date=2026-06-24&end_date=2026-06-26
+```
+
+Those calls now run both `constrained_area_results` and
+`unconstrained_area_results`. Unconstrained rows are stored in
+`sapp_unconstrained_area_results` with hourly `total_purchase_volume_mw`,
+`total_sales_volume_mw`, `price_usd_per_mwh`, and `price_zar_per_mwh`.
+
+`GET /sapp/constrained-area-results` keeps constrained rows in `records` and
+adds `unconstrained_records` plus `unconstrained_total`. The day endpoint now
+returns both arrays:
+
+```text
+GET /sapp/constrained-area-results/2026-06-26
+{
+  "delivery_date": "2026-06-26",
+  "constrained_records": [],
+  "unconstrained_records": []
+}
 ```
 
 ## Bid Construction

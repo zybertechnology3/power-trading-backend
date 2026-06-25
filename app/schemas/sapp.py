@@ -391,13 +391,64 @@ class SappConstrainedAreaResultResponse(SappConstrainedAreaResultCreate):
         populate_by_name = True
 
 
+class SappUnconstrainedAreaResultCreate(BaseModel):
+    """Hourly unconstrained area result extracted from a SAPP MTP DAM document."""
+
+    timestamp: datetime = Field(..., description="Delivery timestamp for this hourly result")
+    delivery_date: date = Field(..., description="SAPP delivery date")
+    hour: Optional[int] = Field(None, ge=1, le=24, description="Delivery hour, 1-24")
+    hour_label: Optional[str] = Field(None, description="Original hour label from the document")
+    total_purchase_volume_mw: Optional[float] = Field(
+        None,
+        description="Total purchase volume in MW",
+    )
+    total_sales_volume_mw: Optional[float] = Field(
+        None,
+        description="Total sales volume in MW",
+    )
+    price_usd_per_mwh: Optional[float] = Field(None, description="Price in USD/MWh")
+    price_zar_per_mwh: Optional[float] = Field(None, description="Price in ZAR/MWh")
+    data_source: str = Field("SAPP_MTP_DAM_UNCONSTRAINED_RESULTS")
+    source_file: Optional[str] = None
+    frequency: Optional[str] = None
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
+    sample_count: Optional[int] = None
+
+
+class SappUnconstrainedAreaResultResponse(SappUnconstrainedAreaResultCreate):
+    """SAPP unconstrained area result with server-generated fields."""
+
+    id: Optional[str] = Field(None, alias="_id")
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+
 class SappConstrainedAreaResultList(BaseModel):
-    """Paginated list of SAPP constrained area results."""
+    """Paginated SAPP constrained and unconstrained area results."""
 
     records: list[SappConstrainedAreaResultResponse]
+    unconstrained_records: list[SappUnconstrainedAreaResultResponse] = Field(
+        default_factory=list
+    )
     total: int
+    unconstrained_total: int = 0
     page: int
     page_size: int
+
+
+class SappConstrainedAreaDayResponse(BaseModel):
+    """Hourly constrained and unconstrained area results for one delivery date."""
+
+    delivery_date: date
+    constrained_records: list[SappConstrainedAreaResultResponse]
+    unconstrained_records: list[SappUnconstrainedAreaResultResponse] = Field(
+        default_factory=list
+    )
 
 
 class SappParticipantPortfolioResultCreate(BaseModel):
@@ -546,6 +597,10 @@ class SappScrapeResponse(BaseModel):
     imported: int
     updated: int
     source_file: str
+    requested_jobs: list[str] = Field(default_factory=list)
+    successful_jobs: int = 1
+    failed_jobs: int = 0
+    related_results: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SappScrapeRangeResult(BaseModel):
@@ -573,3 +628,7 @@ class SappScrapeRangeResponse(BaseModel):
     imported: int
     updated: int
     results: list[SappScrapeRangeResult]
+    requested_jobs: list[str] = Field(default_factory=list)
+    successful_jobs: int = 1
+    failed_jobs: int = 0
+    related_results: list[dict[str, Any]] = Field(default_factory=list)

@@ -33,6 +33,7 @@ from app.schemas.sapp import (
     SappBidTemplateResponse,
     SappBidTemplateUpdate,
     SappBidUpdate,
+    SappConstrainedAreaDayResponse,
     SappConstrainedAreaResultList,
     SappConstrainedAreaResultResponse,
     SappParticipantPortfolioResultList,
@@ -704,6 +705,91 @@ def _aggregate_constrained_area_results(
     return records, total
 
 
+def _aggregate_unconstrained_area_results(
+    collection,
+    query_filter: dict,
+    frequency: str,
+    skip: int,
+    limit: int,
+) -> tuple[list[dict], int]:
+    bucket = FREQUENCY_BUCKETS[frequency]
+    date_trunc = {
+        "$dateTrunc": {
+            "date": "$timestamp",
+            "unit": bucket["unit"],
+            "binSize": bucket["binSize"],
+            "timezone": "UTC",
+        }
+    }
+    if frequency == "1w":
+        date_trunc["$dateTrunc"]["startOfWeek"] = "Monday"
+
+    group_stage = {
+        "$group": {
+            "_id": date_trunc,
+            "total_purchase_volume_mw": {"$avg": "$total_purchase_volume_mw"},
+            "total_sales_volume_mw": {"$avg": "$total_sales_volume_mw"},
+            "price_usd_per_mwh": {"$avg": "$price_usd_per_mwh"},
+            "price_zar_per_mwh": {"$avg": "$price_zar_per_mwh"},
+            "sample_count": {"$sum": 1},
+        }
+    }
+
+    total_result = list(
+        collection.aggregate(
+            [
+                {"$match": query_filter},
+                group_stage,
+                {"$count": "total"},
+            ]
+        )
+    )
+    total = total_result[0]["total"] if total_result else 0
+
+    records = list(
+        collection.aggregate(
+            [
+                {"$match": query_filter},
+                group_stage,
+                {"$sort": {"_id": 1}},
+                {"$skip": skip},
+                {"$limit": limit},
+                {
+                    "$project": {
+                        "_id": {"$concat": [frequency, ":", {"$toString": "$_id"}]},
+                        "timestamp": "$_id",
+                        "delivery_date": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d",
+                                "date": "$_id",
+                                "timezone": "UTC",
+                            }
+                        },
+                        "hour": None,
+                        "hour_label": frequency,
+                        "frequency": frequency,
+                        "period_start": "$_id",
+                        "period_end": _bucket_period_end_expression(frequency),
+                        "sample_count": "$sample_count",
+                        "total_purchase_volume_mw": "$total_purchase_volume_mw",
+                        "total_sales_volume_mw": "$total_sales_volume_mw",
+                        "price_usd_per_mwh": "$price_usd_per_mwh",
+                        "price_zar_per_mwh": "$price_zar_per_mwh",
+                        "data_source": "SAPP_MTP_DAM_UNCONSTRAINED_RESULTS",
+                    }
+                },
+            ]
+        )
+    )
+    return records, total
+
+
+def _scrape_job_names_for_request(job_name: str) -> list[str]:
+    if job_name == "constrained_area_results":
+        return ["constrained_area_results", "unconstrained_area_results"]
+    return [job_name]
+
+
 @router.post(
     "/bids",
     response_model=SappBidResponse,
@@ -1226,17 +1312,33 @@ def scrape_sapp_results(
 ):
     """Download, parse, and upsert one SAPP document. Run locally."""
     try:
-        job = get_extraction_job(job_name)
-        result = run_extraction_job(
-            job,
-            delivery_date=delivery_date,
-            page_start=page_start,
-        )
+        requested_job_names = _scrape_job_names_for_request(job_name)
+        results = [
+            run_extraction_job(
+                get_extraction_job(requested_job_name),
+                delivery_date=delivery_date,
+                page_start=page_start,
+            )
+            for requested_job_name in requested_job_names
+        ]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return result
+
+    primary_result = dict(results[0])
+    primary_result.update(
+        {
+            "job": job_name,
+            "requested_jobs": requested_job_names,
+            "successful_jobs": len(results),
+            "failed_jobs": 0,
+            "imported": sum(result.get("imported", 0) for result in results),
+            "updated": sum(result.get("updated", 0) for result in results),
+            "related_results": results,
+        }
+    )
+    return primary_result
 
 
 @router.post(
@@ -1271,19 +1373,53 @@ def scrape_sapp_results_for_date_range(
 ):
     """Download, parse, and upsert SAPP documents for a date range. Run locally."""
     try:
-        job = get_extraction_job(job_name)
-        result = run_extraction_job_for_date_range(
-            job,
-            start_date=start_date,
-            end_date=end_date,
-            continue_on_error=continue_on_error,
-            page_start=page_start,
-        )
+        requested_job_names = _scrape_job_names_for_request(job_name)
+        range_results = [
+            run_extraction_job_for_date_range(
+                get_extraction_job(requested_job_name),
+                start_date=start_date,
+                end_date=end_date,
+                continue_on_error=continue_on_error,
+                page_start=page_start,
+            )
+            for requested_job_name in requested_job_names
+        ]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return result
+
+    merged_results = [
+        result
+        for range_result in range_results
+        for result in range_result.get("results", [])
+    ]
+    successful_results = [
+        result for result in merged_results if result.get("status") == "success"
+    ]
+    failed_results = [
+        result for result in merged_results if result.get("status") == "failed"
+    ]
+    return {
+        "job": job_name,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "page_start": page_start,
+        "requested_dates": len(merged_results),
+        "successful_dates": len(successful_results),
+        "failed_dates": len(failed_results),
+        "imported": sum(result.get("imported", 0) for result in successful_results),
+        "updated": sum(result.get("updated", 0) for result in successful_results),
+        "results": merged_results,
+        "requested_jobs": requested_job_names,
+        "successful_jobs": len(
+            [result for result in range_results if result.get("failed_dates", 0) == 0]
+        ),
+        "failed_jobs": len(
+            [result for result in range_results if result.get("failed_dates", 0) > 0]
+        ),
+        "related_results": range_results,
+    }
 
 
 @router.get("/constrained-area-results", response_model=SappConstrainedAreaResultList)
@@ -1303,6 +1439,7 @@ def list_constrained_area_results(
     """
     db = get_db()
     collection = db["sapp_constrained_area_results"]
+    unconstrained_collection = db["sapp_unconstrained_area_results"]
 
     query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
 
@@ -1315,9 +1452,26 @@ def list_constrained_area_results(
             .limit(limit)
         )
         records = [_serialize_result(record) for record in records]
+        unconstrained_total = unconstrained_collection.count_documents(query_filter)
+        unconstrained_records = list(
+            unconstrained_collection.find(query_filter)
+            .sort("timestamp", 1)
+            .skip(skip)
+            .limit(limit)
+        )
+        unconstrained_records = [
+            _serialize_result(record) for record in unconstrained_records
+        ]
     else:
         records, total = _aggregate_constrained_area_results(
             collection,
+            query_filter,
+            frequency,
+            skip,
+            limit,
+        )
+        unconstrained_records, unconstrained_total = _aggregate_unconstrained_area_results(
+            unconstrained_collection,
             query_filter,
             frequency,
             skip,
@@ -1327,7 +1481,9 @@ def list_constrained_area_results(
     page = (skip // limit) + 1
     return SappConstrainedAreaResultList(
         records=records,
+        unconstrained_records=unconstrained_records,
         total=total,
+        unconstrained_total=unconstrained_total,
         page=page,
         page_size=limit,
     )
@@ -1335,12 +1491,13 @@ def list_constrained_area_results(
 
 @router.get(
     "/constrained-area-results/{delivery_date}",
-    response_model=list[SappConstrainedAreaResultResponse],
+    response_model=SappConstrainedAreaDayResponse,
 )
 def get_constrained_area_results_for_day(delivery_date: date):
-    """Get all hourly SAPP constrained area results for one delivery date."""
+    """Get hourly SAPP constrained and unconstrained area results for one date."""
     db = get_db()
     collection = db["sapp_constrained_area_results"]
+    unconstrained_collection = db["sapp_unconstrained_area_results"]
 
     start = datetime.combine(delivery_date, time.min)
     end = datetime.combine(delivery_date, time.max)
@@ -1348,10 +1505,20 @@ def get_constrained_area_results_for_day(delivery_date: date):
         collection.find({"timestamp": {"$gte": start, "$lte": end}})
         .sort("timestamp", 1)
     )
-    if not records:
+    unconstrained_records = list(
+        unconstrained_collection.find({"timestamp": {"$gte": start, "$lte": end}})
+        .sort("timestamp", 1)
+    )
+    if not records and not unconstrained_records:
         raise HTTPException(status_code=404, detail="No SAPP results found for this date")
 
-    return [_serialize_result(record) for record in records]
+    return {
+        "delivery_date": delivery_date.isoformat(),
+        "constrained_records": [_serialize_result(record) for record in records],
+        "unconstrained_records": [
+            _serialize_result(record) for record in unconstrained_records
+        ],
+    }
 
 
 @router.get(
