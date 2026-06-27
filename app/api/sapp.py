@@ -49,6 +49,7 @@ from app.schemas.sapp import (
 from sapp_scraper import (
     SAPP_EXTRACTION_JOBS,
     get_extraction_job,
+    run_area_results_test,
     run_extraction_job,
     run_extraction_job_for_date_range,
 )
@@ -599,18 +600,36 @@ def _normalize_trading_invoice_market(market: Optional[str]) -> Optional[str]:
 
 def _build_sapp_time_filter(
     delivery_date: Optional[date],
+    start_date: Optional[date],
+    end_date: Optional[date],
     start_time: Optional[datetime],
     end_time: Optional[datetime],
 ) -> dict:
     query_filter = {}
     if delivery_date:
+        if start_date or end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Use either delivery_date or start_date/end_date, not both",
+            )
         query_filter["delivery_date"] = delivery_date.isoformat()
+    elif start_date or end_date:
+        query_filter["delivery_date"] = {}
+        if start_date:
+            query_filter["delivery_date"]["$gte"] = start_date.isoformat()
+        if end_date:
+            query_filter["delivery_date"]["$lte"] = end_date.isoformat()
     if start_time or end_time:
         query_filter["timestamp"] = {}
         if start_time:
             query_filter["timestamp"]["$gte"] = start_time
         if end_time:
             query_filter["timestamp"]["$lte"] = end_time
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+        )
     return query_filter
 
 
@@ -1284,6 +1303,49 @@ def list_scrape_jobs():
 
 
 @router.post(
+    "/area-results-test",
+    summary="Test the new SAPP area results navigation flow locally",
+    description=(
+        "Runs Selenium locally, logs into SAPP, navigates directly to the "
+        "area-results test URL, fills Delivery Day, sets Category to Price in USD, "
+        "searches unconstrained and constrained area results, extracts the visible "
+        "Handsontable data, and returns the resulting browser URL and table payloads. "
+        "This is a test route only and does not download or store data."
+    ),
+)
+def area_results_test(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Delivery day to enter into the page. Defaults to today's date.",
+    ),
+    target_text: Optional[str] = Query(
+        None,
+        description=(
+            "Optional exact visible text for the menu span. If omitted, the first "
+            "visible span matching lpx-menu-item-text hidden-in-hover-trigger is clicked."
+        ),
+    ),
+    timeout: int = Query(
+        20,
+        ge=1,
+        le=120,
+        description="Seconds to wait for the menu span and page load.",
+    ),
+):
+    """Login and navigate directly to the area results test page. Run locally."""
+    try:
+        return run_area_results_test(
+            target_text=target_text,
+            timeout=timeout,
+            delivery_date=delivery_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
     "/scrape",
     response_model=SappScrapeResponse,
     summary="Scrape one SAPP document locally",
@@ -1427,6 +1489,8 @@ def list_constrained_area_results(
     skip: int = Query(0, ge=0),
     limit: int = Query(1000, ge=1, le=1000),
     delivery_date: Optional[date] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     frequency: Frequency = Query(
@@ -1441,7 +1505,13 @@ def list_constrained_area_results(
     collection = db["sapp_constrained_area_results"]
     unconstrained_collection = db["sapp_unconstrained_area_results"]
 
-    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    query_filter = _build_sapp_time_filter(
+        delivery_date,
+        start_date,
+        end_date,
+        start_time,
+        end_time,
+    )
 
     if frequency == "1h":
         total = collection.count_documents(query_filter)
@@ -1529,6 +1599,8 @@ def list_participant_portfolio_results(
     skip: int = Query(0, ge=0),
     limit: int = Query(1000, ge=1, le=1000),
     delivery_date: Optional[date] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
 ):
@@ -1538,7 +1610,13 @@ def list_participant_portfolio_results(
     db = get_db()
     collection = db["sapp_participant_portfolio_results"]
 
-    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    query_filter = _build_sapp_time_filter(
+        delivery_date,
+        start_date,
+        end_date,
+        start_time,
+        end_time,
+    )
     total = collection.count_documents(query_filter)
     records = list(
         collection.find(query_filter)
@@ -1655,6 +1733,8 @@ def list_trading_invoice_credit_notes(
     skip: int = Query(0, ge=0),
     limit: int = Query(1000, ge=1, le=1000),
     delivery_date: Optional[date] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
 ):
@@ -1664,7 +1744,13 @@ def list_trading_invoice_credit_notes(
     db = get_db()
     collection = db["sapp_trading_invoice_credit_notes"]
 
-    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    query_filter = _build_sapp_time_filter(
+        delivery_date,
+        start_date,
+        end_date,
+        start_time,
+        end_time,
+    )
     total = collection.count_documents(query_filter)
     records = list(
         collection.find(query_filter)
@@ -1757,6 +1843,8 @@ def list_trading_invoice_hourly_details(
     skip: int = Query(0, ge=0),
     limit: int = Query(1000, ge=1, le=1000),
     delivery_date: Optional[date] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     market: Optional[str] = Query(None),
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
@@ -1767,7 +1855,13 @@ def list_trading_invoice_hourly_details(
     db = get_db()
     collection = db["sapp_trading_invoice_hourly_details"]
 
-    query_filter = _build_sapp_time_filter(delivery_date, start_time, end_time)
+    query_filter = _build_sapp_time_filter(
+        delivery_date,
+        start_date,
+        end_date,
+        start_time,
+        end_time,
+    )
     normalized_market = _normalize_trading_invoice_market(market)
     if normalized_market:
         query_filter["market"] = normalized_market

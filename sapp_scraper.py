@@ -30,6 +30,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 BASE_URL = "https://trading.sappmtp.com"
 LOGIN_URL = f"{BASE_URL}/account/login?returnUrl=%2F"
 INBOX_URL = f"{BASE_URL}/mdd/message-inbox"
+AREA_RESULTS_TEST_URL = f"{BASE_URL}/amt/prices-and-turnover-X-dam"
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 CONSTRAINED_AREA_SUBJECT_TEMPLATE = "MTP - DAM - Constrained Area Results for {delivery_date}"
 CONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
@@ -451,15 +452,16 @@ def load_config():
     return username, password
 
 
-def create_driver(download_dir: Path):
+def create_driver(download_dir: Path, headless: bool = True):
     download_dir.mkdir(parents=True, exist_ok=True)
     print(f"[2/7] 🔧 Creating Firefox driver and setting download folder to: {download_dir}")
 
     options = Options()
-    options.add_argument("-headless")
     options.add_argument("--width=1366")
     options.add_argument("--height=900")
-    options.headless = True
+    if headless:
+        options.add_argument("-headless")
+        options.headless = True
     options.set_preference("browser.download.folderList", 2)
     options.set_preference("browser.download.dir", str(download_dir.resolve()))
     options.set_preference("browser.download.useDownloadDir", True)
@@ -471,7 +473,10 @@ def create_driver(download_dir: Path):
     options.set_preference("browser.download.manager.focusWhenStarting", False)
     options.set_preference("browser.shell.checkDefaultBrowser", False)
 
-    os.environ["MOZ_HEADLESS"] = "1"
+    if headless:
+        os.environ["MOZ_HEADLESS"] = "1"
+    else:
+        os.environ.pop("MOZ_HEADLESS", None)
     os.environ["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
 
     driver_path = shutil.which("geckodriver") or GeckoDriverManager().install()
@@ -538,6 +543,674 @@ def login(driver, username: str, password: str):
         print("[3/7] ✅ Login appears successful")
     except TimeoutException:
         print("⚠️ Warning: login may not have completed successfully. Check selectors or credentials.")
+
+
+def click_area_results_test_menu_span(
+    driver,
+    target_text: Optional[str] = None,
+    timeout: int = 20,
+) -> dict:
+    """
+    Test helper for the new area results flow.
+
+    It clicks a visible ABP/LeptonX menu span after login. If target_text is
+    provided it must match the span's normalized text; otherwise the first
+    visible span matching the shared menu classes is clicked.
+    """
+    print("[4/7] Waiting for area results test menu span")
+    selector = "span.lpx-menu-item-text.hidden-in-hover-trigger"
+    target_text_normalized = " ".join(target_text.split()) if target_text else None
+
+    def find_clickable_span(driver):
+        return driver.execute_script(
+            r"""
+            const selector = arguments[0];
+            const targetText = arguments[1];
+            const spans = Array.from(document.querySelectorAll(selector));
+            return spans.find((span) => {
+                const rect = span.getBoundingClientRect();
+                const text = (span.textContent || "").replace(/\s+/g, " ").trim();
+                if (rect.width <= 0 || rect.height <= 0) return false;
+                if (targetText && text !== targetText) return false;
+                return true;
+            }) || null;
+            """,
+            selector,
+            target_text_normalized,
+        )
+
+    span = WebDriverWait(driver, timeout).until(find_clickable_span)
+    clicked_text = driver.execute_script(
+        "return (arguments[0].textContent || '').replace(/\\s+/g, ' ').trim();",
+        span,
+    )
+    old_url = driver.current_url
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", span)
+    try:
+        span.click()
+    except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException):
+        span = WebDriverWait(driver, 5).until(find_clickable_span)
+        driver.execute_script("arguments[0].click();", span)
+
+    print(f"[4/7] Clicked area results test menu span: {clicked_text or '(blank)'}")
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.current_url != old_url
+            or not d.execute_script(
+                """
+                const loading = document.querySelector(
+                    ".lpx-loader, .ngx-spinner-overlay, .k-loading-mask, .spinner-border"
+                );
+                return Boolean(loading && loading.offsetParent !== null);
+                """
+            )
+        )
+    except TimeoutException:
+        print("[4/7] Timed out waiting for visible navigation change after menu click")
+
+    return {
+        "clicked_text": clicked_text,
+        "start_url": old_url,
+        "current_url": driver.current_url,
+        "title": driver.title,
+    }
+
+
+def format_area_results_test_date(value: Optional[date]) -> str:
+    delivery_date = value or datetime.now().date()
+    return delivery_date.strftime("%Y/%m/%d")
+
+
+def find_area_results_field_input(driver, label: str):
+    return driver.execute_script(
+        r"""
+        const labelText = arguments[0].toLowerCase();
+        const normalize = (value) => (value || "")
+            .replace(/\*/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+        const labels = Array.from(document.querySelectorAll("label, .form-label, div, span"))
+            .filter((element) => normalize(element.textContent) === labelText);
+
+        for (const label of labels) {
+            let node = label;
+            for (let depth = 0; node && depth < 6; depth += 1) {
+                const input = node.querySelector(
+                    "input.k-input-inner:not([type='hidden']), input:not([type='hidden'])"
+                );
+                if (input) return input;
+                node = node.parentElement;
+            }
+        }
+        return null;
+        """,
+        label,
+    )
+
+
+def set_area_results_input_by_label(driver, label: str, value: str, timeout: int = 20):
+    print(f"[5/7] Setting {label}: {value}")
+
+    def field_input_exists(driver):
+        return find_area_results_field_input(driver, label)
+
+    input_element = WebDriverWait(driver, timeout).until(field_input_exists)
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
+    input_element.click()
+    input_element.send_keys(Keys.CONTROL, "a")
+    input_element.send_keys(value)
+    input_element.send_keys(Keys.TAB)
+
+    driver.execute_script(
+        """
+        const input = arguments[0];
+        const value = arguments[1];
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            "value"
+        ).set;
+        setter.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        input.dispatchEvent(new Event("blur", { bubbles: true }));
+        """,
+        input_element,
+        value,
+    )
+    return input_element
+
+
+def select_area_results_category(driver, value: str, timeout: int = 20):
+    print(f"[5/7] Selecting Category: {value}")
+    input_element = WebDriverWait(driver, timeout).until(
+        lambda d: find_area_results_field_input(d, "Category")
+    )
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
+    input_element.click()
+    input_element.send_keys(Keys.CONTROL, "a")
+    input_element.send_keys(value)
+
+    def visible_option(driver):
+        return driver.execute_script(
+            r"""
+            const target = arguments[0].toLowerCase();
+            const options = Array.from(document.querySelectorAll(
+                ".k-list-item, .k-item, [role='option']"
+            ));
+            return options.find((option) => {
+                const rect = option.getBoundingClientRect();
+                const text = (option.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+                return rect.width > 0 && rect.height > 0 && text === target;
+            }) || null;
+            """,
+            value,
+        )
+
+    try:
+        option = WebDriverWait(driver, 5).until(visible_option)
+        driver.execute_script("arguments[0].click();", option)
+    except TimeoutException:
+        input_element.send_keys(Keys.ENTER)
+        input_element.send_keys(Keys.TAB)
+
+    driver.execute_script(
+        """
+        const input = arguments[0];
+        const value = arguments[1];
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            "value"
+        ).set;
+        setter.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        input.dispatchEvent(new Event("blur", { bubbles: true }));
+        """,
+        input_element,
+        value,
+    )
+    return input_element
+
+
+def click_area_results_constrained_toggle(driver, timeout: int = 20) -> dict:
+    print("[5/7] Finding constrained area result toggle")
+
+    def find_toggle(driver):
+        return driver.execute_script(
+            r"""
+            const normalize = (value) => (value || "")
+                .replace(/\*/g, "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .toLowerCase();
+            const labels = Array.from(document.querySelectorAll("label, .form-label, div, span"))
+                .filter((element) => normalize(element.textContent) === "constrained per area result");
+
+            for (const label of labels) {
+                let node = label;
+                for (let depth = 0; node && depth < 6; depth += 1) {
+                    const toggle = node.querySelector(
+                        ".k-switch, .k-switch-track, [role='switch'], input[type='checkbox']"
+                    );
+                    if (toggle) return toggle;
+                    node = node.parentElement;
+                }
+            }
+            return document.querySelector(
+                ".k-switch, .k-switch-track, [role='switch'], input[type='checkbox']"
+            );
+            """
+        )
+
+    toggle = WebDriverWait(driver, timeout).until(find_toggle)
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
+    driver.execute_script("arguments[0].click();", toggle)
+    time.sleep(3)
+    driver.execute_script("arguments[0].click();", toggle)
+    time.sleep(3)
+    return {"constrained_toggle_sequence": ["on", "off"]}
+
+
+def find_area_results_constrained_toggle(driver):
+    return driver.execute_script(
+        r"""
+        const normalize = (value) => (value || "")
+            .replace(/\*/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+        const labels = Array.from(document.querySelectorAll("label, .form-label, div, span"))
+            .filter((element) => normalize(element.textContent) === "constrained per area result");
+
+        for (const label of labels) {
+            let node = label;
+            for (let depth = 0; node && depth < 6; depth += 1) {
+                const toggle = node.querySelector(
+                    ".k-switch, [role='switch'], input[type='checkbox'], .k-switch-track"
+                );
+                if (toggle) return toggle.closest(".k-switch") || toggle;
+                node = node.parentElement;
+            }
+        }
+        const fallback = document.querySelector(
+            ".k-switch, [role='switch'], input[type='checkbox'], .k-switch-track"
+        );
+        return fallback ? (fallback.closest(".k-switch") || fallback) : null;
+        """
+    )
+
+
+def get_area_results_constrained_toggle_state(driver, toggle) -> Optional[bool]:
+    return driver.execute_script(
+        """
+        const toggle = arguments[0];
+        const input = toggle.matches("input[type='checkbox']")
+            ? toggle
+            : toggle.querySelector("input[type='checkbox']");
+        if (input) return Boolean(input.checked);
+
+        const ariaChecked = toggle.getAttribute("aria-checked")
+            || (toggle.querySelector("[aria-checked]") || {}).getAttribute?.("aria-checked");
+        if (ariaChecked === "true") return true;
+        if (ariaChecked === "false") return false;
+
+        const className = toggle.getAttribute("class") || "";
+        if (/k-switch-on|k-selected|k-checked/.test(className)) return true;
+        if (/k-switch-off/.test(className)) return false;
+        return null;
+        """,
+        toggle,
+    )
+
+
+def set_area_results_constrained_toggle(
+    driver,
+    enabled: bool,
+    timeout: int = 20,
+) -> dict:
+    label = "on" if enabled else "off"
+    print(f"[5/7] Setting constrained area result toggle {label}")
+    toggle = WebDriverWait(driver, timeout).until(find_area_results_constrained_toggle)
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
+    before_state = get_area_results_constrained_toggle_state(driver, toggle)
+    should_click = before_state is not enabled
+    if before_state is None and enabled is False:
+        should_click = False
+    if should_click:
+        driver.execute_script("arguments[0].click();", toggle)
+        time.sleep(2)
+    after_state = get_area_results_constrained_toggle_state(driver, toggle)
+    print(
+        "[5/7] Constrained toggle state: "
+        f"before={before_state}, requested={enabled}, after={after_state}"
+    )
+    return {
+        "requested_constrained": enabled,
+        "constrained_toggle_before": before_state,
+        "constrained_toggle_after": after_state,
+    }
+
+
+def click_area_results_search_button(driver, timeout: int = 20) -> dict:
+    print("[6/7] Clicking area results Search button")
+    old_url = driver.current_url
+    old_signature = driver.execute_script(
+        "return document.body ? document.body.innerText.slice(0, 2000) : '';"
+    )
+
+    def find_search_button(driver):
+        return driver.execute_script(
+            r"""
+            const buttons = Array.from(document.querySelectorAll(
+                "button[title='Search'], button[data-cy='Search'], button"
+            ));
+            return buttons.find((button) => {
+                const rect = button.getBoundingClientRect();
+                const text = (button.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+                const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                const dataCy = (button.getAttribute("data-cy") || "").trim().toLowerCase();
+                return rect.width > 0
+                    && rect.height > 0
+                    && !button.disabled
+                    && (
+                        title === "search"
+                        || dataCy === "search"
+                        || text === "search"
+                    );
+            }) || null;
+            """
+        )
+
+    button = WebDriverWait(driver, timeout).until(find_search_button)
+    button_info = driver.execute_script(
+        r"""
+        const button = arguments[0];
+        const rect = button.getBoundingClientRect();
+        return {
+            text: (button.textContent || "").replace(/\s+/g, " ").trim(),
+            title: button.getAttribute("title"),
+            dataCy: button.getAttribute("data-cy"),
+            disabled: Boolean(button.disabled),
+            className: button.getAttribute("class"),
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+        };
+        """,
+        button,
+    )
+    print(f"[6/7] Found Search button: {button_info}")
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+    try:
+        button.click()
+        click_method = "selenium_click"
+    except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException):
+        button = WebDriverWait(driver, 5).until(find_search_button)
+        driver.execute_script(
+            """
+            const button = arguments[0];
+            button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            """,
+            button,
+        )
+        click_method = "javascript_mouse_events"
+    print(f"[6/7] Search button click dispatched via {click_method}")
+
+    redirected = False
+    content_changed = False
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: (
+                d.current_url != old_url
+                or d.execute_script(
+                    "return document.body ? document.body.innerText.slice(0, 2000) : '';"
+                )
+                != old_signature
+                or d.execute_script(
+                    """
+                    const loading = document.querySelector(
+                        ".k-loading-mask, .k-i-loading, .k-loading-image, .spinner-border, .ngx-spinner-overlay"
+                    );
+                    return Boolean(loading && loading.offsetParent !== null);
+                    """
+                )
+            )
+        )
+    except TimeoutException:
+        print("[6/7] No URL/content/loading change detected after Search click")
+
+    time.sleep(5)
+    new_url = driver.current_url
+    new_signature = driver.execute_script(
+        "return document.body ? document.body.innerText.slice(0, 2000) : '';"
+    )
+    redirected = new_url != old_url
+    content_changed = new_signature != old_signature
+    print(
+        "[6/7] Search result state: "
+        f"redirected={redirected}, content_changed={content_changed}, "
+        f"current_url={new_url}"
+    )
+    return {
+        "search_clicked": True,
+        "search_click_method": click_method,
+        "search_button": button_info,
+        "search_start_url": old_url,
+        "search_current_url": new_url,
+        "search_redirected": redirected,
+        "search_content_changed": content_changed,
+    }
+
+
+def click_area_results_select_schedule_button(driver, timeout: int = 20) -> dict:
+    print("[5/7] Clicking Select a Schedule button")
+
+    def find_select_schedule_button(driver):
+        return driver.execute_script(
+            r"""
+            const buttons = Array.from(document.querySelectorAll(
+                "button[data-cy='Select a Schedule'], button[title='Select a Schedule'], button"
+            ));
+            return buttons.find((button) => {
+                const rect = button.getBoundingClientRect();
+                const text = (button.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+                const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                const dataCy = (button.getAttribute("data-cy") || "").trim().toLowerCase();
+                return rect.width > 0
+                    && rect.height > 0
+                    && !button.disabled
+                    && (
+                        title === "select a schedule"
+                        || dataCy === "select a schedule"
+                        || text === "select a schedule"
+                    );
+            }) || null;
+            """
+        )
+
+    button = WebDriverWait(driver, timeout).until(find_select_schedule_button)
+    button_info = driver.execute_script(
+        r"""
+        const button = arguments[0];
+        const rect = button.getBoundingClientRect();
+        return {
+            text: (button.textContent || "").replace(/\s+/g, " ").trim(),
+            title: button.getAttribute("title"),
+            dataCy: button.getAttribute("data-cy"),
+            disabled: Boolean(button.disabled),
+            className: button.getAttribute("class"),
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+        };
+        """,
+        button,
+    )
+    print(f"[5/7] Found Select a Schedule button: {button_info}")
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+    try:
+        button.click()
+        click_method = "selenium_click"
+    except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException):
+        button = WebDriverWait(driver, 5).until(find_select_schedule_button)
+        driver.execute_script("arguments[0].click();", button)
+        click_method = "javascript_click"
+
+    WebDriverWait(driver, timeout).until(
+        lambda d: find_area_results_field_input(d, "Delivery Day")
+    )
+    time.sleep(2)
+    return {
+        "select_schedule_clicked": True,
+        "select_schedule_click_method": click_method,
+        "select_schedule_button": button_info,
+    }
+
+
+def extract_area_results_handsontable(driver, dataset: str, timeout: int = 20) -> dict:
+    print(f"[7/7] Extracting {dataset} area results Handsontable")
+
+    def table_exists(driver):
+        return driver.execute_script(
+            """
+            const table = document.querySelector(".ht_master table.htCore");
+            if (!table) return null;
+            const headers = Array.from(table.querySelectorAll("thead th"))
+                .map((cell) => (cell.textContent || "").trim())
+                .filter(Boolean);
+            const rows = Array.from(table.querySelectorAll("tbody tr"));
+            return headers.length >= 2 && rows.length > 0 ? table : null;
+            """
+        )
+
+    WebDriverWait(driver, timeout).until(table_exists)
+    table_data = driver.execute_script(
+        r"""
+        const dataset = arguments[0];
+        const table = document.querySelector(".ht_master table.htCore");
+        const normalize = (value) => (value || "").replace(/\s+/g, " ").trim();
+        const parseNumber = (value) => {
+            const text = normalize(value).replace(/,/g, "");
+            if (!text) return null;
+            const parsed = Number(text);
+            return Number.isFinite(parsed) ? parsed : null;
+        };
+        const normalizeDate = (value) => normalize(value).replace(/\//g, "-");
+        const hourFromProduct = (product) => {
+            const match = normalize(product).match(/^(\d{2})-(\d{2})$/);
+            if (!match) return null;
+            return Number(match[1]) + 1;
+        };
+        const headers = Array.from(table.querySelectorAll("thead th"))
+            .map((cell) => normalize(cell.textContent));
+        const dateHeaders = headers.slice(1).map((label) => ({
+            label,
+            date: normalizeDate(label)
+        }));
+        const rows = Array.from(table.querySelectorAll("tbody tr")).map((row) => {
+            const cells = Array.from(row.querySelectorAll("td, th"))
+                .map((cell) => normalize(cell.textContent));
+            const product = cells[0] || "";
+            const values = {};
+            dateHeaders.forEach((header, index) => {
+                values[header.date] = parseNumber(cells[index + 1]);
+            });
+            return { product, values };
+        }).filter((row) => row.product);
+
+        const summaryNames = new Set(["min", "max", "avg", "nett"]);
+        const hourlyRecords = [];
+        const summaryRecords = [];
+        rows.forEach((row) => {
+            const normalizedProduct = row.product.toLowerCase();
+            for (const [date, value] of Object.entries(row.values)) {
+                if (summaryNames.has(normalizedProduct)) {
+                    summaryRecords.push({
+                        dataset,
+                        date,
+                        metric: row.product,
+                        value
+                    });
+                } else {
+                    hourlyRecords.push({
+                        dataset,
+                        date,
+                        product: row.product,
+                        hour: hourFromProduct(row.product),
+                        value
+                    });
+                }
+            }
+        });
+
+        return {
+            dataset,
+            columns: dateHeaders,
+            rows,
+            hourly_records: hourlyRecords,
+            summary_records: summaryRecords,
+            row_count: rows.length,
+            hourly_record_count: hourlyRecords.length,
+            summary_record_count: summaryRecords.length
+        };
+        """,
+        dataset,
+    )
+    print(
+        f"[7/7] Extracted {dataset} table: "
+        f"{table_data['row_count']} rows, "
+        f"{table_data['hourly_record_count']} hourly cells, "
+        f"{table_data['summary_record_count']} summary cells"
+    )
+    return table_data
+
+
+def search_and_extract_area_results_dataset(
+    driver,
+    dataset: str,
+    constrained: bool,
+    timeout: int = 20,
+) -> dict:
+    toggle_result = set_area_results_constrained_toggle(
+        driver,
+        constrained,
+        timeout=timeout,
+    )
+    search_result = click_area_results_search_button(driver, timeout=timeout)
+    table_result = extract_area_results_handsontable(driver, dataset, timeout=timeout)
+    return {
+        "dataset": dataset,
+        "constrained": constrained,
+        **toggle_result,
+        **search_result,
+        "table": table_result,
+    }
+
+
+def run_area_results_test(
+    target_text: Optional[str] = None,
+    timeout: int = 20,
+    delivery_date: Optional[date] = None,
+) -> dict:
+    username, password = load_config()
+    with tempfile.TemporaryDirectory(prefix="sapp-area-results-test-") as temp_download_dir:
+        download_dir = Path(temp_download_dir)
+        driver = create_driver(download_dir, headless=False)
+        try:
+            login(driver, username, password)
+            print(f"[4/7] Navigating directly to area results test URL: {AREA_RESULTS_TEST_URL}")
+            driver.get(AREA_RESULTS_TEST_URL)
+            WebDriverWait(driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(5)
+            delivery_day = format_area_results_test_date(delivery_date)
+            set_area_results_input_by_label(driver, "Delivery Day", delivery_day, timeout=timeout)
+            select_area_results_category(driver, "Price in USD", timeout=timeout)
+            unconstrained_result = search_and_extract_area_results_dataset(
+                driver,
+                "unconstrained",
+                constrained=False,
+                timeout=timeout,
+            )
+            select_schedule_result = click_area_results_select_schedule_button(
+                driver,
+                timeout=timeout,
+            )
+            set_area_results_input_by_label(driver, "Delivery Day", delivery_day, timeout=timeout)
+            select_area_results_category(driver, "Price in USD", timeout=timeout)
+            constrained_result = search_and_extract_area_results_dataset(
+                driver,
+                "constrained",
+                constrained=True,
+                timeout=timeout,
+            )
+            return {
+                "status": "success",
+                "target_text": target_text,
+                "target_url": AREA_RESULTS_TEST_URL,
+                "delivery_day": delivery_day,
+                "category": "Price in USD",
+                "returned_dates": constrained_result["table"]["columns"],
+                **select_schedule_result,
+                "datasets": {
+                    "unconstrained": unconstrained_result,
+                    "constrained": constrained_result,
+                },
+                "current_url": driver.current_url,
+                "title": driver.title,
+            }
+        finally:
+            time.sleep(30)
+            driver.quit()
 
 
 def navigate_to_inbox(driver):

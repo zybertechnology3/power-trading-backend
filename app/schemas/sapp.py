@@ -373,6 +373,12 @@ class SappConstrainedAreaResultCreate(BaseModel):
     area_price_usd_per_mwh: Optional[float] = Field(None, description="Area price in USD/MWh")
     data_source: str = Field("SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS")
     source_file: Optional[str] = None
+    product: Optional[str] = None
+    search_delivery_date: Optional[date] = None
+    window_start_date: Optional[date] = None
+    window_end_date: Optional[date] = None
+    window_offset_days: Optional[int] = None
+    category: Optional[str] = None
     frequency: Optional[str] = None
     period_start: Optional[datetime] = None
     period_end: Optional[datetime] = None
@@ -410,6 +416,12 @@ class SappUnconstrainedAreaResultCreate(BaseModel):
     price_zar_per_mwh: Optional[float] = Field(None, description="Price in ZAR/MWh")
     data_source: str = Field("SAPP_MTP_DAM_UNCONSTRAINED_RESULTS")
     source_file: Optional[str] = None
+    product: Optional[str] = None
+    search_delivery_date: Optional[date] = None
+    window_start_date: Optional[date] = None
+    window_end_date: Optional[date] = None
+    window_offset_days: Optional[int] = None
+    category: Optional[str] = None
     frequency: Optional[str] = None
     period_start: Optional[datetime] = None
     period_end: Optional[datetime] = None

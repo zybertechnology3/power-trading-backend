@@ -231,6 +231,22 @@ GET /sapp/constrained-area-results/2026-06-26
 }
 ```
 
+The list endpoint also accepts date-range filters:
+
+```text
+GET /sapp/constrained-area-results?start_date=2026-06-20&end_date=2026-06-26
+GET /sapp/constrained-area-results?start_date=2026-06-20&end_date=2026-06-26&frequency=1d
+```
+
+The standalone `area_results_test_scraper.py` script now persists:
+
+- hourly constrained rows in `sapp_constrained_area_results`
+- hourly unconstrained rows in `sapp_unconstrained_area_results`
+
+Each hourly row now carries explicit search-window metadata such as
+`search_delivery_date`, `window_start_date`, `window_end_date`,
+`window_offset_days`, `product`, and `category`.
+
 ## Bid Construction
 
 Supported bid markets are `dam`, `fpm_w`, and `fpm_m`.
