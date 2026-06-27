@@ -36,6 +36,8 @@ from app.schemas.sapp import (
     SappConstrainedAreaDayResponse,
     SappConstrainedAreaResultList,
     SappConstrainedAreaResultResponse,
+    SappMarketOverviewDayResponse,
+    SappMarketOverviewResponse,
     SappParticipantPortfolioResultList,
     SappParticipantPortfolioResultResponse,
     SappPublicHolidayResponse,
@@ -1556,6 +1558,130 @@ def list_constrained_area_results(
         unconstrained_total=unconstrained_total,
         page=page,
         page_size=limit,
+    )
+
+
+@router.get("/market-overview", response_model=SappMarketOverviewResponse)
+def get_market_overview(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Single delivery date to return. Use this or start_date/end_date.",
+    ),
+    start_date: Optional[date] = Query(
+        None,
+        description="First delivery date in the requested range.",
+    ),
+    end_date: Optional[date] = Query(
+        None,
+        description="Last delivery date in the requested range, inclusive.",
+    ),
+):
+    """Return constrained and unconstrained area results grouped by delivery date."""
+    if delivery_date:
+        if start_date or end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Use either delivery_date or start_date/end_date, not both",
+            )
+        normalized_start_date = delivery_date
+        normalized_end_date = delivery_date
+    else:
+        if not start_date and not end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide delivery_date or start_date/end_date",
+            )
+        normalized_start_date = start_date or end_date
+        normalized_end_date = end_date or start_date
+        if normalized_start_date is None or normalized_end_date is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide delivery_date or start_date/end_date",
+            )
+        if normalized_end_date < normalized_start_date:
+            raise HTTPException(
+                status_code=400,
+                detail="end_date must be greater than or equal to start_date",
+            )
+
+    db = get_db()
+    constrained_collection = db["sapp_constrained_area_results"]
+    unconstrained_collection = db["sapp_unconstrained_area_results"]
+
+    query_filter = _build_sapp_time_filter(
+        None,
+        normalized_start_date,
+        normalized_end_date,
+        None,
+        None,
+    )
+
+    constrained_records = [
+        _serialize_result(record)
+        for record in constrained_collection.find(query_filter).sort(
+            [("delivery_date", 1), ("timestamp", 1), ("hour", 1)]
+        )
+    ]
+    unconstrained_records = [
+        _serialize_result(record)
+        for record in unconstrained_collection.find(query_filter).sort(
+            [("delivery_date", 1), ("timestamp", 1), ("hour", 1)]
+        )
+    ]
+
+    days_by_date: dict[str, dict] = {}
+    current_date = normalized_start_date
+    while current_date <= normalized_end_date:
+        days_by_date[current_date.isoformat()] = {
+            "delivery_date": current_date,
+            "constrained_records": [],
+            "unconstrained_records": [],
+        }
+        current_date += timedelta(days=1)
+
+    for record in constrained_records:
+        record_date = record["delivery_date"]
+        days_by_date.setdefault(
+            record_date,
+            {
+                "delivery_date": date.fromisoformat(record_date),
+                "constrained_records": [],
+                "unconstrained_records": [],
+            },
+        )["constrained_records"].append(record)
+
+    for record in unconstrained_records:
+        record_date = record["delivery_date"]
+        days_by_date.setdefault(
+            record_date,
+            {
+                "delivery_date": date.fromisoformat(record_date),
+                "constrained_records": [],
+                "unconstrained_records": [],
+            },
+        )["unconstrained_records"].append(record)
+
+    days = []
+    for delivery_date_key in sorted(days_by_date.keys()):
+        day = days_by_date[delivery_date_key]
+        days.append(
+            SappMarketOverviewDayResponse(
+                delivery_date=day["delivery_date"],
+                constrained_records=day["constrained_records"],
+                unconstrained_records=day["unconstrained_records"],
+                constrained_count=len(day["constrained_records"]),
+                unconstrained_count=len(day["unconstrained_records"]),
+            )
+        )
+
+    return SappMarketOverviewResponse(
+        delivery_date=delivery_date,
+        start_date=normalized_start_date,
+        end_date=normalized_end_date,
+        day_count=len(days),
+        constrained_total=len(constrained_records),
+        unconstrained_total=len(unconstrained_records),
+        days=days,
     )
 
 

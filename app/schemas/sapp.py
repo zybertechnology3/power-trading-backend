@@ -463,6 +463,32 @@ class SappConstrainedAreaDayResponse(BaseModel):
     )
 
 
+class SappMarketOverviewDayResponse(BaseModel):
+    """Constrained and unconstrained area results grouped by delivery date."""
+
+    delivery_date: date
+    constrained_records: list[SappConstrainedAreaResultResponse] = Field(
+        default_factory=list
+    )
+    unconstrained_records: list[SappUnconstrainedAreaResultResponse] = Field(
+        default_factory=list
+    )
+    constrained_count: int = 0
+    unconstrained_count: int = 0
+
+
+class SappMarketOverviewResponse(BaseModel):
+    """Market overview payload for one delivery date or a delivery date range."""
+
+    delivery_date: Optional[date] = None
+    start_date: date
+    end_date: date
+    day_count: int
+    constrained_total: int
+    unconstrained_total: int
+    days: list[SappMarketOverviewDayResponse] = Field(default_factory=list)
+
+
 class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 

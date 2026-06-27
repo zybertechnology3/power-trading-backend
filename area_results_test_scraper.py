@@ -153,6 +153,16 @@ def find_field_input(driver, label: str):
     )
 
 
+def read_input_value(driver, input_element) -> str:
+    return driver.execute_script(
+        """
+        const input = arguments[0];
+        return (input.value || "").trim();
+        """,
+        input_element,
+    )
+
+
 def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> None:
     print(f"[2/7] Setting {label}: {value}")
     wait_for_page_settle(driver, timeout=timeout)
@@ -160,28 +170,34 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
         lambda d: find_field_input(d, label)
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
-    input_element.click()
-    time.sleep(0.5)
-    input_element.send_keys(Keys.CONTROL, "a")
-    input_element.send_keys(value)
-    input_element.send_keys(Keys.TAB)
-    driver.execute_script(
-        """
-        const input = arguments[0];
-        const value = arguments[1];
-        const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype,
-            "value"
-        ).set;
-        setter.call(input, value);
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-        input.dispatchEvent(new Event("blur", { bubbles: true }));
-        """,
-        input_element,
-        value,
+    for attempt in range(1, 4):
+        print(f"[2/7] {label} attempt {attempt}: writing '{value}'")
+        input_element.click()
+        time.sleep(0.5)
+        input_element.send_keys(Keys.CONTROL, "a")
+        selected_value = read_input_value(driver, input_element)
+        print(f"[2/7] {label} attempt {attempt}: selected existing value '{selected_value}'")
+
+        for character in value:
+            input_element.send_keys(character)
+            time.sleep(0.12)
+
+        input_element.send_keys(Keys.TAB)
+        time.sleep(1.0)
+
+        actual_value = read_input_value(driver, input_element)
+        print(f"[2/7] {label} attempt {attempt}: field now shows '{actual_value}'")
+        if actual_value == value:
+            return
+
+        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.5)
+        input_element = WebDriverWait(driver, timeout).until(
+            lambda d: find_field_input(d, label)
+        )
+
+    raise RuntimeError(
+        f"Failed to set {label} to '{value}'. Field kept a different value."
     )
-    time.sleep(1.0)
 
 
 def select_category(driver, value: str, timeout: int = 20) -> None:
@@ -550,14 +566,67 @@ def enrich_hourly_records(
     return enriched_records
 
 
+def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
+    if end_date < start_date:
+        raise ValueError("end_date must be greater than or equal to start_date")
+
+    chunks = []
+    chunk_start = start_date
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + timedelta(days=6), end_date)
+        chunks.append(
+            {
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "search_date": chunk_end,
+            }
+        )
+        chunk_start = chunk_end + timedelta(days=1)
+
+    return chunks
+
+
+def filter_existing_records(collection, records: list[dict]) -> tuple[list[dict], int]:
+    if not records:
+        return [], 0
+
+    deduped_records = {}
+    for record in records:
+        deduped_records[(record["delivery_date"], record["hour"])] = record
+
+    unique_records = list(deduped_records.values())
+    delivery_dates = sorted({record["delivery_date"] for record in unique_records})
+    existing_keys = set()
+
+    for existing_record in collection.find(
+        {"delivery_date": {"$in": delivery_dates}},
+        {"delivery_date": 1, "hour": 1},
+    ):
+        existing_keys.add((existing_record.get("delivery_date"), existing_record.get("hour")))
+
+    new_records = [
+        record
+        for record in unique_records
+        if (record["delivery_date"], record["hour"]) not in existing_keys
+    ]
+    skipped_existing = len(unique_records) - len(new_records)
+    if skipped_existing:
+        print(
+            f"[db] Skipping {skipped_existing} existing records already present in "
+            f"{collection.name}"
+        )
+    return new_records, skipped_existing
+
+
 def upsert_hourly_records(
     collection,
     dataset: str,
     records: list[dict],
     now: datetime,
 ) -> dict:
+    records_to_write, skipped_existing = filter_existing_records(collection, records)
     print(
-        f"[db] Preparing {len(records)} {dataset} hourly records for collection "
+        f"[db] Preparing {len(records_to_write)} {dataset} hourly records for collection "
         f"{collection.name}"
     )
     if dataset == "constrained":
@@ -568,7 +637,7 @@ def upsert_hourly_records(
         field_name = "price_usd_per_mwh"
 
     operations = []
-    for record in records:
+    for record in records_to_write:
         operations.append(
             UpdateOne(
                 {
@@ -609,16 +678,18 @@ def upsert_hourly_records(
         )
 
     if not operations:
-        return {"imported": 0, "updated": 0}
+        return {"imported": 0, "updated": 0, "skipped_existing": skipped_existing}
 
     result = collection.bulk_write(operations, ordered=False)
     summary = {
         "imported": result.upserted_count,
         "updated": result.matched_count,
+        "skipped_existing": skipped_existing,
     }
     print(
         f"[db] Upserted {dataset} records into {collection.name}: "
-        f"imported={summary['imported']}, updated={summary['updated']}"
+        f"imported={summary['imported']}, updated={summary['updated']}, "
+        f"skipped_existing={summary['skipped_existing']}"
     )
     return summary
 
@@ -669,12 +740,75 @@ def store_results(
         print("[db] MongoDB connection closed")
 
 
-def run(delivery_day: date, timeout: int, headless: bool, observe_seconds: int) -> dict:
-    username, password, mongodb_url, database_name = load_config()
-    print(
-        f"[run] Starting area results scraper for delivery_day={delivery_day.isoformat()}, "
-        f"timeout={timeout}, headless={headless}, observe_seconds={observe_seconds}"
+def scrape_area_results_for_search_date(
+    driver,
+    search_date: date,
+    timeout: int,
+    reopen_schedule: bool,
+) -> dict:
+    formatted_date = format_delivery_day(search_date)
+    if reopen_schedule:
+        click_select_schedule(driver, timeout=timeout)
+
+    set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
+    select_category(driver, "Price in USD", timeout=timeout)
+
+    set_constrained_toggle(driver, False, timeout=timeout)
+    click_search(driver, timeout=timeout)
+    unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
+    unconstrained_records = enrich_hourly_records(
+        "unconstrained",
+        unconstrained_table["hourly_records"],
+        search_date,
+        unconstrained_table["returned_dates"],
     )
+
+    click_select_schedule(driver, timeout=timeout)
+    set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
+    select_category(driver, "Price in USD", timeout=timeout)
+    set_constrained_toggle(driver, True, timeout=timeout)
+    click_search(driver, timeout=timeout)
+    constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
+    constrained_records = enrich_hourly_records(
+        "constrained",
+        constrained_table["hourly_records"],
+        search_date,
+        constrained_table["returned_dates"],
+    )
+
+    return {
+        "search_date": search_date.isoformat(),
+        "formatted_search_date": formatted_date,
+        "returned_dates": {
+            "unconstrained": unconstrained_table["columns"],
+            "constrained": constrained_table["columns"],
+        },
+        "unconstrained_records": unconstrained_records,
+        "constrained_records": constrained_records,
+    }
+
+
+def run(
+    start_date: date,
+    end_date: date,
+    timeout: int,
+    headless: bool,
+    observe_seconds: int,
+) -> dict:
+    username, password, mongodb_url, database_name = load_config()
+    chunks = build_search_chunks(start_date, end_date)
+    print(
+        f"[run] Starting area results scraper for start_date={start_date.isoformat()}, "
+        f"end_date={end_date.isoformat()}, chunks={len(chunks)}, timeout={timeout}, "
+        f"headless={headless}, observe_seconds={observe_seconds}"
+    )
+    for index, chunk in enumerate(chunks, start=1):
+        print(
+            f"[run] Chunk {index}/{len(chunks)}: "
+            f"{chunk['chunk_start'].isoformat()} -> {chunk['chunk_end'].isoformat()} "
+            f"(search {chunk['search_date'].isoformat()})"
+        )
+
     driver = create_driver(headless=headless)
     try:
         login(driver, username, password, timeout=timeout)
@@ -682,55 +816,72 @@ def run(delivery_day: date, timeout: int, headless: bool, observe_seconds: int) 
         driver.get(AREA_RESULTS_URL)
         wait_for_page_settle(driver, timeout=timeout, extra_delay=3.0)
 
-        formatted_date = format_delivery_day(delivery_day)
-        set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
-        select_category(driver, "Price in USD", timeout=timeout)
+        chunk_results = []
+        total_unconstrained_records = 0
+        total_constrained_records = 0
+        total_imported_unconstrained = 0
+        total_imported_constrained = 0
+        total_skipped_unconstrained = 0
+        total_skipped_constrained = 0
 
-        set_constrained_toggle(driver, False, timeout=timeout)
-        click_search(driver, timeout=timeout)
-        unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
-        unconstrained_records = enrich_hourly_records(
-            "unconstrained",
-            unconstrained_table["hourly_records"],
-            delivery_day,
-            unconstrained_table["returned_dates"],
-        )
+        for index, chunk in enumerate(chunks, start=1):
+            print(
+                f"[run] Executing chunk {index}/{len(chunks)} with search date "
+                f"{chunk['search_date'].isoformat()}"
+            )
+            chunk_result = scrape_area_results_for_search_date(
+                driver=driver,
+                search_date=chunk["search_date"],
+                timeout=timeout,
+                reopen_schedule=index > 1,
+            )
+            storage_result = store_results(
+                mongodb_url,
+                database_name,
+                chunk_result["unconstrained_records"],
+                chunk_result["constrained_records"],
+            )
+            chunk_result["storage"] = storage_result
+            chunk_results.append(chunk_result)
 
-        click_select_schedule(driver, timeout=timeout)
-        set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
-        select_category(driver, "Price in USD", timeout=timeout)
-        set_constrained_toggle(driver, True, timeout=timeout)
-        click_search(driver, timeout=timeout)
-        constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
-        constrained_records = enrich_hourly_records(
-            "constrained",
-            constrained_table["hourly_records"],
-            delivery_day,
-            constrained_table["returned_dates"],
-        )
+            total_unconstrained_records += len(chunk_result["unconstrained_records"])
+            total_constrained_records += len(chunk_result["constrained_records"])
+            total_imported_unconstrained += storage_result["unconstrained"]["imported"]
+            total_imported_constrained += storage_result["constrained"]["imported"]
+            total_skipped_unconstrained += storage_result["unconstrained"]["skipped_existing"]
+            total_skipped_constrained += storage_result["constrained"]["skipped_existing"]
 
-        storage_result = store_results(
-            mongodb_url,
-            database_name,
-            unconstrained_records,
-            constrained_records,
-        )
-
-        print(
-            "[7/7] Stored hourly cells: "
-            f"unconstrained={len(unconstrained_records)}, "
-            f"constrained={len(constrained_records)}"
-        )
         result = {
-            "delivery_day": formatted_date,
-            "returned_dates": {
-                "unconstrained": unconstrained_table["columns"],
-                "constrained": constrained_table["columns"],
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "chunks": [
+                {
+                    "chunk_start": chunk["chunk_start"].isoformat(),
+                    "chunk_end": chunk["chunk_end"].isoformat(),
+                    "search_date": chunk["search_date"].isoformat(),
+                }
+                for chunk in chunks
+            ],
+            "searched_chunk_count": len(chunks),
+            "fetched_record_counts": {
+                "unconstrained": total_unconstrained_records,
+                "constrained": total_constrained_records,
             },
-            "unconstrained_records": len(unconstrained_records),
-            "constrained_records": len(constrained_records),
-            "storage": storage_result,
+            "stored_record_counts": {
+                "unconstrained_imported": total_imported_unconstrained,
+                "constrained_imported": total_imported_constrained,
+                "unconstrained_skipped_existing": total_skipped_unconstrained,
+                "constrained_skipped_existing": total_skipped_constrained,
+            },
+            "results": chunk_results,
         }
+        print(
+            "[7/7] Range storage summary: "
+            f"unconstrained imported={total_imported_unconstrained}, "
+            f"constrained imported={total_imported_constrained}, "
+            f"unconstrained skipped={total_skipped_unconstrained}, "
+            f"constrained skipped={total_skipped_constrained}"
+        )
         print(f"[run] Final result summary: {result}")
         return result
     finally:
@@ -747,8 +898,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--delivery-date",
-        default=datetime.now().date().isoformat(),
-        help="Delivery date to search, in YYYY-MM-DD format.",
+        help="Legacy single search date in YYYY-MM-DD format. Searches one 7-day window ending on this date.",
+    )
+    parser.add_argument(
+        "--start-date",
+        help="Start delivery date in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--end-date",
+        help="End delivery date in YYYY-MM-DD format. If omitted with --start-date, a 7-day chunk is assumed.",
     )
     parser.add_argument(
         "--timeout",
@@ -772,9 +930,25 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    delivery_day = date.fromisoformat(args.delivery_date)
+    if args.start_date:
+        start_date = date.fromisoformat(args.start_date)
+        end_date = (
+            date.fromisoformat(args.end_date)
+            if args.end_date
+            else start_date + timedelta(days=6)
+        )
+    else:
+        delivery_date_value = (
+            date.fromisoformat(args.delivery_date)
+            if args.delivery_date
+            else datetime.now().date()
+        )
+        start_date = delivery_date_value
+        end_date = delivery_date_value
+
     result = run(
-        delivery_day=delivery_day,
+        start_date=start_date,
+        end_date=end_date,
         timeout=args.timeout,
         headless=args.headless,
         observe_seconds=args.observe_seconds,
