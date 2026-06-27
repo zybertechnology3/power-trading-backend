@@ -586,6 +586,25 @@ def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
     return chunks
 
 
+def normalize_requested_range(start_date: date, end_date: date) -> tuple[date, date]:
+    today = datetime.now().date()
+    normalized_end_date = end_date
+    if end_date > today:
+        normalized_end_date = today
+        print(
+            f"[run] Requested end_date {end_date.isoformat()} is in the future; "
+            f"using {normalized_end_date.isoformat()} instead"
+        )
+
+    if normalized_end_date < start_date:
+        raise ValueError(
+            "Requested range starts in the future. No scrapeable delivery dates remain "
+            "after clamping end_date to today."
+        )
+
+    return start_date, normalized_end_date
+
+
 def filter_existing_records(collection, records: list[dict]) -> tuple[list[dict], int]:
     if not records:
         return [], 0
@@ -796,6 +815,7 @@ def run(
     observe_seconds: int,
 ) -> dict:
     username, password, mongodb_url, database_name = load_config()
+    start_date, end_date = normalize_requested_range(start_date, end_date)
     chunks = build_search_chunks(start_date, end_date)
     print(
         f"[run] Starting area results scraper for start_date={start_date.isoformat()}, "
