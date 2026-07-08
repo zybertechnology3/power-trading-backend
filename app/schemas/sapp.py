@@ -489,6 +489,21 @@ class SappMarketOverviewResponse(BaseModel):
     days: list[SappMarketOverviewDayResponse] = Field(default_factory=list)
 
 
+class SappStandaloneAreaResultsRangeResponse(BaseModel):
+    """Standalone-scraper constrained and unconstrained results for a delivery-date range."""
+
+    start_date: date
+    end_date: date
+    constrained_total: int
+    unconstrained_total: int
+    constrained_records: list[SappConstrainedAreaResultResponse] = Field(
+        default_factory=list
+    )
+    unconstrained_records: list[SappUnconstrainedAreaResultResponse] = Field(
+        default_factory=list
+    )
+
+
 class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 

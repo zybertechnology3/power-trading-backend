@@ -240,20 +240,36 @@ def select_category(driver, value: str, timeout: int = 20) -> None:
 def find_constrained_toggle(driver):
     return driver.execute_script(
         r"""
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
         const normalize = (value) => (value || "")
             .replace(/\*/g, "")
             .replace(/\s+/g, " ")
             .trim()
             .toLowerCase();
+        const directMatches = Array.from(document.querySelectorAll(
+            "kendo-switch[data-cy*='constrained'], [role='switch'][data-cy*='constrained'], .k-switch[data-cy*='constrained']"
+        )).filter(isVisible);
+        if (directMatches.length) return directMatches[0];
+
         const labels = Array.from(document.querySelectorAll("label, .form-label, div, span"))
-            .filter((element) => normalize(element.textContent) === "constrained per area result");
+            .filter((element) =>
+                isVisible(element)
+                && normalize(element.textContent) === "constrained per area result"
+            );
         for (const label of labels) {
             let node = label;
             for (let depth = 0; node && depth < 6; depth += 1) {
-                const toggle = node.querySelector(
-                    ".k-switch, [role='switch'], input[type='checkbox'], .k-switch-track"
-                );
-                if (toggle) return toggle.closest(".k-switch") || toggle;
+                const toggles = Array.from(node.querySelectorAll(
+                    "kendo-switch, .k-switch, [role='switch'], input[type='checkbox'], .k-switch-track"
+                )).filter(isVisible);
+                if (toggles.length) {
+                    const toggle = toggles[0];
+                    return toggle.closest("kendo-switch, .k-switch, [role='switch']") || toggle;
+                }
                 node = node.parentElement;
             }
         }
@@ -296,11 +312,48 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
     if before_state is None and enabled is False:
         should_click = False
     if should_click:
-        driver.execute_script("arguments[0].click();", toggle)
-        time.sleep(2)
+        print("[3/7] Toggling constrained switch")
+        try:
+            driver.execute_script(
+                """
+                const toggle = arguments[0];
+                const track = toggle.querySelector?.(".k-switch-track");
+                (track || toggle).click();
+                """,
+                toggle,
+            )
+        except WebDriverException:
+            toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
+            toggle.click()
+
+        try:
+            WebDriverWait(driver, timeout).until(
+                lambda d: (
+                    lambda refreshed: refreshed is not None
+                    and get_toggle_state(d, refreshed) is enabled
+                )(find_constrained_toggle(d))
+            )
+        except TimeoutException:
+            print("[3/7] Switch did not flip after click; trying keyboard toggle")
+            toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
+            toggle.send_keys(Keys.SPACE)
+            WebDriverWait(driver, timeout).until(
+                lambda d: (
+                    lambda refreshed: refreshed is not None
+                    and get_toggle_state(d, refreshed) is enabled
+                )(find_constrained_toggle(d))
+            )
+
+        time.sleep(1.0)
         wait_for_page_settle(driver, timeout=timeout, extra_delay=0.75)
+
+    toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
     after_state = get_toggle_state(driver, toggle)
     print(f"[3/7] Toggle state before={before_state}, after={after_state}")
+    if after_state is not enabled:
+        raise RuntimeError(
+            f"Failed to set constrained toggle to {enabled}. Final state was {after_state}."
+        )
 
 
 def click_search(driver, timeout: int = 20) -> dict:
@@ -637,6 +690,85 @@ def filter_existing_records(collection, records: list[dict]) -> tuple[list[dict]
     return new_records, skipped_existing
 
 
+def summarize_delivery_date_coverage(
+    chunk_results: list[dict],
+    start_date: date,
+    end_date: date,
+) -> dict:
+    coverage_by_date: dict[str, dict] = {}
+    current_date = start_date
+    while current_date <= end_date:
+        coverage_by_date[current_date.isoformat()] = {
+            "delivery_date": current_date.isoformat(),
+            "constrained_count": 0,
+            "unconstrained_count": 0,
+            "search_dates": set(),
+        }
+        current_date += timedelta(days=1)
+
+    for chunk_result in chunk_results:
+        search_date = chunk_result["search_date"]
+        for record in chunk_result["constrained_records"]:
+            delivery_date_value = record["delivery_date"]
+            if delivery_date_value in coverage_by_date:
+                coverage_by_date[delivery_date_value]["constrained_count"] += 1
+                coverage_by_date[delivery_date_value]["search_dates"].add(search_date)
+
+        for record in chunk_result["unconstrained_records"]:
+            delivery_date_value = record["delivery_date"]
+            if delivery_date_value in coverage_by_date:
+                coverage_by_date[delivery_date_value]["unconstrained_count"] += 1
+                coverage_by_date[delivery_date_value]["search_dates"].add(search_date)
+
+    both = []
+    constrained_only = []
+    unconstrained_only = []
+    no_data = []
+    per_date = []
+
+    for delivery_date_value in sorted(coverage_by_date.keys()):
+        summary = coverage_by_date[delivery_date_value]
+        has_constrained = summary["constrained_count"] > 0
+        has_unconstrained = summary["unconstrained_count"] > 0
+
+        if has_constrained and has_unconstrained:
+            status = "both"
+            both.append(delivery_date_value)
+        elif has_constrained:
+            status = "constrained_only"
+            constrained_only.append(delivery_date_value)
+        elif has_unconstrained:
+            status = "unconstrained_only"
+            unconstrained_only.append(delivery_date_value)
+        else:
+            status = "no_data"
+            no_data.append(delivery_date_value)
+
+        per_date.append(
+            {
+                "delivery_date": delivery_date_value,
+                "status": status,
+                "constrained_count": summary["constrained_count"],
+                "unconstrained_count": summary["unconstrained_count"],
+                "search_dates": sorted(summary["search_dates"]),
+            }
+        )
+
+    return {
+        "successful_both_dates": both,
+        "constrained_only_dates": constrained_only,
+        "unconstrained_only_dates": unconstrained_only,
+        "no_data_dates": no_data,
+        "counts": {
+            "successful_both_dates": len(both),
+            "constrained_only_dates": len(constrained_only),
+            "unconstrained_only_dates": len(unconstrained_only),
+            "no_data_dates": len(no_data),
+        },
+        "per_date": per_date,
+    }
+
+
 def upsert_hourly_records(
     collection,
     dataset: str,
@@ -772,19 +904,8 @@ def scrape_area_results_for_search_date(
     set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
     select_category(driver, "Price in USD", timeout=timeout)
 
-    set_constrained_toggle(driver, False, timeout=timeout)
-    click_search(driver, timeout=timeout)
-    unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
-    unconstrained_records = enrich_hourly_records(
-        "unconstrained",
-        unconstrained_table["hourly_records"],
-        search_date,
-        unconstrained_table["returned_dates"],
-    )
-
-    click_select_schedule(driver, timeout=timeout)
-    set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
-    select_category(driver, "Price in USD", timeout=timeout)
+    # Fill the schedule once, search constrained first, then reopen and only
+    # flip the switch for the unconstrained run.
     set_constrained_toggle(driver, True, timeout=timeout)
     click_search(driver, timeout=timeout)
     constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
@@ -793,6 +914,17 @@ def scrape_area_results_for_search_date(
         constrained_table["hourly_records"],
         search_date,
         constrained_table["returned_dates"],
+    )
+
+    click_select_schedule(driver, timeout=timeout)
+    set_constrained_toggle(driver, False, timeout=timeout)
+    click_search(driver, timeout=timeout)
+    unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
+    unconstrained_records = enrich_hourly_records(
+        "unconstrained",
+        unconstrained_table["hourly_records"],
+        search_date,
+        unconstrained_table["returned_dates"],
     )
 
     return {
@@ -871,6 +1003,11 @@ def run(
             total_skipped_unconstrained += storage_result["unconstrained"]["skipped_existing"]
             total_skipped_constrained += storage_result["constrained"]["skipped_existing"]
 
+        coverage_summary = summarize_delivery_date_coverage(
+            chunk_results,
+            start_date,
+            end_date,
+        )
         result = {
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
@@ -893,6 +1030,7 @@ def run(
                 "unconstrained_skipped_existing": total_skipped_unconstrained,
                 "constrained_skipped_existing": total_skipped_constrained,
             },
+            "delivery_date_coverage": coverage_summary,
             "results": chunk_results,
         }
         print(
@@ -901,6 +1039,13 @@ def run(
             f"constrained imported={total_imported_constrained}, "
             f"unconstrained skipped={total_skipped_unconstrained}, "
             f"constrained skipped={total_skipped_constrained}"
+        )
+        print(
+            "[7/7] Delivery-date coverage: "
+            f"both={coverage_summary['counts']['successful_both_dates']}, "
+            f"constrained_only={coverage_summary['counts']['constrained_only_dates']}, "
+            f"unconstrained_only={coverage_summary['counts']['unconstrained_only_dates']}, "
+            f"no_data={coverage_summary['counts']['no_data_dates']}"
         )
         print(f"[run] Final result summary: {result}")
         return result

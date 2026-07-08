@@ -38,6 +38,7 @@ from app.schemas.sapp import (
     SappConstrainedAreaResultResponse,
     SappMarketOverviewDayResponse,
     SappMarketOverviewResponse,
+    SappStandaloneAreaResultsRangeResponse,
     SappParticipantPortfolioResultList,
     SappParticipantPortfolioResultResponse,
     SappPublicHolidayResponse,
@@ -76,6 +77,8 @@ TRADING_INVOICE_MARKET_ALIASES = {
     "bm down": "bm_down",
     "bm-down": "bm_down",
 }
+STANDALONE_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_CONSTRAINED_PRICE_RESULTS"
+STANDALONE_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_UNCONSTRAINED_PRICE_RESULTS"
 
 FREQUENCY_BUCKETS = {
     "4h": {"unit": "hour", "binSize": 4},
@@ -1682,6 +1685,64 @@ def get_market_overview(
         constrained_total=len(constrained_records),
         unconstrained_total=len(unconstrained_records),
         days=days,
+    )
+
+
+@router.get(
+    "/standalone-area-results",
+    response_model=SappStandaloneAreaResultsRangeResponse,
+)
+def get_standalone_area_results_for_range(
+    start_date: date = Query(..., description="First delivery date in the requested range."),
+    end_date: date = Query(..., description="Last delivery date in the requested range, inclusive."),
+):
+    """Return standalone-scraper constrained and unconstrained area results for a date range."""
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+        )
+
+    db = get_db()
+    constrained_collection = db["sapp_constrained_area_results"]
+    unconstrained_collection = db["sapp_unconstrained_area_results"]
+
+    base_filter = _build_sapp_time_filter(
+        None,
+        start_date,
+        end_date,
+        None,
+        None,
+    )
+    constrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_CONSTRAINED_DATA_SOURCE,
+    }
+    unconstrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_UNCONSTRAINED_DATA_SOURCE,
+    }
+
+    constrained_records = [
+        _serialize_result(record)
+        for record in constrained_collection.find(constrained_filter).sort(
+            [("delivery_date", 1), ("timestamp", 1), ("hour", 1)]
+        )
+    ]
+    unconstrained_records = [
+        _serialize_result(record)
+        for record in unconstrained_collection.find(unconstrained_filter).sort(
+            [("delivery_date", 1), ("timestamp", 1), ("hour", 1)]
+        )
+    ]
+
+    return SappStandaloneAreaResultsRangeResponse(
+        start_date=start_date,
+        end_date=end_date,
+        constrained_total=len(constrained_records),
+        unconstrained_total=len(unconstrained_records),
+        constrained_records=constrained_records,
+        unconstrained_records=unconstrained_records,
     )
 
 
