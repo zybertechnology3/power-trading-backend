@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import openpyxl
 from dotenv import load_dotenv
@@ -26,6 +26,7 @@ from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.firefox import GeckoDriverManager
+from app.core.time_of_use import get_time_of_use_period
 
 BASE_URL = "https://trading.sappmtp.com"
 LOGIN_URL = f"{BASE_URL}/account/login?returnUrl=%2F"
@@ -42,6 +43,14 @@ PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE = (
     "MTP - DAM - Participant Portfolio Results for {delivery_date}"
 )
 PARTICIPANT_PORTFOLIO_DATA_SOURCE = "SAPP_MTP_DAM_PARTICIPANT_PORTFOLIO_RESULTS"
+PARTICIPANT_PORTFOLIO_FPM_W_SUBJECT_TEMPLATE = (
+    "MTP - FPM-W - Participant Portfolio Results for {delivery_date}"
+)
+PARTICIPANT_PORTFOLIO_FPM_W_DATA_SOURCE = "SAPP_MTP_FPM_W_PARTICIPANT_PORTFOLIO_RESULTS"
+PARTICIPANT_PORTFOLIO_FPM_M_SUBJECT_TEMPLATE = (
+    "MTP - FPM-M - Participant Portfolio Results for {delivery_date}"
+)
+PARTICIPANT_PORTFOLIO_FPM_M_DATA_SOURCE = "SAPP_MTP_FPM_M_PARTICIPANT_PORTFOLIO_RESULTS"
 TRADING_INVOICE_SUBJECT_TEMPLATE = (
     "MTP - Trading Invoice / Credit Note for {delivery_date}"
 )
@@ -52,8 +61,8 @@ INTERNAL_COLLECTION_FIELD = "_collection_name"
 INTERNAL_UNIQUE_KEY_FIELDS_FIELD = "_unique_key_fields"
 INTERNAL_UNSET_FIELDS_FIELD = "_unset_fields"
 MAX_INBOX_PAGES_TO_SEARCH = 75
-INBOX_GRID_READY_TIMEOUT = 10
-INBOX_PAGE_CHANGE_TIMEOUT = 10
+INBOX_GRID_READY_TIMEOUT = 15
+INBOX_PAGE_CHANGE_TIMEOUT = 30
 MESSAGE_CLICK_TIMEOUT = 3
 NEXT_PAGE_SELECTOR = (
     "button.k-pager-nav[title='Go to the next page'], "
@@ -69,6 +78,8 @@ INBOX_GRID_SELECTOR = ".k-grid, [role='grid']"
 INBOX_LOADING_SELECTOR = ".k-loading-mask, .k-i-loading, .k-loading-image"
 
 # stress test for all possible scenarios:
+
+PortfolioMarket = Literal["dam", "fpm_w", "fpm_m"]
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,70 @@ def find_delivery_date_in_sheet(sheet) -> Optional[date]:
                 candidate = row[idx + 1] if idx + 1 < len(row) else None
                 return parse_delivery_date_value(candidate)
     return None
+
+
+def next_monday(reference_date: date) -> date:
+    days_until_monday = (7 - reference_date.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    return reference_date + timedelta(days=days_until_monday)
+
+
+def next_month_start(reference_date: date) -> date:
+    if reference_date.month == 12:
+        return date(reference_date.year + 1, 1, 1)
+    return date(reference_date.year, reference_date.month + 1, 1)
+
+
+def month_end(month_start_date: date) -> date:
+    return next_month_start(month_start_date) - timedelta(days=1)
+
+
+def hour_label_from_hour(hour: int) -> str:
+    return f"{hour - 1:02d}-{hour:02d}" if hour < 24 else "23-24"
+
+
+def normalize_portfolio_product(value) -> Optional[str]:
+    normalized = normalize_excel_header(value)
+    aliases = {
+        "off-peak": "off_peak",
+        "off peak": "off_peak",
+        "off_peak": "off_peak",
+        "peak": "peak",
+        "standard": "standard",
+    }
+    return aliases.get(normalized)
+
+
+def infer_portfolio_market(sheet, header_row_index: int, fallback: PortfolioMarket) -> PortfolioMarket:
+    for row_idx in range(max(1, header_row_index - 6), header_row_index + 1):
+        row = [sheet.cell(row=row_idx, column=col_idx).value for col_idx in range(1, sheet.max_column + 1)]
+        labels = " | ".join(
+            normalize_excel_header(value)
+            for value in row
+            if value is not None and str(value).strip()
+        )
+        if "fpm-w" in labels or "mtp - fpm-w" in labels or "mtp fpm-w" in labels:
+            return "fpm_w"
+        if "fpm-m" in labels or "mtp - fpm-m" in labels or "mtp fpm-m" in labels:
+            return "fpm_m"
+        if "dam" in labels or "mtp - dam" in labels or "mtp dam" in labels:
+            return "dam"
+    return fallback
+
+
+def period_range_for_portfolio_market(
+    market: PortfolioMarket,
+    source_delivery_date: date,
+) -> tuple[date, date]:
+    if market == "dam":
+        return source_delivery_date, source_delivery_date
+    if market == "fpm_w":
+        period_start_date = next_monday(source_delivery_date)
+        return period_start_date, period_start_date + timedelta(days=6)
+
+    period_start_date = next_month_start(source_delivery_date)
+    return period_start_date, month_end(period_start_date)
 
 
 def safe_divide(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
@@ -452,7 +527,7 @@ def load_config():
     return username, password
 
 
-def create_driver(download_dir: Path, headless: bool = True):
+def create_driver(download_dir: Path, headless: bool = False):
     download_dir.mkdir(parents=True, exist_ok=True)
     print(f"[2/7] 🔧 Creating Firefox driver and setting download folder to: {download_dir}")
 
@@ -1379,6 +1454,7 @@ def find_enabled_next_page_button(driver):
 
 def click_next_inbox_page(driver, page_number: int, timeout: int = INBOX_PAGE_CHANGE_TIMEOUT):
     old_signature = inbox_grid_signature(driver)
+    print(f"[5/7] Attempting next-page navigation from page {page_number} with timeout={timeout}s")
 
     def click_next(driver):
         button = find_enabled_next_page_button(driver)
@@ -1418,6 +1494,7 @@ def go_to_inbox_page(driver, page_start: int):
     old_signature = inbox_grid_signature(driver)
 
     try:
+        print(f"[5/7] Trying direct page jump to {page_start} with timeout={INBOX_PAGE_CHANGE_TIMEOUT}s")
         page_input = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, PAGE_NUMBER_INPUT_SELECTOR))
         )
@@ -1774,100 +1851,228 @@ def extract_participant_portfolio_results(
     )
     workbook = openpyxl.load_workbook(file_path, data_only=True)
 
-    required_headers = {
+    source_delivery_date = None
+    for sheet in workbook.worksheets:
+        source_delivery_date = find_delivery_date_in_sheet(sheet)
+        if source_delivery_date is not None:
+            break
+
+    if source_delivery_date is None:
+        raise RuntimeError("Could not find the delivery date in the downloaded file.")
+
+    dam_required_headers = {
         "hour": "hour",
         "participant_total_area_schedule_mwh": "participant total area schedule (mwh)",
         "area_price_usd_per_mwh": "area price (usd/mwh)",
-        "unconstrained_market_price_usd_per_mwh": "unconstrained market price (usd/mwh)",
-        "total_dam_turnover_mwh": "total dam turnover (mwh)",
+    }
+    fpm_required_headers = {
+        "product": "product",
+        "participant_total_area_schedule_mw": "participant total area schedule (mw)",
+        "area_price_usd_per_mwh": "area price (usd/mwh)",
     }
 
-    target_sheet = None
-    header_row_index = None
-    column_indexes = None
-    for sheet in workbook.worksheets:
-        for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-            normalized = [normalize_excel_header(value) for value in row]
-            indexes = {}
-            for field_name, header in required_headers.items():
-                try:
-                    indexes[field_name] = normalized.index(header)
-                except ValueError:
-                    indexes = {}
-                    break
-            if indexes:
-                target_sheet = sheet
-                header_row_index = row_idx
-                column_indexes = indexes
-                break
-        if target_sheet is not None:
-            break
-
-    if target_sheet is None or header_row_index is None or column_indexes is None:
-        raise RuntimeError("Could not find the participant portfolio hourly data header row.")
-
-    delivery_date = find_delivery_date_in_sheet(target_sheet)
-    if delivery_date is None:
-        for sheet in workbook.worksheets:
-            delivery_date = find_delivery_date_in_sheet(sheet)
-            if delivery_date is not None:
-                break
-
-    if delivery_date is None:
-        raise RuntimeError("Could not find the delivery date in the downloaded file.")
-
     records = []
-    for row in target_sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
-        hour_col = column_indexes["hour"]
-        if not row or hour_col >= len(row) or row[hour_col] is None:
-            continue
 
-        hour = parse_hour(row[hour_col])
-        if hour is None:
-            continue
-
-        def cell(field_name: str):
-            col_idx = column_indexes[field_name]
-            return row[col_idx] if col_idx < len(row) else None
-
-        records.append(
-            {
-                "timestamp": delivery_timestamp(delivery_date, hour),
-                "delivery_date": delivery_date.isoformat(),
-                "hour": hour,
-                "hour_label": str(row[hour_col]).strip(),
-                "participant_total_area_schedule_mwh": to_float(
-                    cell("participant_total_area_schedule_mwh")
-                ),
-                "area_price_usd_per_mwh": to_float(cell("area_price_usd_per_mwh")),
-                "unconstrained_market_price_usd_per_mwh": to_float(
-                    cell("unconstrained_market_price_usd_per_mwh")
-                ),
-                "total_dam_turnover_mwh": to_float(cell("total_dam_turnover_mwh")),
-                "metadata": {
-                    "data_source": data_source,
-                    "source_file": file_path.name,
-                },
+    def build_base_record(
+        market: PortfolioMarket,
+        delivery_day: date,
+        hour: int,
+        participant_schedule: Optional[float],
+        area_price: Optional[float],
+        source_hour_label: str,
+        product: Optional[str],
+        period_start_date: date,
+        period_end_date: date,
+        unconstrained_price: Optional[float] = None,
+        total_dam_turnover: Optional[float] = None,
+    ) -> dict:
+        return {
+            "timestamp": delivery_timestamp(delivery_day, hour),
+            "market": market,
+            "delivery_date": delivery_day.isoformat(),
+            "source_delivery_date": source_delivery_date.isoformat(),
+            "period_start_date": period_start_date.isoformat(),
+            "period_end_date": period_end_date.isoformat(),
+            "hour": hour,
+            "hour_label": hour_label_from_hour(hour),
+            "product": product or get_time_of_use_period(delivery_day, hour),
+            "participant_total_area_schedule_mwh": participant_schedule,
+            "area_price_usd_per_mwh": area_price,
+            "unconstrained_market_price_usd_per_mwh": unconstrained_price,
+            "total_dam_turnover_mwh": total_dam_turnover,
+            "metadata": {
+                "data_source": data_source,
                 "source_file": file_path.name,
-            }
-        )
+                "market": market,
+                "source_hour_label": source_hour_label,
+                "source_delivery_date": source_delivery_date.isoformat(),
+                "period_start_date": period_start_date.isoformat(),
+                "period_end_date": period_end_date.isoformat(),
+            },
+            "source_file": file_path.name,
+        }
+
+    for sheet in workbook.worksheets:
+        sheet_rows = list(sheet.iter_rows(values_only=True))
+        for row_idx, row in enumerate(sheet_rows, start=1):
+            normalized = [normalize_excel_header(value) for value in row]
+
+            dam_indexes = {}
+            for field_name, header in dam_required_headers.items():
+                try:
+                    dam_indexes[field_name] = normalized.index(header)
+                except ValueError:
+                    dam_indexes = {}
+                    break
+
+            if dam_indexes:
+                if "unconstrained market price (usd/mwh)" in normalized:
+                    dam_indexes["unconstrained_market_price_usd_per_mwh"] = normalized.index(
+                        "unconstrained market price (usd/mwh)"
+                    )
+                if "total dam turnover (mwh)" in normalized:
+                    dam_indexes["total_dam_turnover_mwh"] = normalized.index(
+                        "total dam turnover (mwh)"
+                    )
+
+                market = infer_portfolio_market(sheet, row_idx, "dam")
+                period_start_date, period_end_date = period_range_for_portfolio_market(
+                    market,
+                    source_delivery_date,
+                )
+
+                for data_row in sheet_rows[row_idx:]:
+                    hour_col = dam_indexes["hour"]
+                    if not data_row or hour_col >= len(data_row) or data_row[hour_col] is None:
+                        continue
+
+                    raw_hour = str(data_row[hour_col]).strip()
+                    if normalize_excel_header(raw_hour) in {"total", "min", "max", "avg"}:
+                        break
+
+                    hour = parse_hour(data_row[hour_col])
+                    if hour is None:
+                        continue
+
+                    def dam_cell(field_name: str):
+                        col_idx = dam_indexes.get(field_name)
+                        if col_idx is None or col_idx >= len(data_row):
+                            return None
+                        return data_row[col_idx]
+
+                    delivery_day = source_delivery_date if market == "dam" else period_start_date
+                    records.append(
+                        build_base_record(
+                            market=market,
+                            delivery_day=delivery_day,
+                            hour=hour,
+                            participant_schedule=to_float(
+                                dam_cell("participant_total_area_schedule_mwh")
+                            ),
+                            area_price=to_float(dam_cell("area_price_usd_per_mwh")),
+                            source_hour_label=raw_hour,
+                            product=get_time_of_use_period(delivery_day, hour),
+                            period_start_date=period_start_date,
+                            period_end_date=period_end_date,
+                            unconstrained_price=to_float(
+                                dam_cell("unconstrained_market_price_usd_per_mwh")
+                            ),
+                            total_dam_turnover=to_float(dam_cell("total_dam_turnover_mwh")),
+                        )
+                    )
+                continue
+
+            fpm_indexes = {}
+            for field_name, header in fpm_required_headers.items():
+                try:
+                    fpm_indexes[field_name] = normalized.index(header)
+                except ValueError:
+                    fpm_indexes = {}
+                    break
+
+            if fpm_indexes:
+                market = infer_portfolio_market(sheet, row_idx, "fpm_w")
+                if market == "dam":
+                    continue
+                period_start_date, period_end_date = period_range_for_portfolio_market(
+                    market,
+                    source_delivery_date,
+                )
+
+                product_rows = []
+                for data_row in sheet_rows[row_idx:]:
+                    product_col = fpm_indexes["product"]
+                    if not data_row or product_col >= len(data_row) or data_row[product_col] is None:
+                        continue
+
+                    product = normalize_portfolio_product(data_row[product_col])
+                    if product is None:
+                        first_value = normalize_excel_header(data_row[product_col])
+                        if first_value in {"total", "min", "max", "avg"}:
+                            break
+                        continue
+
+                    def fpm_cell(field_name: str):
+                        col_idx = fpm_indexes.get(field_name)
+                        if col_idx is None or col_idx >= len(data_row):
+                            return None
+                        return data_row[col_idx]
+
+                    product_rows.append(
+                        {
+                            "product": product,
+                            "source_hour_label": str(data_row[product_col]).strip(),
+                            "participant_total_area_schedule_mwh": to_float(
+                                fpm_cell("participant_total_area_schedule_mw")
+                            ),
+                            "area_price_usd_per_mwh": to_float(
+                                fpm_cell("area_price_usd_per_mwh")
+                            ),
+                        }
+                    )
+
+                for current_date in (
+                    period_start_date + timedelta(days=offset)
+                    for offset in range((period_end_date - period_start_date).days + 1)
+                ):
+                    for hour in range(1, 25):
+                        product = get_time_of_use_period(current_date, hour)
+                        matching_row = next(
+                            (row_data for row_data in product_rows if row_data["product"] == product),
+                            None,
+                        )
+                        if matching_row is None:
+                            continue
+
+                        records.append(
+                            build_base_record(
+                                market=market,
+                                delivery_day=current_date,
+                                hour=hour,
+                                participant_schedule=matching_row[
+                                    "participant_total_area_schedule_mwh"
+                                ],
+                                area_price=matching_row["area_price_usd_per_mwh"],
+                                source_hour_label=matching_row["source_hour_label"],
+                                product=product,
+                                period_start_date=period_start_date,
+                                period_end_date=period_end_date,
+                            )
+                        )
 
     if not records:
-        raise RuntimeError("No hourly rows were extracted from the downloaded file.")
+        raise RuntimeError("No participant portfolio rows were extracted from the downloaded file.")
 
-    extracted_hours = {record["hour"] for record in records}
-    expected_hours = set(range(1, 25))
-    if extracted_hours != expected_hours:
-        missing_hours = sorted(expected_hours - extracted_hours)
-        extra_hours = sorted(extracted_hours - expected_hours)
-        raise RuntimeError(
-            "Expected 24 hourly participant portfolio rows for the delivery day, "
-            f"but extracted {len(records)}. "
-            f"Missing hours: {missing_hours or 'none'}. "
-            f"Unexpected hours: {extra_hours or 'none'}."
+    deduped_records = {}
+    for record in records:
+        deduped_records[(record["market"], record["delivery_date"], record["hour"])] = record
+
+    return list(
+        sorted(
+            deduped_records.values(),
+            key=lambda record: (record["market"], record["delivery_date"], record["hour"]),
         )
-
-    return records
+    )
 
 
 def extract_participant_portfolio_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
@@ -2251,7 +2456,25 @@ PARTICIPANT_PORTFOLIO_RESULTS_JOB = SappExtractionJob(
     subject_template=PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE,
     data_source=PARTICIPANT_PORTFOLIO_DATA_SOURCE,
     collection_name="sapp_participant_portfolio_results",
-    unique_key_fields=("delivery_date", "hour"),
+    unique_key_fields=("market", "delivery_date", "hour"),
+    extractor=extract_participant_portfolio_job,
+)
+
+PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB = SappExtractionJob(
+    name="participant_portfolio_results_fpm_w",
+    subject_template=PARTICIPANT_PORTFOLIO_FPM_W_SUBJECT_TEMPLATE,
+    data_source=PARTICIPANT_PORTFOLIO_FPM_W_DATA_SOURCE,
+    collection_name="sapp_participant_portfolio_results",
+    unique_key_fields=("market", "delivery_date", "hour"),
+    extractor=extract_participant_portfolio_job,
+)
+
+PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB = SappExtractionJob(
+    name="participant_portfolio_results_fpm_m",
+    subject_template=PARTICIPANT_PORTFOLIO_FPM_M_SUBJECT_TEMPLATE,
+    data_source=PARTICIPANT_PORTFOLIO_FPM_M_DATA_SOURCE,
+    collection_name="sapp_participant_portfolio_results",
+    unique_key_fields=("market", "delivery_date", "hour"),
     extractor=extract_participant_portfolio_job,
 )
 
@@ -2268,6 +2491,8 @@ SAPP_EXTRACTION_JOBS: dict[str, SappExtractionJob] = {
     CONSTRAINED_AREA_RESULTS_JOB.name: CONSTRAINED_AREA_RESULTS_JOB,
     UNCONSTRAINED_AREA_RESULTS_JOB.name: UNCONSTRAINED_AREA_RESULTS_JOB,
     PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_RESULTS_JOB,
+    PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB,
+    PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB,
     TRADING_INVOICE_RESULTS_JOB.name: TRADING_INVOICE_RESULTS_JOB,
 }
 

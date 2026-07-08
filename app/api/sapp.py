@@ -603,6 +603,19 @@ def _normalize_trading_invoice_market(market: Optional[str]) -> Optional[str]:
     return normalized_market
 
 
+def _normalize_portfolio_market(market: Optional[str]) -> Optional[str]:
+    if market is None:
+        return None
+
+    normalized_market = str(market).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized_market not in {"dam", "fpm_w", "fpm_m"}:
+        raise HTTPException(
+            status_code=400,
+            detail="market must be one of: dam, fpm_w, fpm_m",
+        )
+    return normalized_market
+
+
 def _build_sapp_time_filter(
     delivery_date: Optional[date],
     start_date: Optional[date],
@@ -636,6 +649,18 @@ def _build_sapp_time_filter(
             detail="end_date must be greater than or equal to start_date",
         )
     return query_filter
+
+
+def _serialize_portfolio_result(record: dict) -> dict:
+    serialized = _serialize_result(record)
+    serialized.setdefault("market", "dam")
+    if "source_delivery_date" not in serialized:
+        serialized["source_delivery_date"] = serialized.get("delivery_date")
+    if "period_start_date" not in serialized:
+        serialized["period_start_date"] = serialized.get("delivery_date")
+    if "period_end_date" not in serialized:
+        serialized["period_end_date"] = serialized.get("delivery_date")
+    return serialized
 
 
 def _bucket_period_end_expression(frequency: str):
@@ -811,6 +836,12 @@ def _aggregate_unconstrained_area_results(
 def _scrape_job_names_for_request(job_name: str) -> list[str]:
     if job_name == "constrained_area_results":
         return ["constrained_area_results", "unconstrained_area_results"]
+    if job_name == "participant_portfolio_results":
+        return [
+            "participant_portfolio_results",
+            "participant_portfolio_results_fpm_w",
+            "participant_portfolio_results_fpm_m",
+        ]
     return [job_name]
 
 
@@ -1788,6 +1819,7 @@ def list_participant_portfolio_results(
     delivery_date: Optional[date] = Query(None),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
+    market: Optional[str] = Query(None),
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
 ):
@@ -1804,14 +1836,17 @@ def list_participant_portfolio_results(
         start_time,
         end_time,
     )
+    normalized_market = _normalize_portfolio_market(market)
+    if normalized_market:
+        query_filter["market"] = normalized_market
     total = collection.count_documents(query_filter)
     records = list(
         collection.find(query_filter)
-        .sort("timestamp", 1)
+        .sort([("delivery_date", 1), ("market", 1), ("timestamp", 1), ("hour", 1)])
         .skip(skip)
         .limit(limit)
     )
-    records = [_serialize_result(record) for record in records]
+    records = [_serialize_portfolio_result(record) for record in records]
 
     page = (skip // limit) + 1
     return SappParticipantPortfolioResultList(
@@ -1838,19 +1873,35 @@ def scrape_participant_portfolio_results(
         description="Inbox page number to start searching from.",
     ),
 ):
-    """Download, parse, and upsert one SAPP participant portfolio document."""
+    """Download, parse, and upsert SAPP DAM, FPM-W, and FPM-M portfolio documents."""
     try:
-        job = get_extraction_job("participant_portfolio_results")
-        result = run_extraction_job(
-            job,
-            delivery_date=delivery_date,
-            page_start=page_start,
-        )
+        requested_job_names = _scrape_job_names_for_request("participant_portfolio_results")
+        results = [
+            run_extraction_job(
+                get_extraction_job(requested_job_name),
+                delivery_date=delivery_date,
+                page_start=page_start,
+            )
+            for requested_job_name in requested_job_names
+        ]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return result
+
+    primary_result = dict(results[0])
+    primary_result.update(
+        {
+            "job": "participant_portfolio_results",
+            "requested_jobs": requested_job_names,
+            "successful_jobs": len(results),
+            "failed_jobs": 0,
+            "imported": sum(result.get("imported", 0) for result in results),
+            "updated": sum(result.get("updated", 0) for result in results),
+            "related_results": results,
+        }
+    )
+    return primary_result
 
 
 @router.post(
@@ -1871,37 +1922,74 @@ def scrape_participant_portfolio_results_for_date_range(
         description="Inbox page number to start searching from.",
     ),
 ):
-    """Download, parse, and upsert SAPP participant portfolio documents for a date range."""
+    """Download, parse, and upsert SAPP DAM, FPM-W, and FPM-M portfolio documents."""
     try:
-        job = get_extraction_job("participant_portfolio_results")
-        result = run_extraction_job_for_date_range(
-            job,
-            start_date=start_date,
-            end_date=end_date,
-            continue_on_error=continue_on_error,
-            page_start=page_start,
-        )
+        requested_job_names = _scrape_job_names_for_request("participant_portfolio_results")
+        range_results = [
+            run_extraction_job_for_date_range(
+                get_extraction_job(requested_job_name),
+                start_date=start_date,
+                end_date=end_date,
+                continue_on_error=continue_on_error,
+                page_start=page_start,
+            )
+            for requested_job_name in requested_job_names
+        ]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return result
+
+    merged_results = [
+        result
+        for range_result in range_results
+        for result in range_result.get("results", [])
+    ]
+    successful_results = [
+        result for result in merged_results if result.get("status") == "success"
+    ]
+    failed_results = [
+        result for result in merged_results if result.get("status") == "failed"
+    ]
+    return {
+        "job": "participant_portfolio_results",
+        "requested_jobs": requested_job_names,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "page_start": page_start,
+        "requested_dates": sum(
+            result.get("requested_dates", 0) for result in range_results
+        ),
+        "successful_dates": len(successful_results),
+        "failed_dates": len(failed_results),
+        "imported": sum(result.get("imported", 0) for result in range_results),
+        "updated": sum(result.get("updated", 0) for result in range_results),
+        "results": merged_results,
+        "related_results": range_results,
+    }
 
 
 @router.get(
     "/participant-portfolio-results/{delivery_date}",
     response_model=list[SappParticipantPortfolioResultResponse],
 )
-def get_participant_portfolio_results_for_day(delivery_date: date):
+def get_participant_portfolio_results_for_day(
+    delivery_date: date,
+    market: Optional[str] = Query(None),
+):
     """Get all hourly SAPP participant portfolio results for one delivery date."""
     db = get_db()
     collection = db["sapp_participant_portfolio_results"]
 
     start = datetime.combine(delivery_date, time.min)
     end = datetime.combine(delivery_date, time.max)
+    query_filter = {"timestamp": {"$gte": start, "$lte": end}}
+    normalized_market = _normalize_portfolio_market(market)
+    if normalized_market:
+        query_filter["market"] = normalized_market
     records = list(
-        collection.find({"timestamp": {"$gte": start, "$lte": end}})
-        .sort("timestamp", 1)
+        collection.find(query_filter)
+        .sort([("market", 1), ("timestamp", 1), ("hour", 1)])
     )
     if not records:
         raise HTTPException(
@@ -1909,7 +1997,7 @@ def get_participant_portfolio_results_for_day(delivery_date: date):
             detail="No SAPP participant portfolio results found for this date",
         )
 
-    return [_serialize_result(record) for record in records]
+    return [_serialize_portfolio_result(record) for record in records]
 
 
 @router.get(

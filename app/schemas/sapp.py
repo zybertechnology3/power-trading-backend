@@ -508,9 +508,26 @@ class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 
     timestamp: datetime = Field(..., description="Delivery timestamp for this hourly result")
+    market: SappBidMarket = Field("dam", description="Portfolio market: dam, fpm_w, or fpm_m")
     delivery_date: date = Field(..., description="SAPP delivery date")
+    source_delivery_date: Optional[date] = Field(
+        None,
+        description="Portfolio report date used to derive this delivery period",
+    )
+    period_start_date: Optional[date] = Field(
+        None,
+        description="First delivery date covered by the source market result",
+    )
+    period_end_date: Optional[date] = Field(
+        None,
+        description="Last delivery date covered by the source market result",
+    )
     hour: Optional[int] = Field(None, ge=1, le=24, description="Delivery hour, 1-24")
     hour_label: Optional[str] = Field(None, description="Original hour label from the document")
+    product: Optional[SappBidProduct] = Field(
+        None,
+        description="Time-of-use product for this hour: off_peak, peak, or standard",
+    )
     participant_total_area_schedule_mwh: Optional[float] = Field(
         None,
         description="Participant total area schedule in MWh",

@@ -228,21 +228,41 @@ def _initialize_collections():
 
     if "sapp_participant_portfolio_results" not in db.list_collection_names():
         db.create_collection("sapp_participant_portfolio_results")
-        participant_portfolio_collection = db["sapp_participant_portfolio_results"]
-        participant_portfolio_collection.create_index(
-            [("timestamp", DESCENDING)],
-            name="idx_sapp_participant_portfolio_timestamp",
-        )
-        participant_portfolio_collection.create_index(
-            [("delivery_date", ASCENDING), ("hour", ASCENDING)],
-            unique=True,
-            name="idx_sapp_participant_portfolio_delivery_date_hour_unique",
-        )
-        participant_portfolio_collection.create_index(
-            [("metadata.data_source", ASCENDING)],
-            name="idx_sapp_participant_portfolio_data_source",
-        )
         print("Created 'sapp_participant_portfolio_results' collection")
+
+    participant_portfolio_collection = db["sapp_participant_portfolio_results"]
+    existing_indexes = participant_portfolio_collection.index_information()
+    legacy_index_name = "idx_sapp_participant_portfolio_delivery_date_hour_unique"
+    if legacy_index_name in existing_indexes:
+        participant_portfolio_collection.drop_index(legacy_index_name)
+
+    participant_portfolio_collection.update_many(
+        {"market": {"$exists": False}},
+        [
+            {
+                "$set": {
+                    "market": "dam",
+                    "source_delivery_date": "$delivery_date",
+                    "period_start_date": "$delivery_date",
+                    "period_end_date": "$delivery_date",
+                }
+            }
+        ],
+    )
+
+    participant_portfolio_collection.create_index(
+        [("timestamp", DESCENDING)],
+        name="idx_sapp_participant_portfolio_timestamp",
+    )
+    participant_portfolio_collection.create_index(
+        [("market", ASCENDING), ("delivery_date", ASCENDING), ("hour", ASCENDING)],
+        unique=True,
+        name="idx_sapp_participant_portfolio_market_delivery_date_hour_unique",
+    )
+    participant_portfolio_collection.create_index(
+        [("metadata.data_source", ASCENDING)],
+        name="idx_sapp_participant_portfolio_data_source",
+    )
 
     if "sapp_trading_invoice_credit_notes" not in db.list_collection_names():
         db.create_collection("sapp_trading_invoice_credit_notes")
