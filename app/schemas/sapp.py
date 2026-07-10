@@ -504,6 +504,25 @@ class SappStandaloneAreaResultsRangeResponse(BaseModel):
     )
 
 
+class SappDamAreaResultRecord(BaseModel):
+    """Minimal merged DAM area price record for charting."""
+
+    delivery_date: date
+    hour: int = Field(..., ge=1, le=24)
+    timestamp: datetime
+    constrained_price_usd_per_mwh: Optional[float] = None
+    unconstrained_price_usd_per_mwh: Optional[float] = None
+
+
+class SappDamAreaResultsRangeResponse(BaseModel):
+    """Minimal merged DAM area price payload for charting."""
+
+    market: Literal["dam"] = "dam"
+    start_date: date
+    end_date: date
+    records: list[SappDamAreaResultRecord] = Field(default_factory=list)
+
+
 class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 

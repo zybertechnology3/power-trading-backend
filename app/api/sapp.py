@@ -22,6 +22,8 @@ from app.core.config import settings
 from app.db.database import get_db
 from app.schemas.sapp import (
     BidStatus,
+    SappDamAreaResultRecord,
+    SappDamAreaResultsRangeResponse,
     SappBidMarket,
     SappBidCreate,
     SappBidComparisonResponse,
@@ -651,6 +653,78 @@ def _build_sapp_time_filter(
             detail="end_date must be greater than or equal to start_date",
         )
     return query_filter
+
+
+def _dam_area_result_timestamp(delivery_date_value, hour: int) -> datetime:
+    if isinstance(delivery_date_value, date):
+        delivery_day = delivery_date_value
+    else:
+        delivery_day = date.fromisoformat(str(delivery_date_value))
+    return datetime.combine(delivery_day, time.min) + timedelta(hours=hour - 1)
+
+
+def _merge_dam_area_results(
+    constrained_records: list[dict],
+    unconstrained_records: list[dict],
+) -> list[SappDamAreaResultRecord]:
+    merged: dict[tuple[str, int], dict] = {}
+
+    for record in constrained_records:
+        delivery_date_value = record.get("delivery_date")
+        hour_value = record.get("hour")
+        if delivery_date_value is None or hour_value is None:
+            continue
+        delivery_date_key = (
+            delivery_date_value.isoformat()
+            if isinstance(delivery_date_value, date)
+            else str(delivery_date_value)
+        )
+        hour_int = int(hour_value)
+        key = (delivery_date_key, hour_int)
+        merged.setdefault(
+            key,
+            {
+                "delivery_date": date.fromisoformat(delivery_date_key),
+                "hour": hour_int,
+                "timestamp": _dam_area_result_timestamp(delivery_date_key, hour_int),
+                "constrained_price_usd_per_mwh": None,
+                "unconstrained_price_usd_per_mwh": None,
+            },
+        )
+        merged[key]["constrained_price_usd_per_mwh"] = record.get(
+            "area_price_usd_per_mwh"
+        )
+
+    for record in unconstrained_records:
+        delivery_date_value = record.get("delivery_date")
+        hour_value = record.get("hour")
+        if delivery_date_value is None or hour_value is None:
+            continue
+        delivery_date_key = (
+            delivery_date_value.isoformat()
+            if isinstance(delivery_date_value, date)
+            else str(delivery_date_value)
+        )
+        hour_int = int(hour_value)
+        key = (delivery_date_key, hour_int)
+        merged.setdefault(
+            key,
+            {
+                "delivery_date": date.fromisoformat(delivery_date_key),
+                "hour": hour_int,
+                "timestamp": _dam_area_result_timestamp(delivery_date_key, hour_int),
+                "constrained_price_usd_per_mwh": None,
+                "unconstrained_price_usd_per_mwh": None,
+            },
+        )
+        merged[key]["unconstrained_price_usd_per_mwh"] = record.get(
+            "price_usd_per_mwh"
+        )
+
+    return [
+        SappDamAreaResultRecord(**merged[key])
+        for key in sorted(merged.keys(), key=lambda item: (item[0], item[1]))
+    ]
 
 
 def _serialize_portfolio_result(record: dict) -> dict:
@@ -1788,6 +1862,47 @@ def get_standalone_area_results_for_range(
         unconstrained_total=len(unconstrained_records),
         constrained_records=constrained_records,
         unconstrained_records=unconstrained_records,
+    )
+
+
+@router.get("/dam-area-results", response_model=SappDamAreaResultsRangeResponse)
+def get_dam_area_results_for_range(
+    start_date: date = Query(..., description="First delivery date in the requested range."),
+    end_date: date = Query(..., description="Last delivery date in the requested range, inclusive."),
+):
+    """Return a minimal merged DAM area price series for charting."""
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+        )
+
+    db = get_db()
+    constrained_collection = db["sapp_constrained_area_results"]
+    unconstrained_collection = db["sapp_unconstrained_area_results"]
+
+    base_filter = _build_sapp_time_filter(None, start_date, end_date, None, None)
+    constrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_CONSTRAINED_DATA_SOURCE,
+    }
+    unconstrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_UNCONSTRAINED_DATA_SOURCE,
+    }
+
+    constrained_records = list(
+        constrained_collection.find(constrained_filter).sort([("delivery_date", 1), ("hour", 1)])
+    )
+    unconstrained_records = list(
+        unconstrained_collection.find(unconstrained_filter).sort([("delivery_date", 1), ("hour", 1)])
+    )
+
+    return SappDamAreaResultsRangeResponse(
+        market="dam",
+        start_date=start_date,
+        end_date=end_date,
+        records=_merge_dam_area_results(constrained_records, unconstrained_records),
     )
 
 
