@@ -109,6 +109,47 @@ def build_message_subject(delivery_date: date, subject_template: str) -> str:
     return subject_template.format(delivery_date=delivery_date.strftime("%Y/%m/%d"))
 
 
+def normalize_subject_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def delivery_date_subject_variants(delivery_date: date) -> set[str]:
+    return {
+        delivery_date.strftime("%Y/%m/%d"),
+        delivery_date.strftime("%Y-%m-%d"),
+        delivery_date.strftime("%d/%m/%Y"),
+        delivery_date.strftime("%d-%m-%Y"),
+    }
+
+
+def job_subject_keywords(job: SappExtractionJob) -> list[str]:
+    prefix = job.subject_template.split("{delivery_date}")[0]
+    normalized_prefix = normalize_subject_text(prefix)
+    stopwords = {"for", "the", "and"}
+    return [
+        token
+        for token in normalized_prefix.split()
+        if token and token not in stopwords
+    ]
+
+
+def subject_matches_job_and_date(
+    subject: str,
+    job: SappExtractionJob,
+    delivery_date: date,
+) -> bool:
+    normalized_subject = normalize_subject_text(subject)
+    if not all(keyword in normalized_subject for keyword in job_subject_keywords(job)):
+        return False
+
+    subject_date_tokens = {
+        token
+        for token in delivery_date_subject_variants(delivery_date)
+        if normalize_subject_text(token) in normalized_subject
+    }
+    return bool(subject_date_tokens)
+
+
 def parse_delivery_date_value(value):
     if isinstance(value, datetime):
         return value.date()
@@ -163,22 +204,30 @@ def normalize_excel_header(value) -> str:
     return re.sub(r"\s+", " ", str(value).strip()).lower()
 
 
-def find_delivery_date_in_sheet(sheet) -> Optional[date]:
+def find_labeled_date_in_sheet(sheet, labels: list[str]) -> Optional[date]:
     for row in sheet.iter_rows(min_row=1, max_row=50, values_only=True):
         if not row:
             continue
         for idx, value in enumerate(row):
-            if isinstance(value, str) and value.strip() == "Delivery Date:":
+            if isinstance(value, str) and value.strip() in labels:
                 candidate = row[idx + 1] if idx + 1 < len(row) else None
                 return parse_delivery_date_value(candidate)
     return None
 
 
-def next_monday(reference_date: date) -> date:
-    days_until_monday = (7 - reference_date.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    return reference_date + timedelta(days=days_until_monday)
+def find_delivery_date_in_sheet(sheet) -> Optional[date]:
+    return find_labeled_date_in_sheet(sheet, ["Delivery Date:"])
+
+
+def find_portfolio_reference_date_in_sheet(sheet) -> Optional[date]:
+    return find_labeled_date_in_sheet(
+        sheet,
+        [
+            "Delivery Date:",
+            "Delivery Week:",
+            "Delivery Month:",
+        ],
+    )
 
 
 def next_month_start(reference_date: date) -> date:
@@ -226,15 +275,15 @@ def infer_portfolio_market(sheet, header_row_index: int, fallback: PortfolioMark
 
 def period_range_for_portfolio_market(
     market: PortfolioMarket,
-    source_delivery_date: date,
+    reference_date: date,
 ) -> tuple[date, date]:
     if market == "dam":
-        return source_delivery_date, source_delivery_date
+        return reference_date, reference_date
     if market == "fpm_w":
-        period_start_date = next_monday(source_delivery_date)
+        period_start_date = reference_date
         return period_start_date, period_start_date + timedelta(days=6)
 
-    period_start_date = next_month_start(source_delivery_date)
+    period_start_date = date(reference_date.year, reference_date.month, 1)
     return period_start_date, month_end(period_start_date)
 
 
@@ -1376,46 +1425,82 @@ def get_current_inbox_page_number(driver) -> Optional[int]:
         return None
 
 
-def find_message_on_current_page(driver, target_subject: str):
+def find_visible_subject_titles(driver) -> list[str]:
     try:
         return driver.execute_script(
             """
-            const target = arguments[0];
-            return Array.from(document.querySelectorAll("span[title]")).find((element) => {
-                if (element.getAttribute("title") !== target) return false;
-                const rect = element.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-            }) || null;
-            """,
-            target_subject,
-        )
-    except WebDriverException:
-        return None
-
-
-def find_target_subjects_on_current_page(driver, target_subjects: list[str]) -> list[str]:
-    if not target_subjects:
-        return []
-
-    try:
-        return driver.execute_script(
+            return Array.from(document.querySelectorAll("span[title]"))
+                .filter((element) => {
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                })
+                .map((element) => (element.getAttribute("title") || "").trim())
+                .filter(Boolean);
             """
-            const targets = new Set(arguments[0]);
-            const found = [];
-            for (const element of document.querySelectorAll("span[title]")) {
-                const title = element.getAttribute("title");
-                if (!targets.has(title) || found.includes(title)) continue;
-                const rect = element.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    found.push(title);
-                }
-            }
-            return found;
-            """,
-            target_subjects,
         )
     except WebDriverException:
         return []
+
+
+def find_matching_subject_title_on_current_page(
+    driver,
+    job: SappExtractionJob,
+    delivery_date: date,
+) -> Optional[str]:
+    for subject in find_visible_subject_titles(driver):
+        if subject_matches_job_and_date(subject, job, delivery_date):
+            return subject
+    return None
+
+
+def find_matching_subjects_on_current_page(
+    driver,
+    job: SappExtractionJob,
+    pending_dates: list[date],
+) -> dict[str, date]:
+    matches = {}
+    visible_subjects = find_visible_subject_titles(driver)
+    for delivery_date in pending_dates:
+        for subject in visible_subjects:
+            if subject in matches:
+                continue
+            if subject_matches_job_and_date(subject, job, delivery_date):
+                matches[subject] = delivery_date
+                break
+    return matches
+
+
+def find_matching_job_subjects_on_current_page(
+    driver,
+    jobs: list[SappExtractionJob],
+    pending_items: list[tuple[SappExtractionJob, date]],
+) -> dict[str, tuple[SappExtractionJob, date]]:
+    matches = {}
+    visible_subjects = find_visible_subject_titles(driver)
+    for job, delivery_date in pending_items:
+        for subject in visible_subjects:
+            if subject in matches:
+                continue
+            if subject_matches_job_and_date(subject, job, delivery_date):
+                matches[subject] = (job, delivery_date)
+                break
+    return matches
+
+
+def extract_job_delivery_dates_from_current_page(
+    driver,
+    job: SappExtractionJob,
+) -> list[date]:
+    prefix = job.subject_template.split("{delivery_date}")[0]
+    extracted_dates = []
+    for subject in find_visible_subject_titles(driver):
+        if not subject.startswith(prefix):
+            continue
+        candidate = subject[len(prefix) :].strip()
+        parsed_date = parse_delivery_date_value(candidate)
+        if parsed_date is not None:
+            extracted_dates.append(parsed_date)
+    return extracted_dates
 
 
 def click_message(driver, target_subject: str):
@@ -1530,15 +1615,25 @@ def go_to_inbox_page(driver, page_start: int):
         current_page += 1
 
 
-def find_message_and_open(driver, target_subject: str, page_start: int = 1):
+def find_message_and_open(
+    driver,
+    job: SappExtractionJob,
+    delivery_date: date,
+    page_start: int = 1,
+):
+    target_subject = job.build_subject(delivery_date)
     print(f"[5/7] Looking for message with subject: {target_subject}")
     go_to_inbox_page(driver, page_start)
 
     for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
         wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
-        message_span = find_message_on_current_page(driver, target_subject)
-        if message_span is not None:
-            click_message(driver, target_subject)
+        matched_subject = find_matching_subject_title_on_current_page(
+            driver,
+            job,
+            delivery_date,
+        )
+        if matched_subject is not None:
+            click_message(driver, matched_subject)
             print(f"[5/7] Opened target message on inbox page {page_number}")
             return
 
@@ -1853,7 +1948,7 @@ def extract_participant_portfolio_results(
 
     source_delivery_date = None
     for sheet in workbook.worksheets:
-        source_delivery_date = find_delivery_date_in_sheet(sheet)
+        source_delivery_date = find_portfolio_reference_date_in_sheet(sheet)
         if source_delivery_date is not None:
             break
 
@@ -2496,6 +2591,12 @@ SAPP_EXTRACTION_JOBS: dict[str, SappExtractionJob] = {
     TRADING_INVOICE_RESULTS_JOB.name: TRADING_INVOICE_RESULTS_JOB,
 }
 
+PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES = [
+    "participant_portfolio_results",
+    "participant_portfolio_results_fpm_w",
+    "participant_portfolio_results_fpm_m",
+]
+
 
 def get_extraction_job(job_name: str) -> SappExtractionJob:
     try:
@@ -2547,7 +2648,12 @@ def run_extraction_job(
         try:
             login(driver, username, password)
             navigate_to_inbox(driver)
-            find_message_and_open(driver, target_subject, page_start=page_start)
+            find_message_and_open(
+                driver,
+                job,
+                delivery_date,
+                page_start=page_start,
+            )
             downloaded_file = download_attachment(
                 driver,
                 download_dir,
@@ -2572,10 +2678,7 @@ def run_extraction_job_for_date_range(
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
     delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
-    pending_by_subject = {
-        job.build_subject(delivery_date): delivery_date
-        for delivery_date in delivery_dates
-    }
+    pending_dates = set(delivery_dates)
     print(
         f"Starting SAPP scraper job '{job.name}' for date range "
         f"{start_date.isoformat()} to {end_date.isoformat()} "
@@ -2584,6 +2687,7 @@ def run_extraction_job_for_date_range(
 
     username, password = load_config()
     results = []
+    stop_reason = None
 
     with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
@@ -2594,28 +2698,27 @@ def run_extraction_job_for_date_range(
             go_to_inbox_page(driver, page_start)
 
             for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
-                if not pending_by_subject:
+                if not pending_dates:
                     break
 
                 wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
                 print(
                     f"[5/7] Scanning inbox page {page_number} for "
-                    f"{len(pending_by_subject)} remaining target messages"
+                    f"{len(pending_dates)} remaining target messages"
                 )
 
-                while pending_by_subject:
-                    found_subjects = find_target_subjects_on_current_page(
+                while pending_dates:
+                    found_subjects = find_matching_subjects_on_current_page(
                         driver,
-                        list(pending_by_subject.keys()),
+                        job,
+                        sorted(pending_dates, reverse=True),
                     )
                     if not found_subjects:
                         break
 
-                    for target_subject in found_subjects:
-                        if target_subject not in pending_by_subject:
+                    for target_subject, delivery_date in found_subjects.items():
+                        if delivery_date not in pending_dates:
                             continue
-
-                        delivery_date = pending_by_subject[target_subject]
                         try:
                             print(
                                 f"[5/7] Found target message for "
@@ -2640,7 +2743,7 @@ def run_extraction_job_for_date_range(
                                     **result,
                                 }
                             )
-                            pending_by_subject.pop(target_subject, None)
+                            pending_dates.discard(delivery_date)
                         except Exception as exc:
                             failure = {
                                 "job": job.name,
@@ -2649,7 +2752,7 @@ def run_extraction_job_for_date_range(
                                 "error": str(exc),
                             }
                             results.append(failure)
-                            pending_by_subject.pop(target_subject, None)
+                            pending_dates.discard(delivery_date)
                             print(
                                 f"SAPP scraper failed for "
                                 f"{delivery_date.isoformat()}: {exc}"
@@ -2657,7 +2760,21 @@ def run_extraction_job_for_date_range(
                             if not continue_on_error:
                                 raise
 
-                if not pending_by_subject:
+                if not pending_dates:
+                    break
+
+                oldest_pending_date = min(pending_dates)
+                visible_job_dates = extract_job_delivery_dates_from_current_page(driver, job)
+                if visible_job_dates and max(visible_job_dates) < oldest_pending_date:
+                    stop_reason = (
+                        "Visible matching inbox subjects are older than the oldest pending "
+                        f"requested date {oldest_pending_date.isoformat()}"
+                    )
+                    print(
+                        f"[5/7] Visible {job.name} subjects are older than the oldest "
+                        f"pending date {oldest_pending_date.isoformat()}. "
+                        "Stopping further page scans."
+                    )
                     break
 
                 next_page_button = find_enabled_next_page_button(driver)
@@ -2666,19 +2783,20 @@ def run_extraction_job_for_date_range(
 
                 print(
                     f"[5/7] Moving to inbox page {page_number + 1}; "
-                    f"{len(pending_by_subject)} target messages still pending"
+                    f"{len(pending_dates)} target messages still pending"
                 )
                 click_next_inbox_page(driver, page_number)
 
-            for target_subject, delivery_date in pending_by_subject.items():
+            for delivery_date in sorted(pending_dates, reverse=True):
                 failure = {
                     "job": job.name,
                     "delivery_date": delivery_date.isoformat(),
                     "status": "failed",
-                    "error": (
+                    "error": stop_reason
+                    or (
                         "Target message not found after searching up to "
                         f"{MAX_INBOX_PAGES_TO_SEARCH} inbox pages from page "
-                        f"{page_start}: {target_subject}"
+                        f"{page_start}: {job.build_subject(delivery_date)}"
                     ),
                 }
                 results.append(failure)
@@ -2701,6 +2819,286 @@ def run_extraction_job_for_date_range(
         "imported": sum(result.get("imported", 0) for result in successful_results),
         "updated": sum(result.get("updated", 0) for result in successful_results),
         "results": results,
+    }
+
+
+def run_portfolio_extraction_bundle(
+    delivery_date: Optional[date] = None,
+    page_start: int = 1,
+) -> dict:
+    delivery_date = delivery_date or datetime.now().date()
+    if page_start < 1:
+        raise ValueError("page_start must be greater than or equal to 1.")
+
+    jobs = [get_extraction_job(job_name) for job_name in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES]
+    print(
+        f"Starting bundled SAPP participant portfolio scrape for {delivery_date.isoformat()} "
+        f"from inbox page {page_start}"
+    )
+
+    username, password = load_config()
+    results = []
+    pending_jobs = list(jobs)
+
+    with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
+        download_dir = Path(temp_download_dir)
+        driver = create_driver(download_dir)
+        try:
+            login(driver, username, password)
+            navigate_to_inbox(driver)
+            go_to_inbox_page(driver, page_start)
+
+            for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
+                if not pending_jobs:
+                    break
+
+                wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
+                print(
+                    f"[5/7] Scanning inbox page {page_number} for "
+                    f"{len(pending_jobs)} remaining participant portfolio subjects"
+                )
+
+                found_subjects = find_matching_job_subjects_on_current_page(
+                    driver,
+                    jobs,
+                    [(job, delivery_date) for job in pending_jobs],
+                )
+
+                for target_subject, (job, matched_date) in found_subjects.items():
+                    if job not in pending_jobs:
+                        continue
+                    try:
+                        print(
+                            f"[5/7] Found {job.name} message for "
+                            f"{matched_date.isoformat()} on inbox page {page_number}"
+                        )
+                        click_message(driver, target_subject)
+                        downloaded_file = download_attachment(
+                            driver,
+                            download_dir,
+                            extension=job.attachment_extension,
+                        )
+                        records = job.extractor(downloaded_file, job)
+                        result = store_records_in_database(records, job)
+                        results.append(result)
+                        pending_jobs.remove(job)
+                    except Exception as exc:
+                        results.append(
+                            {
+                                "job": job.name,
+                                "delivery_date": matched_date.isoformat(),
+                                "imported": 0,
+                                "updated": 0,
+                                "source_file": "",
+                                "error": str(exc),
+                                "status": "failed",
+                            }
+                        )
+                        pending_jobs.remove(job)
+
+                if not pending_jobs:
+                    break
+
+                next_page_button = find_enabled_next_page_button(driver)
+                if next_page_button is None:
+                    break
+                click_next_inbox_page(driver, page_number)
+        finally:
+            driver.quit()
+
+    successful_results = [
+        result for result in results if result.get("error") in (None, "")
+    ]
+    failed_results = [result for result in results if result.get("error")]
+    for job in pending_jobs:
+        failed_results.append(
+            {
+                "job": job.name,
+                "delivery_date": delivery_date.isoformat(),
+                "imported": 0,
+                "updated": 0,
+                "source_file": "",
+                "error": f"Target message not found after searching up to {MAX_INBOX_PAGES_TO_SEARCH} inbox pages from page {page_start}: {job.build_subject(delivery_date)}",
+            }
+        )
+
+    all_results = successful_results + failed_results
+    primary = successful_results[0] if successful_results else {
+        "job": "participant_portfolio_results",
+        "delivery_date": delivery_date.isoformat(),
+        "imported": 0,
+        "updated": 0,
+        "source_file": "",
+    }
+    primary = dict(primary)
+    primary.update(
+        {
+            "job": "participant_portfolio_results",
+            "page_start": page_start,
+            "requested_jobs": PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES,
+            "successful_jobs": len(successful_results),
+            "failed_jobs": len(failed_results),
+            "imported": sum(result.get("imported", 0) for result in successful_results),
+            "updated": sum(result.get("updated", 0) for result in successful_results),
+            "related_results": all_results,
+        }
+    )
+    return primary
+
+
+def run_portfolio_extraction_bundle_for_date_range(
+    start_date: date,
+    end_date: date,
+    continue_on_error: bool = True,
+    page_start: int = 1,
+) -> dict:
+    if page_start < 1:
+        raise ValueError("page_start must be greater than or equal to 1.")
+    delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
+    jobs = [get_extraction_job(job_name) for job_name in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES]
+    pending_items = {(job.name, delivery_date): job for job in jobs for delivery_date in delivery_dates}
+    print(
+        f"Starting bundled SAPP participant portfolio scrape for date range "
+        f"{start_date.isoformat()} to {end_date.isoformat()} from newest to oldest, "
+        f"starting at inbox page {page_start}"
+    )
+
+    username, password = load_config()
+    results = []
+    stop_reason = None
+
+    with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
+        download_dir = Path(temp_download_dir)
+        driver = create_driver(download_dir)
+        try:
+            login(driver, username, password)
+            navigate_to_inbox(driver)
+            go_to_inbox_page(driver, page_start)
+
+            for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
+                if not pending_items:
+                    break
+
+                wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
+                print(
+                    f"[5/7] Scanning inbox page {page_number} for "
+                    f"{len(pending_items)} remaining participant portfolio messages"
+                )
+
+                while pending_items:
+                    ordered_pending = sorted(
+                        ((job, delivery_date) for (job_name, delivery_date), job in pending_items.items()),
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )
+                    found_subjects = find_matching_job_subjects_on_current_page(
+                        driver,
+                        jobs,
+                        ordered_pending,
+                    )
+                    if not found_subjects:
+                        break
+
+                    for target_subject, (job, delivery_date) in found_subjects.items():
+                        key = (job.name, delivery_date)
+                        if key not in pending_items:
+                            continue
+                        try:
+                            print(
+                                f"[5/7] Found {job.name} message for "
+                                f"{delivery_date.isoformat()} on inbox page {page_number}"
+                            )
+                            click_message(driver, target_subject)
+                            downloaded_file = download_attachment(
+                                driver,
+                                download_dir,
+                                extension=job.attachment_extension,
+                            )
+                            records = job.extractor(downloaded_file, job)
+                            result = store_records_in_database(records, job)
+                            results.append(
+                                {
+                                    "delivery_date": delivery_date.isoformat(),
+                                    "status": "success",
+                                    **result,
+                                }
+                            )
+                            pending_items.pop(key, None)
+                        except Exception as exc:
+                            results.append(
+                                {
+                                    "job": job.name,
+                                    "delivery_date": delivery_date.isoformat(),
+                                    "status": "failed",
+                                    "error": str(exc),
+                                }
+                            )
+                            pending_items.pop(key, None)
+                            if not continue_on_error:
+                                raise
+
+                if not pending_items:
+                    break
+
+                oldest_pending_date = min(delivery_date for _, delivery_date in pending_items.keys())
+                visible_job_dates = sorted(
+                    {
+                        visible_date
+                        for job in jobs
+                        for visible_date in extract_job_delivery_dates_from_current_page(driver, job)
+                    }
+                )
+                if visible_job_dates and max(visible_job_dates) < oldest_pending_date:
+                    stop_reason = (
+                        "Visible participant portfolio subjects are older than the oldest pending "
+                        f"requested date {oldest_pending_date.isoformat()}"
+                    )
+                    print(f"[5/7] {stop_reason}. Stopping further page scans.")
+                    break
+
+                next_page_button = find_enabled_next_page_button(driver)
+                if next_page_button is None:
+                    break
+                click_next_inbox_page(driver, page_number)
+
+            for (job_name, delivery_date), job in sorted(
+                pending_items.items(),
+                key=lambda item: item[0][1],
+                reverse=True,
+            ):
+                failure = {
+                    "job": job_name,
+                    "delivery_date": delivery_date.isoformat(),
+                    "status": "failed",
+                    "error": stop_reason
+                    or (
+                        "Target message not found after searching up to "
+                        f"{MAX_INBOX_PAGES_TO_SEARCH} inbox pages from page {page_start}: "
+                        f"{job.build_subject(delivery_date)}"
+                    ),
+                }
+                results.append(failure)
+                if not continue_on_error:
+                    raise RuntimeError(failure["error"])
+        finally:
+            driver.quit()
+
+    successful_results = [result for result in results if result["status"] == "success"]
+    failed_results = [result for result in results if result["status"] == "failed"]
+    return {
+        "job": "participant_portfolio_results",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "page_start": page_start,
+        "requested_dates": len(delivery_dates) * len(jobs),
+        "successful_dates": len(successful_results),
+        "failed_dates": len(failed_results),
+        "imported": sum(result.get("imported", 0) for result in successful_results),
+        "updated": sum(result.get("updated", 0) for result in successful_results),
+        "results": results,
+        "requested_jobs": PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES,
+        "successful_jobs": len([job for job in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES if any(r.get("job") == job and r.get("status") == "success" for r in results)]),
+        "failed_jobs": len([job for job in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES if not any(r.get("job") == job and r.get("status") == "success" for r in results)]),
     }
 
 

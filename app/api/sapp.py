@@ -55,6 +55,8 @@ from sapp_scraper import (
     run_area_results_test,
     run_extraction_job,
     run_extraction_job_for_date_range,
+    run_portfolio_extraction_bundle,
+    run_portfolio_extraction_bundle_for_date_range,
 )
 
 router = APIRouter(prefix="/sapp", tags=["sapp"])
@@ -1410,6 +1412,11 @@ def scrape_sapp_results(
 ):
     """Download, parse, and upsert one SAPP document. Run locally."""
     try:
+        if job_name == "participant_portfolio_results":
+            return run_portfolio_extraction_bundle(
+                delivery_date=delivery_date,
+                page_start=page_start,
+            )
         requested_job_names = _scrape_job_names_for_request(job_name)
         results = [
             run_extraction_job(
@@ -1471,6 +1478,13 @@ def scrape_sapp_results_for_date_range(
 ):
     """Download, parse, and upsert SAPP documents for a date range. Run locally."""
     try:
+        if job_name == "participant_portfolio_results":
+            return run_portfolio_extraction_bundle_for_date_range(
+                start_date=start_date,
+                end_date=end_date,
+                continue_on_error=continue_on_error,
+                page_start=page_start,
+            )
         requested_job_names = _scrape_job_names_for_request(job_name)
         range_results = [
             run_extraction_job_for_date_range(
@@ -1875,33 +1889,14 @@ def scrape_participant_portfolio_results(
 ):
     """Download, parse, and upsert SAPP DAM, FPM-W, and FPM-M portfolio documents."""
     try:
-        requested_job_names = _scrape_job_names_for_request("participant_portfolio_results")
-        results = [
-            run_extraction_job(
-                get_extraction_job(requested_job_name),
-                delivery_date=delivery_date,
-                page_start=page_start,
-            )
-            for requested_job_name in requested_job_names
-        ]
+        return run_portfolio_extraction_bundle(
+            delivery_date=delivery_date,
+            page_start=page_start,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-    primary_result = dict(results[0])
-    primary_result.update(
-        {
-            "job": "participant_portfolio_results",
-            "requested_jobs": requested_job_names,
-            "successful_jobs": len(results),
-            "failed_jobs": 0,
-            "imported": sum(result.get("imported", 0) for result in results),
-            "updated": sum(result.get("updated", 0) for result in results),
-            "related_results": results,
-        }
-    )
-    return primary_result
 
 
 @router.post(
@@ -1924,49 +1919,16 @@ def scrape_participant_portfolio_results_for_date_range(
 ):
     """Download, parse, and upsert SAPP DAM, FPM-W, and FPM-M portfolio documents."""
     try:
-        requested_job_names = _scrape_job_names_for_request("participant_portfolio_results")
-        range_results = [
-            run_extraction_job_for_date_range(
-                get_extraction_job(requested_job_name),
-                start_date=start_date,
-                end_date=end_date,
-                continue_on_error=continue_on_error,
-                page_start=page_start,
-            )
-            for requested_job_name in requested_job_names
-        ]
+        return run_portfolio_extraction_bundle_for_date_range(
+            start_date=start_date,
+            end_date=end_date,
+            continue_on_error=continue_on_error,
+            page_start=page_start,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-    merged_results = [
-        result
-        for range_result in range_results
-        for result in range_result.get("results", [])
-    ]
-    successful_results = [
-        result for result in merged_results if result.get("status") == "success"
-    ]
-    failed_results = [
-        result for result in merged_results if result.get("status") == "failed"
-    ]
-    return {
-        "job": "participant_portfolio_results",
-        "requested_jobs": requested_job_names,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "page_start": page_start,
-        "requested_dates": sum(
-            result.get("requested_dates", 0) for result in range_results
-        ),
-        "successful_dates": len(successful_results),
-        "failed_dates": len(failed_results),
-        "imported": sum(result.get("imported", 0) for result in range_results),
-        "updated": sum(result.get("updated", 0) for result in range_results),
-        "results": merged_results,
-        "related_results": range_results,
-    }
 
 
 @router.get(

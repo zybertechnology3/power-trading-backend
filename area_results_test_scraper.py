@@ -639,6 +639,47 @@ def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
     return chunks
 
 
+def expected_chunk_dates(chunk_start: date, chunk_end: date) -> list[str]:
+    dates = []
+    current_date = chunk_start
+    while current_date <= chunk_end:
+        dates.append(current_date.isoformat())
+        current_date += timedelta(days=1)
+    return dates
+
+
+def validate_returned_dates_for_chunk(
+    dataset: str,
+    returned_dates: list[str],
+    chunk_start: date,
+    chunk_end: date,
+) -> None:
+    expected_dates = expected_chunk_dates(chunk_start, chunk_end)
+    if not returned_dates:
+        raise RuntimeError(
+            f"{dataset} search for chunk {chunk_start.isoformat()} to "
+            f"{chunk_end.isoformat()} returned no dates."
+        )
+
+    returned_date_set = set(returned_dates)
+    expected_date_set = set(expected_dates)
+    unexpected_dates = sorted(returned_date_set - expected_date_set)
+    missing_dates = sorted(expected_date_set - returned_date_set)
+
+    if unexpected_dates or missing_dates:
+        raise RuntimeError(
+            f"{dataset} search returned dates outside the requested chunk or missed "
+            f"expected dates. Chunk={chunk_start.isoformat()} to {chunk_end.isoformat()}, "
+            f"returned={returned_dates}, missing={missing_dates or 'none'}, "
+            f"unexpected={unexpected_dates or 'none'}."
+        )
+
+    print(
+        f"[6/7] {dataset} returned dates match requested chunk "
+        f"{chunk_start.isoformat()} to {chunk_end.isoformat()}"
+    )
+
+
 def normalize_requested_range(start_date: date, end_date: date) -> tuple[date, date]:
     today = datetime.now().date()
     normalized_end_date = end_date
@@ -894,6 +935,8 @@ def store_results(
 def scrape_area_results_for_search_date(
     driver,
     search_date: date,
+    chunk_start: date,
+    chunk_end: date,
     timeout: int,
     reopen_schedule: bool,
 ) -> dict:
@@ -909,6 +952,12 @@ def scrape_area_results_for_search_date(
     set_constrained_toggle(driver, True, timeout=timeout)
     click_search(driver, timeout=timeout)
     constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
+    validate_returned_dates_for_chunk(
+        "constrained",
+        constrained_table["returned_dates"],
+        chunk_start,
+        chunk_end,
+    )
     constrained_records = enrich_hourly_records(
         "constrained",
         constrained_table["hourly_records"],
@@ -920,6 +969,12 @@ def scrape_area_results_for_search_date(
     set_constrained_toggle(driver, False, timeout=timeout)
     click_search(driver, timeout=timeout)
     unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
+    validate_returned_dates_for_chunk(
+        "unconstrained",
+        unconstrained_table["returned_dates"],
+        chunk_start,
+        chunk_end,
+    )
     unconstrained_records = enrich_hourly_records(
         "unconstrained",
         unconstrained_table["hourly_records"],
@@ -984,6 +1039,8 @@ def run(
             chunk_result = scrape_area_results_for_search_date(
                 driver=driver,
                 search_date=chunk["search_date"],
+                chunk_start=chunk["chunk_start"],
+                chunk_end=chunk["chunk_end"],
                 timeout=timeout,
                 reopen_schedule=index > 1,
             )
