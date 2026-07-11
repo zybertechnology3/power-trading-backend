@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -24,13 +25,13 @@ from webdriver_manager.firefox import GeckoDriverManager
 
 BASE_URL = "https://trading.sappmtp.com"
 LOGIN_URL = f"{BASE_URL}/account/login?returnUrl=%2F"
-AREA_RESULTS_URL = f"{BASE_URL}/amt/prices-and-turnover-X-dam"
+AREA_RESULTS_URL = f"{BASE_URL}/amt/prices-and-turnover-X-fpm"
 
-CONSTRAINED_COLLECTION = "sapp_constrained_area_results"
-UNCONSTRAINED_COLLECTION = "sapp_unconstrained_area_results"
+CONSTRAINED_COLLECTION = "sapp_fpm_w_constrained_area_results"
+UNCONSTRAINED_COLLECTION = "sapp_fpm_w_unconstrained_area_results"
 
-CONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_CONSTRAINED_PRICE_RESULTS"
-UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_UNCONSTRAINED_PRICE_RESULTS"
+CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RESULTS"
+UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
 MONGO_SERVER_SELECTION_TIMEOUT_MS = 30000
 MONGO_CONNECT_TIMEOUT_MS = 30000
 MONGO_SOCKET_TIMEOUT_MS = 30000
@@ -168,6 +169,221 @@ def read_input_value(driver, input_element) -> str:
     )
 
 
+def select_all_input_text(driver, input_element) -> None:
+    driver.execute_script(
+        """
+        const input = arguments[0];
+        input.focus();
+        if (typeof input.select === "function") {
+            input.select();
+        }
+        if (typeof input.setSelectionRange === "function") {
+            input.setSelectionRange(0, input.value.length);
+        }
+        """,
+        input_element,
+    )
+
+
+def find_calendar_toggle(driver, label: str):
+    return driver.execute_script(
+        r"""
+        const labelText = arguments[0].toLowerCase();
+        const normalize = (value) => (value || "")
+            .replace(/\*/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+        };
+        const labels = Array.from(document.querySelectorAll("label, .form-label, div, span"))
+            .filter((element) => normalize(element.textContent) === labelText);
+
+        for (const label of labels) {
+            let node = label;
+            for (let depth = 0; node && depth < 6; depth += 1) {
+                const toggles = Array.from(node.querySelectorAll("button")).filter(isVisible);
+                const toggle = toggles.find((button) => {
+                    const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                    const aria = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+                    return title === "toggle calendar" || aria === "toggle calendar";
+                });
+                if (toggle) return toggle;
+                node = node.parentElement;
+            }
+        }
+        return null;
+        """,
+        label,
+    )
+
+
+def find_visible_calendar_popup(driver):
+    return driver.execute_script(
+        r"""
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+        };
+        const popups = Array.from(document.querySelectorAll(
+            ".k-calendar, .k-calendar-container, .k-popup, .k-animation-container"
+        ));
+        return popups.find((popup) => isVisible(popup) && /\b\d{4}\b/.test(popup.textContent || "")) || null;
+        """
+    )
+
+
+def parse_month_year_from_text(text: str) -> Optional[tuple[int, int]]:
+    months = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+    match = re.search(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})",
+        text.lower(),
+    )
+    if not match:
+        return None
+    return months[match.group(1)], int(match.group(2))
+
+
+def find_calendar_nav_button(driver, calendar, direction: str):
+    return driver.execute_script(
+        r"""
+        const calendar = arguments[0];
+        const direction = arguments[1];
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+        };
+        const buttons = Array.from(calendar.querySelectorAll("button")).filter(isVisible);
+        const predicate = direction === "next"
+            ? (button) => {
+                const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                const aria = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+                const cls = (button.getAttribute("class") || "").toLowerCase();
+                return title.includes("next") || aria.includes("next") || cls.includes("next");
+            }
+            : (button) => {
+                const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                const aria = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+                const cls = (button.getAttribute("class") || "").toLowerCase();
+                return title.includes("previous") || title.includes("prev")
+                    || aria.includes("previous") || aria.includes("prev")
+                    || cls.includes("prev");
+            };
+        return buttons.find(predicate) || null;
+        """,
+        calendar,
+        direction,
+    )
+
+
+def click_calendar_day(driver, calendar, target_date: date):
+    return driver.execute_script(
+        r"""
+        const calendar = arguments[0];
+        const dayText = String(arguments[1]);
+        const targetMonth = Number(arguments[2]);
+        const targetYear = Number(arguments[3]);
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+        };
+        const sameMonth = (button) => {
+            const cls = (button.getAttribute("class") || "").toLowerCase();
+            const aria = (button.getAttribute("aria-label") || "").toLowerCase();
+            const title = (button.getAttribute("title") || "").toLowerCase();
+            if (cls.includes("other-month") || cls.includes("adjacent")) return false;
+            if (aria.includes("other month") || title.includes("other month")) return false;
+            if (aria.includes(String(targetYear)) || title.includes(String(targetYear))) return true;
+            return true;
+        };
+        const buttons = Array.from(calendar.querySelectorAll("button")).filter(isVisible);
+        const candidates = buttons.filter((button) => {
+            const text = (button.textContent || "").replace(/\s+/g, " ").trim();
+            return text === dayText && sameMonth(button);
+        });
+        return candidates[0] || null;
+        """,
+        calendar,
+        target_date.day,
+        target_date.month,
+        target_date.year,
+    )
+
+
+def set_date_via_calendar(driver, label: str, value: str, timeout: int = 20) -> None:
+    print(f"[2/7] Falling back to calendar for {label}: {value}")
+    target_date = date.fromisoformat(value.replace("/", "-"))
+    wait_for_page_settle(driver, timeout=timeout)
+
+    toggle = WebDriverWait(driver, timeout).until(
+        lambda d: find_calendar_toggle(d, label)
+    )
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
+    time.sleep(0.3)
+    driver.execute_script("arguments[0].click();", toggle)
+
+    calendar = WebDriverWait(driver, timeout).until(
+        lambda d: find_visible_calendar_popup(d)
+    )
+
+    for _ in range(24):
+        popup_text = driver.execute_script(
+            """
+            const popup = arguments[0];
+            return (popup.innerText || popup.textContent || "").replace(/\\s+/g, " ").trim();
+            """,
+            calendar,
+        )
+        current_month_year = parse_month_year_from_text(popup_text)
+        if current_month_year == (target_date.month, target_date.year):
+            break
+
+        nav_direction = None
+        if current_month_year is not None:
+            current_month, current_year = current_month_year
+            current_serial = current_year * 12 + current_month
+            target_serial = target_date.year * 12 + target_date.month
+            nav_direction = "next" if target_serial > current_serial else "prev"
+
+        if nav_direction is None:
+            break
+
+        nav_button = find_calendar_nav_button(driver, calendar, nav_direction)
+        if nav_button is None:
+            break
+
+        driver.execute_script("arguments[0].click();", nav_button)
+        time.sleep(0.4)
+        calendar = WebDriverWait(driver, timeout).until(
+            lambda d: find_visible_calendar_popup(d)
+        )
+
+    day_button = WebDriverWait(driver, timeout).until(
+        lambda d: click_calendar_day(d, calendar, target_date)
+    )
+    driver.execute_script("arguments[0].click();", day_button)
+    time.sleep(1.0)
+
+
 def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> None:
     print(f"[2/7] Setting {label}: {value}")
     wait_for_page_settle(driver, timeout=timeout)
@@ -179,7 +395,7 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
         print(f"[2/7] {label} attempt {attempt}: writing '{value}'")
         input_element.click()
         time.sleep(0.5)
-        input_element.send_keys(Keys.CONTROL, "a")
+        select_all_input_text(driver, input_element)
         selected_value = read_input_value(driver, input_element)
         print(f"[2/7] {label} attempt {attempt}: selected existing value '{selected_value}'")
 
@@ -194,6 +410,18 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
         print(f"[2/7] {label} attempt {attempt}: field now shows '{actual_value}'")
         if actual_value == value:
             return
+
+        if label == "Delivery Day":
+            try:
+                set_date_via_calendar(driver, label, value, timeout=timeout)
+                actual_value = read_input_value(driver, input_element)
+                print(
+                    f"[2/7] {label} attempt {attempt}: calendar fallback shows '{actual_value}'"
+                )
+                if actual_value == value:
+                    return
+            except Exception as exc:
+                print(f"[2/7] {label} calendar fallback failed: {exc}")
 
         wait_for_page_settle(driver, timeout=timeout, extra_delay=0.5)
         input_element = WebDriverWait(driver, timeout).until(
@@ -1054,8 +1282,9 @@ def scrape_area_results_for_search_date(
     if reopen_schedule:
         click_select_schedule(driver, timeout=timeout)
 
-    set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
-    select_category(driver, "Price in USD", timeout=timeout)
+    set_input_by_label(driver, "Market", "FPM-W", timeout=timeout)
+    set_input_by_label(driver, "Category", "Price in USD", timeout=timeout)
+    #set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
 
     # Fill the schedule once, search constrained first, then reopen and only
     # flip the switch for the unconstrained run.

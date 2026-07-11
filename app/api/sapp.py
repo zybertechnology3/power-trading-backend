@@ -24,6 +24,7 @@ from app.schemas.sapp import (
     BidStatus,
     SappDamAreaResultRecord,
     SappDamAreaResultsRangeResponse,
+    SappFpmWAreaResultsRangeResponse,
     SappBidMarket,
     SappBidCreate,
     SappBidComparisonResponse,
@@ -83,6 +84,8 @@ TRADING_INVOICE_MARKET_ALIASES = {
 }
 STANDALONE_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_CONSTRAINED_PRICE_RESULTS"
 STANDALONE_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_UNCONSTRAINED_PRICE_RESULTS"
+STANDALONE_FPM_W_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RESULTS"
+STANDALONE_FPM_W_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
 
 FREQUENCY_BUCKETS = {
     "4h": {"unit": "hour", "binSize": 4},
@@ -1900,6 +1903,47 @@ def get_dam_area_results_for_range(
 
     return SappDamAreaResultsRangeResponse(
         market="dam",
+        start_date=start_date,
+        end_date=end_date,
+        records=_merge_dam_area_results(constrained_records, unconstrained_records),
+    )
+
+
+@router.get("/fpm-w-area-results", response_model=SappFpmWAreaResultsRangeResponse)
+def get_fpm_w_area_results_for_range(
+    start_date: date = Query(..., description="First delivery date in the requested range."),
+    end_date: date = Query(..., description="Last delivery date in the requested range, inclusive."),
+):
+    """Return a minimal merged FPM-W area price series for charting."""
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+        )
+
+    db = get_db()
+    constrained_collection = db["sapp_fpm_w_constrained_area_results"]
+    unconstrained_collection = db["sapp_fpm_w_unconstrained_area_results"]
+
+    base_filter = _build_sapp_time_filter(None, start_date, end_date, None, None)
+    constrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_FPM_W_CONSTRAINED_DATA_SOURCE,
+    }
+    unconstrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_FPM_W_UNCONSTRAINED_DATA_SOURCE,
+    }
+
+    constrained_records = list(
+        constrained_collection.find(constrained_filter).sort([("delivery_date", 1), ("hour", 1)])
+    )
+    unconstrained_records = list(
+        unconstrained_collection.find(unconstrained_filter).sort([("delivery_date", 1), ("hour", 1)])
+    )
+
+    return SappFpmWAreaResultsRangeResponse(
+        market="fpm_w",
         start_date=start_date,
         end_date=end_date,
         records=_merge_dam_area_results(constrained_records, unconstrained_records),

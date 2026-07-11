@@ -226,6 +226,42 @@ def _initialize_collections():
         )
         print("Created 'sapp_unconstrained_area_results' collection")
 
+    if "sapp_fpm_w_constrained_area_results" not in db.list_collection_names():
+        db.create_collection("sapp_fpm_w_constrained_area_results")
+        fpm_w_constrained_collection = db["sapp_fpm_w_constrained_area_results"]
+        fpm_w_constrained_collection.create_index(
+            [("timestamp", DESCENDING)],
+            name="idx_sapp_fpm_w_timestamp",
+        )
+        fpm_w_constrained_collection.create_index(
+            [("delivery_date", ASCENDING), ("hour", ASCENDING)],
+            unique=True,
+            name="idx_sapp_fpm_w_delivery_date_hour_unique",
+        )
+        fpm_w_constrained_collection.create_index(
+            [("metadata.data_source", ASCENDING)],
+            name="idx_sapp_fpm_w_data_source",
+        )
+        print("Created 'sapp_fpm_w_constrained_area_results' collection")
+
+    if "sapp_fpm_w_unconstrained_area_results" not in db.list_collection_names():
+        db.create_collection("sapp_fpm_w_unconstrained_area_results")
+        fpm_w_unconstrained_collection = db["sapp_fpm_w_unconstrained_area_results"]
+        fpm_w_unconstrained_collection.create_index(
+            [("timestamp", DESCENDING)],
+            name="idx_sapp_fpm_w_unconstrained_timestamp",
+        )
+        fpm_w_unconstrained_collection.create_index(
+            [("delivery_date", ASCENDING), ("hour", ASCENDING)],
+            unique=True,
+            name="idx_sapp_fpm_w_unconstrained_delivery_date_hour_unique",
+        )
+        fpm_w_unconstrained_collection.create_index(
+            [("metadata.data_source", ASCENDING)],
+            name="idx_sapp_fpm_w_unconstrained_data_source",
+        )
+        print("Created 'sapp_fpm_w_unconstrained_area_results' collection")
+
     if "sapp_participant_portfolio_results" not in db.list_collection_names():
         db.create_collection("sapp_participant_portfolio_results")
         print("Created 'sapp_participant_portfolio_results' collection")

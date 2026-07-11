@@ -523,6 +523,25 @@ class SappDamAreaResultsRangeResponse(BaseModel):
     records: list[SappDamAreaResultRecord] = Field(default_factory=list)
 
 
+class SappFpmWAreaResultRecord(BaseModel):
+    """Minimal merged FPM-W area price record for charting."""
+
+    delivery_date: date
+    hour: int = Field(..., ge=1, le=24)
+    timestamp: datetime
+    constrained_price_usd_per_mwh: Optional[float] = None
+    unconstrained_price_usd_per_mwh: Optional[float] = None
+
+
+class SappFpmWAreaResultsRangeResponse(BaseModel):
+    """Minimal merged FPM-W area price payload for charting."""
+
+    market: Literal["fpm_w"] = "fpm_w"
+    start_date: date
+    end_date: date
+    records: list[SappFpmWAreaResultRecord] = Field(default_factory=list)
+
+
 class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 
