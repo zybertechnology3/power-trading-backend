@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from app.core.time_of_use import get_time_of_use_period
 from dotenv import load_dotenv
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import ServerSelectionTimeoutError
@@ -131,6 +132,10 @@ def format_delivery_day(value: date) -> str:
     return value.strftime("%Y/%m/%d")
 
 
+def normalize_week_start(value: date) -> date:
+    return value - timedelta(days=value.weekday())
+
+
 def find_field_input(driver, label: str):
     return driver.execute_script(
         r"""
@@ -183,6 +188,26 @@ def select_all_input_text(driver, input_element) -> None:
         """,
         input_element,
     )
+
+
+def normalize_text(value) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def normalize_product(value) -> Optional[str]:
+    normalized = normalize_text(value)
+    aliases = {
+        "off-peak": "off_peak",
+        "off peak": "off_peak",
+        "off_peak": "off_peak",
+        "peak": "peak",
+        "standard": "standard",
+    }
+    return aliases.get(normalized)
+
+
+def hour_label_from_hour(hour: int) -> str:
+    return f"{hour - 1:02d}-{hour:02d}" if hour < 24 else "23-24"
 
 
 def find_calendar_toggle(driver, label: str):
@@ -411,7 +436,7 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
         if actual_value == value:
             return
 
-        if label == "Delivery Day":
+        if label == "Delivery Week":
             try:
                 set_date_via_calendar(driver, label, value, timeout=timeout)
                 actual_value = read_input_value(driver, input_element)
@@ -718,12 +743,12 @@ def click_select_schedule(driver, timeout: int = 20) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
     time.sleep(0.5)
     driver.execute_script("arguments[0].click();", button)
-    WebDriverWait(driver, timeout).until(lambda d: find_field_input(d, "Delivery Day"))
+    WebDriverWait(driver, timeout).until(lambda d: find_field_input(d, "Delivery Week"))
     wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
 
 
 def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
-    print(f"[6/7] Extracting {dataset} hourly table")
+    print(f"[6/7] Extracting {dataset} weekly table")
     wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
 
     def table_exists(driver):
@@ -752,12 +777,7 @@ def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
             return Number.isFinite(parsed) ? parsed : null;
         };
         const normalizeDate = (value) => normalize(value).replace(/\//g, "-");
-        const hourFromProduct = (product) => {
-            const match = normalize(product).match(/^(\d{2})-(\d{2})$/);
-            if (!match) return null;
-            return Number(match[1]) + 1;
-        };
-        const summaryNames = new Set(["min", "max", "avg", "nett"]);
+        const summaryNames = new Set(["min", "max", "avg", "nett", "net"]);
 
         const headers = Array.from(table.querySelectorAll("thead th"))
             .map((cell) => normalize(cell.textContent));
@@ -775,15 +795,14 @@ def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
             }))
             .filter((row) => row.product && !summaryNames.has(row.product.toLowerCase()));
 
-        const hourlyRecords = [];
+        const weeklyRecords = [];
         rows.forEach((row) => {
             dateHeaders.forEach((header, index) => {
-                hourlyRecords.push({
+                weeklyRecords.push({
                     dataset,
-                    delivery_date: header.date,
+                    delivery_week: header.date,
                     product: row.product,
-                    hour: hourFromProduct(row.product),
-                    hour_label: row.product,
+                    product_label: row.product,
                     value: parseNumber(row.values[index])
                 });
             });
@@ -797,15 +816,15 @@ def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
             dataset,
             columns: dateHeaders,
             returned_dates: returnedDates,
-            hourly_records: hourlyRecords,
-            record_count: hourlyRecords.length
+            weekly_records: weeklyRecords,
+            record_count: weeklyRecords.length
         };
         """,
         dataset,
     )
     print(
-        f"[6/7] {dataset} table has {len(result['columns'])} date columns and "
-        f"{result['record_count']} hourly cells"
+        f"[6/7] {dataset} table has {len(result['columns'])} week columns and "
+        f"{result['record_count']} weekly cells"
     )
     if result["columns"]:
         print(
@@ -828,25 +847,54 @@ def enrich_hourly_records(
 ) -> list[dict]:
     window_start_date = date.fromisoformat(returned_dates[0]) if returned_dates else None
     window_end_date = date.fromisoformat(returned_dates[-1]) if returned_dates else None
-    enriched_records = []
+    weekly_prices: dict[str, dict[str, dict[str, object]]] = {}
 
     for record in records:
-        delivery_day = date.fromisoformat(record["delivery_date"])
-        enriched_record = {
-            **record,
-            "search_delivery_date": search_delivery_date.isoformat(),
-            "window_start_date": window_start_date.isoformat()
-            if window_start_date
-            else None,
-            "window_end_date": window_end_date.isoformat() if window_end_date else None,
-            "window_offset_days": (delivery_day - search_delivery_date).days,
-            "category": "Price in USD",
-            "dataset": dataset,
+        delivery_week = date.fromisoformat(record["delivery_week"])
+        product = normalize_product(record["product"])
+        if product is None or record["value"] is None:
+            continue
+        weekly_prices.setdefault(delivery_week.isoformat(), {})[product] = {
+            "value": record["value"],
+            "product_label": record["product_label"],
         }
-        enriched_records.append(enriched_record)
+
+    enriched_records = []
+    for week_date_text in returned_dates:
+        week_start = date.fromisoformat(week_date_text)
+        week_prices = weekly_prices.get(week_date_text, {})
+        if not week_prices:
+            continue
+
+        for offset in range(7):
+            delivery_day = week_start + timedelta(days=offset)
+            for hour in range(1, 25):
+                product = get_time_of_use_period(delivery_day, hour)
+                price_row = week_prices.get(product)
+                if price_row is None:
+                    continue
+
+                enriched_records.append(
+                    {
+                        "timestamp": delivery_timestamp(delivery_day.isoformat(), hour),
+                        "delivery_date": delivery_day.isoformat(),
+                        "hour": hour,
+                        "hour_label": hour_label_from_hour(hour),
+                        "product": product,
+                        "value": price_row["value"],
+                        "search_delivery_date": search_delivery_date.isoformat(),
+                        "window_start_date": window_start_date.isoformat()
+                        if window_start_date
+                        else None,
+                        "window_end_date": window_end_date.isoformat() if window_end_date else None,
+                        "window_offset_days": (delivery_day - search_delivery_date).days,
+                        "category": "Price in USD",
+                        "dataset": dataset,
+                    }
+                )
 
     print(
-        f"[6/7] Enriched {len(enriched_records)} {dataset} records with "
+        f"[6/7] Expanded {len(enriched_records)} {dataset} hourly records with "
         f"search window {window_start_date} to {window_end_date}"
     )
     return enriched_records
@@ -874,10 +922,11 @@ def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
 
 def expected_chunk_dates(chunk_start: date, chunk_end: date) -> list[str]:
     dates = []
-    current_date = chunk_start
-    while current_date <= chunk_end:
+    current_date = normalize_week_start(chunk_start)
+    end_week = normalize_week_start(chunk_end)
+    while current_date <= end_week:
         dates.append(current_date.isoformat())
-        current_date += timedelta(days=1)
+        current_date += timedelta(days=7)
     return dates
 
 
@@ -1284,7 +1333,7 @@ def scrape_area_results_for_search_date(
 
     set_input_by_label(driver, "Market", "FPM-W", timeout=timeout)
     set_input_by_label(driver, "Category", "Price in USD", timeout=timeout)
-    #set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
+    set_input_by_label(driver, "Delivery Week", formatted_date, timeout=timeout)
 
     # Fill the schedule once, search constrained first, then reopen and only
     # flip the switch for the unconstrained run.
@@ -1299,7 +1348,7 @@ def scrape_area_results_for_search_date(
     )
     constrained_records = enrich_hourly_records(
         "constrained",
-        constrained_table["hourly_records"],
+        constrained_table["weekly_records"],
         search_date,
         constrained_table["returned_dates"],
     )
@@ -1316,7 +1365,7 @@ def scrape_area_results_for_search_date(
     )
     unconstrained_records = enrich_hourly_records(
         "unconstrained",
-        unconstrained_table["hourly_records"],
+        unconstrained_table["weekly_records"],
         search_date,
         unconstrained_table["returned_dates"],
     )

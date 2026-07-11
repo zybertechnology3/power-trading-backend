@@ -24,6 +24,7 @@ from app.schemas.sapp import (
     BidStatus,
     SappDamAreaResultRecord,
     SappDamAreaResultsRangeResponse,
+    SappFpmWAreaResultRecord,
     SappFpmWAreaResultsRangeResponse,
     SappBidMarket,
     SappBidCreate,
@@ -1946,7 +1947,10 @@ def get_fpm_w_area_results_for_range(
         market="fpm_w",
         start_date=start_date,
         end_date=end_date,
-        records=_merge_dam_area_results(constrained_records, unconstrained_records),
+        records=[
+            SappFpmWAreaResultRecord(**record.model_dump())
+            for record in _merge_dam_area_results(constrained_records, unconstrained_records)
+        ],
     )
 
 
