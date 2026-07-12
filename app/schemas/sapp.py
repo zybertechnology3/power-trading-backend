@@ -15,7 +15,7 @@ MONDAY = 0
 
 
 class SappPublicHolidayResponse(BaseModel):
-    """Public holiday returned by the Botswana/SAPP market calendar endpoint."""
+    """Public holiday returned by the Zimbabwe/SAPP market calendar endpoint."""
 
     date: date
     local_name: str
@@ -540,6 +540,25 @@ class SappFpmWAreaResultsRangeResponse(BaseModel):
     start_date: date
     end_date: date
     records: list[SappFpmWAreaResultRecord] = Field(default_factory=list)
+
+
+class SappFpmMAreaResultRecord(BaseModel):
+    """Minimal merged FPM-M area price record for charting."""
+
+    delivery_date: date
+    hour: int = Field(..., ge=1, le=24)
+    timestamp: datetime
+    constrained_price_usd_per_mwh: Optional[float] = None
+    unconstrained_price_usd_per_mwh: Optional[float] = None
+
+
+class SappFpmMAreaResultsRangeResponse(BaseModel):
+    """Minimal merged FPM-M area price payload for charting."""
+
+    market: Literal["fpm_m"] = "fpm_m"
+    start_date: date
+    end_date: date
+    records: list[SappFpmMAreaResultRecord] = Field(default_factory=list)
 
 
 class SappParticipantPortfolioResultCreate(BaseModel):

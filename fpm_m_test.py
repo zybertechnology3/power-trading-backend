@@ -1,4 +1,5 @@
 import argparse
+import calendar
 import os
 import re
 import tempfile
@@ -31,11 +32,11 @@ BASE_URL = "https://trading.sappmtp.com"
 LOGIN_URL = f"{BASE_URL}/account/login?returnUrl=%2F"
 AREA_RESULTS_URL = f"{BASE_URL}/amt/prices-and-turnover-X-fpm"
 
-CONSTRAINED_COLLECTION = "sapp_fpm_w_constrained_area_results"
-UNCONSTRAINED_COLLECTION = "sapp_fpm_w_unconstrained_area_results"
+CONSTRAINED_COLLECTION = "sapp_fpm_m_constrained_area_results"
+UNCONSTRAINED_COLLECTION = "sapp_fpm_m_unconstrained_area_results"
 
-CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RESULTS"
-UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
+CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_CONSTRAINED_PRICE_RESULTS"
+UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_UNCONSTRAINED_PRICE_RESULTS"
 ZIMBABWE_COUNTRY_CODE = "ZW"
 MONGO_SERVER_SELECTION_TIMEOUT_MS = 30000
 MONGO_CONNECT_TIMEOUT_MS = 30000
@@ -127,8 +128,13 @@ def format_delivery_day(value: date) -> str:
     return value.strftime("%Y/%m/%d")
 
 
-def normalize_week_start(value: date) -> date:
-    return value - timedelta(days=value.weekday())
+def normalize_month_start(value: date) -> date:
+    return date(value.year, value.month, 1)
+
+
+def month_end(value: date) -> date:
+    days_in_month = calendar.monthrange(value.year, value.month)[1]
+    return date(value.year, value.month, days_in_month)
 
 
 def find_field_input(driver, label: str):
@@ -493,7 +499,7 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
             print(f"  ✓ {label} set")
             return
 
-        if label == "Delivery Week":
+        if label == "Delivery Month":
             try:
                 set_date_via_calendar(driver, label, value, timeout=timeout)
                 actual_value = read_input_value(driver, input_element)
@@ -793,7 +799,7 @@ def click_select_schedule(driver, timeout: int = 20) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
     time.sleep(0.5)
     driver.execute_script("arguments[0].click();", button)
-    WebDriverWait(driver, timeout).until(lambda d: find_field_input(d, "Delivery Week"))
+    WebDriverWait(driver, timeout).until(lambda d: find_field_input(d, "Delivery Month"))
     wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
 
 
@@ -845,12 +851,12 @@ def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
             }))
             .filter((row) => row.product && !summaryNames.has(row.product.toLowerCase()));
 
-        const weeklyRecords = [];
+        const monthlyRecords = [];
         rows.forEach((row) => {
             dateHeaders.forEach((header, index) => {
-                weeklyRecords.push({
+                monthlyRecords.push({
                     dataset,
-                    delivery_week: header.date,
+                    delivery_month: header.date,
                     product: row.product,
                     product_label: row.product,
                     value: parseNumber(row.values[index])
@@ -866,14 +872,14 @@ def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
             dataset,
             columns: dateHeaders,
             returned_dates: returnedDates,
-            weekly_records: weeklyRecords,
-            record_count: weeklyRecords.length
+            monthly_records: monthlyRecords,
+            record_count: monthlyRecords.length
         };
         """,
         dataset,
     )
     if result["columns"]:
-        print(f"  ✓ {dataset}: {len(result['columns'])} weeks, {result['record_count']} cells")
+        print(f"  ✓ {dataset}: {len(result['columns'])} months, {result['record_count']} cells")
     return result
 
 
@@ -887,44 +893,45 @@ def enrich_hourly_records(
     records: list[dict],
     search_delivery_date: date,
     returned_dates: list[str],
-    weekstarts: list[str],
+    monthstarts: list[str],
     holiday_dates: set[date] | None = None,
 ) -> list[dict]:
     window_start_date = date.fromisoformat(returned_dates[0]) if returned_dates else None
     window_end_date = date.fromisoformat(returned_dates[-1]) if returned_dates else None
-    weekly_prices: dict[str, dict[str, dict[str, object]]] = {}
+    monthly_prices: dict[str, dict[str, dict[str, object]]] = {}
 
     for record in records:
-        delivery_week = date.fromisoformat(record["delivery_week"])
+        delivery_month = date.fromisoformat(record["delivery_month"])
         product = normalize_product(record["product"])
         if product is None or record["value"] is None:
             continue
-        weekly_prices.setdefault(delivery_week.isoformat(), {})[product] = {
+        monthly_prices.setdefault(delivery_month.isoformat(), {})[product] = {
             "value": record["value"],
             "product_label": record["product_label"],
         }
 
     enriched_records = []
-    planned_weekstarts = [date.fromisoformat(weekstart) for weekstart in weekstarts]
+    planned_monthstarts = [date.fromisoformat(monthstart) for monthstart in monthstarts]
 
-    missing_weekstarts = [
-        weekstart.isoformat()
-        for weekstart in planned_weekstarts
-        if weekstart.isoformat() not in weekly_prices
+    missing_monthstarts = [
+        monthstart.isoformat()
+        for monthstart in planned_monthstarts
+        if monthstart.isoformat() not in monthly_prices
     ]
-    if missing_weekstarts:
+    if missing_monthstarts:
         raise RuntimeError(
-            f"{dataset} weekly data missing expected weekstarts: {missing_weekstarts}"
+            f"{dataset} monthly data missing expected monthstarts: {missing_monthstarts}"
         )
 
-    for weekstart in planned_weekstarts:
-        target_week_text = weekstart.isoformat()
-        target_week_prices = weekly_prices[target_week_text]
-        for offset in range(7):
-            delivery_day = weekstart + timedelta(days=offset)
+    for monthstart in planned_monthstarts:
+        target_month_text = monthstart.isoformat()
+        target_month_prices = monthly_prices[target_month_text]
+        days_in_month = calendar.monthrange(monthstart.year, monthstart.month)[1]
+        for offset in range(days_in_month):
+            delivery_day = monthstart + timedelta(days=offset)
             for hour in range(1, 25):
                 product = get_time_of_use_period(delivery_day, hour, holiday_dates)
-                price_row = target_week_prices.get(product)
+                price_row = target_month_prices.get(product)
                 if price_row is None:
                     continue
 
@@ -955,22 +962,25 @@ def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
     if end_date < start_date:
         raise ValueError("end_date must be greater than or equal to start_date")
 
-    weekstarts = []
-    current_weekstart = normalize_week_start(start_date)
-    last_weekstart = normalize_week_start(end_date)
-    while current_weekstart <= last_weekstart:
-        weekstarts.append(current_weekstart)
-        current_weekstart += timedelta(days=7)
+    monthstarts = []
+    current_monthstart = normalize_month_start(start_date)
+    last_monthstart = normalize_month_start(end_date)
+    while current_monthstart <= last_monthstart:
+        monthstarts.append(current_monthstart)
+        if current_monthstart.month == 12:
+            current_monthstart = date(current_monthstart.year + 1, 1, 1)
+        else:
+            current_monthstart = date(current_monthstart.year, current_monthstart.month + 1, 1)
 
     chunks = []
-    for index in range(0, len(weekstarts), 7):
-        batch_weekstarts = weekstarts[index : index + 7]
+    for index in range(0, len(monthstarts), 7):
+        batch_monthstarts = monthstarts[index : index + 7]
         chunks.append(
             {
-                "chunk_start": batch_weekstarts[0],
-                "chunk_end": batch_weekstarts[-1],
-                "search_date": batch_weekstarts[-1],
-                "weekstarts": [weekstart.isoformat() for weekstart in batch_weekstarts],
+                "chunk_start": batch_monthstarts[0],
+                "chunk_end": batch_monthstarts[-1],
+                "search_date": batch_monthstarts[-1],
+                "monthstarts": [monthstart.isoformat() for monthstart in batch_monthstarts],
             }
         )
 
@@ -979,11 +989,14 @@ def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
 
 def expected_chunk_dates(chunk_start: date, chunk_end: date) -> list[str]:
     dates = []
-    current_date = normalize_week_start(chunk_start)
-    end_week = normalize_week_start(chunk_end)
-    while current_date <= end_week:
+    current_date = normalize_month_start(chunk_start)
+    end_month = normalize_month_start(chunk_end)
+    while current_date <= end_month:
         dates.append(current_date.isoformat())
-        current_date += timedelta(days=7)
+        if current_date.month == 12:
+            current_date = date(current_date.year + 1, 1, 1)
+        else:
+            current_date = date(current_date.year, current_date.month + 1, 1)
     return dates
 
 
@@ -1368,18 +1381,18 @@ def scrape_area_results_for_search_date(
     reopen_schedule: bool,
     start_with_unconstrained: bool,
     configure_static_fields: bool,
-    weekstarts: list[str],
+    monthstarts: list[str],
     holiday_dates: set[date] | None = None,
 ) -> dict:
-    delivery_week_start = normalize_week_start(search_date)
-    formatted_date = format_delivery_day(delivery_week_start)
+    delivery_month_start = normalize_month_start(search_date)
+    formatted_date = format_delivery_day(delivery_month_start)
     if reopen_schedule:
         click_select_schedule(driver, timeout=timeout)
 
     if configure_static_fields:
-        set_input_by_label(driver, "Market", "FPM-W", timeout=timeout)
+        set_input_by_label(driver, "Market", "FPM-M", timeout=timeout)
         set_input_by_label(driver, "Category", "Price in USD", timeout=timeout)
-    set_input_by_label(driver, "Delivery Week", formatted_date, timeout=timeout)
+    set_input_by_label(driver, "Delivery Month", formatted_date, timeout=timeout)
 
     first_dataset = "unconstrained" if start_with_unconstrained else "constrained"
     first_toggle_state = True if start_with_unconstrained else False
@@ -1409,10 +1422,10 @@ def scrape_area_results_for_search_date(
         tables[dataset_name] = table
         records[dataset_name] = enrich_hourly_records(
             dataset_name,
-            table["weekly_records"],
-            delivery_week_start,
+            table["monthly_records"],
+            delivery_month_start,
             table["returned_dates"],
-            weekstarts,
+            monthstarts,
             holiday_dates,
         )
 
@@ -1483,7 +1496,7 @@ def run(
                 reopen_schedule=index > 1,
                 start_with_unconstrained=(index % 2 == 1),
                 configure_static_fields=(index == 1),
-                weekstarts=chunk["weekstarts"],
+                monthstarts=chunk["monthstarts"],
                 holiday_dates=holiday_dates,
             )
             storage_result = store_results(
@@ -1559,7 +1572,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--delivery-date",
-        help="Legacy single search date in YYYY-MM-DD format. Searches one 7-day window ending on this date.",
+        help="Legacy single search date in YYYY-MM-DD format. Searches the month containing this date.",
     )
     parser.add_argument(
         "--start-date",
@@ -1567,7 +1580,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--end-date",
-        help="End delivery date in YYYY-MM-DD format. If omitted with --start-date, a 7-day chunk is assumed.",
+        help="End delivery date in YYYY-MM-DD format. If omitted with --start-date, a single month is assumed.",
     )
     parser.add_argument(
         "--timeout",

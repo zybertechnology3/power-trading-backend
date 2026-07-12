@@ -165,14 +165,14 @@ start_at` and reject overlapping outage windows for the same `unit_code`.
 
 ## SAPP Examples
 
-Botswana public holidays for SAPP market calendar logic:
+Zimbabwe public holidays for SAPP market calendar logic:
 
 ```text
 GET /sapp/public-holidays?year=2026
 GET /sapp/public-holidays?year=2026&public_only=false
 ```
 
-The endpoint fetches Botswana (`BW`) holidays from the configured public
+The endpoint fetches Zimbabwe (`ZW`) holidays from the configured public
 holidays provider and normalizes the response to snake_case fields:
 `date`, `local_name`, `name`, `country_code`, `fixed`, `global_holiday`,
 `counties`, `launch_year`, and `types`. The provider base URL defaults to

@@ -3,6 +3,7 @@ SAPP MTP constrained area result endpoints.
 """
 
 from datetime import date, datetime, time, timedelta, timezone
+from functools import lru_cache
 from typing import Literal, Optional
 
 import httpx
@@ -24,6 +25,8 @@ from app.schemas.sapp import (
     BidStatus,
     SappDamAreaResultRecord,
     SappDamAreaResultsRangeResponse,
+    SappFpmMAreaResultRecord,
+    SappFpmMAreaResultsRangeResponse,
     SappFpmWAreaResultRecord,
     SappFpmWAreaResultsRangeResponse,
     SappBidMarket,
@@ -66,7 +69,7 @@ from sapp_scraper import (
 router = APIRouter(prefix="/sapp", tags=["sapp"])
 
 Frequency = Literal["1h", "4h", "1d", "1w", "1mo", "1y"]
-BOTSWANA_COUNTRY_CODE = "BW"
+ZIMBABWE_COUNTRY_CODE = "ZW"
 MONDAY = 0
 FRIDAY = 4
 WEDNESDAY = 2
@@ -87,6 +90,8 @@ STANDALONE_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_CONSTRAINED_PRICE_RESULTS"
 STANDALONE_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_UNCONSTRAINED_PRICE_RESULTS"
 STANDALONE_FPM_W_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RESULTS"
 STANDALONE_FPM_W_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
+STANDALONE_FPM_M_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_CONSTRAINED_PRICE_RESULTS"
+STANDALONE_FPM_M_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_UNCONSTRAINED_PRICE_RESULTS"
 
 FREQUENCY_BUCKETS = {
     "4h": {"unit": "hour", "binSize": 4},
@@ -111,22 +116,92 @@ def _utcnow() -> datetime:
 def _public_holidays_api_url(year: int) -> str:
     return (
         f"{settings.PUBLIC_HOLIDAYS_API_BASE_URL.rstrip('/')}"
-        f"/PublicHolidays/{year}/{BOTSWANA_COUNTRY_CODE}"
+        f"/PublicHolidays/{year}/{ZIMBABWE_COUNTRY_CODE}"
     )
 
 
 def _normalize_public_holiday(record: dict) -> dict:
+    holiday_date = record["date"]
+    if not isinstance(holiday_date, date):
+        holiday_date = date.fromisoformat(str(holiday_date))
     return {
-        "date": record["date"],
+        "date": holiday_date,
         "local_name": record.get("localName") or record.get("local_name") or record["name"],
         "name": record["name"],
-        "country_code": record.get("countryCode") or record.get("country_code") or BOTSWANA_COUNTRY_CODE,
+        "country_code": record.get("countryCode") or record.get("country_code") or ZIMBABWE_COUNTRY_CODE,
         "fixed": bool(record.get("fixed", False)),
         "global_holiday": bool(record.get("global", record.get("global_holiday", True))),
         "counties": record.get("counties"),
         "launch_year": record.get("launchYear") or record.get("launch_year"),
         "types": record.get("types") or [],
     }
+
+
+@lru_cache(maxsize=None)
+def _public_holidays_for_year(year: int) -> tuple[dict, ...]:
+    try:
+        response = httpx.get(_public_holidays_api_url(year), timeout=10)
+        response.raise_for_status()
+        records = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Public holidays provider returned "
+                f"{exc.response.status_code}"
+            ),
+        )
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(
+            status_code=502,
+            detail="Public holidays provider is unavailable",
+        )
+
+    holidays = [_normalize_public_holiday(record) for record in records]
+    holidays = [
+        holiday
+        for holiday in holidays
+        if not holiday["types"] or PUBLIC_HOLIDAY_TYPES.intersection(holiday["types"])
+    ]
+    return tuple(holidays)
+
+
+def _holiday_effective_dates(actual_dates: set[date]) -> set[date]:
+    if not actual_dates:
+        return set()
+
+    effective_dates = set(actual_dates)
+    sorted_dates = sorted(actual_dates)
+    run_start = sorted_dates[0]
+    run_end = sorted_dates[0]
+
+    def finalize_run(start: date, end: date) -> None:
+        current = start
+        while current <= end:
+            if current.weekday() == 6:
+                effective_dates.add(end + timedelta(days=1))
+                break
+            current += timedelta(days=1)
+
+    for current_date in sorted_dates[1:]:
+        if current_date == run_end + timedelta(days=1):
+            run_end = current_date
+        else:
+            finalize_run(run_start, run_end)
+            run_start = run_end = current_date
+
+    finalize_run(run_start, run_end)
+    return effective_dates
+
+
+def _holiday_dates_for_range(start_date: date, end_date: date) -> set[date]:
+    if end_date < start_date:
+        raise ValueError("end_date must be greater than or equal to start_date")
+
+    actual_dates: set[date] = set()
+    for year in range(start_date.year - 1, end_date.year + 2):
+        actual_dates.update(holiday["date"] for holiday in _public_holidays_for_year(year))
+    return _holiday_effective_dates(actual_dates)
 
 
 def _parse_object_id(record_id: str, record_name: str) -> ObjectId:
@@ -174,30 +249,12 @@ def _calculate_weighted_average_price(
     "/public-holidays",
     response_model=list[SappPublicHolidayResponse],
 )
-def list_botswana_public_holidays(
+def list_zimbabwe_public_holidays(
     year: int = Query(..., ge=1900, le=2100),
     public_only: bool = Query(True),
 ):
-    """List Botswana public holidays for SAPP market calendar use."""
-    try:
-        response = httpx.get(_public_holidays_api_url(year), timeout=10)
-        response.raise_for_status()
-        records = response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Public holidays provider returned "
-                f"{exc.response.status_code}"
-            ),
-        )
-    except (httpx.HTTPError, ValueError):
-        raise HTTPException(
-            status_code=502,
-            detail="Public holidays provider is unavailable",
-        )
-
-    holidays = [_normalize_public_holiday(record) for record in records]
+    """List Zimbabwe public holidays for SAPP market calendar use."""
+    holidays = list(_public_holidays_for_year(year))
     if public_only:
         holidays = [
             holiday
@@ -283,7 +340,12 @@ def _bid_period_range(payload: SappBidCreate) -> tuple[date, date, int]:
 def _bid_fields_from_payload(payload: SappBidCreate) -> dict:
     quantities = _normalize_quantities(payload.quantities)
     period_start_date, period_end_date, delivery_days = _bid_period_range(payload)
-    period_hour_counts = count_time_of_use_hours(period_start_date, period_end_date)
+    holiday_dates = _holiday_dates_for_range(period_start_date, period_end_date)
+    period_hour_counts = count_time_of_use_hours(
+        period_start_date,
+        period_end_date,
+        holiday_dates,
+    )
 
     if payload.market == "dam":
         weighted_quantities = [(quantity, 1) for quantity in quantities]
@@ -291,7 +353,11 @@ def _bid_fields_from_payload(payload: SappBidCreate) -> dict:
         total_energy = daily_energy
         period_energy = {"off_peak": 0, "standard": 0, "peak": 0}
         for quantity in quantities:
-            product = get_time_of_use_period(payload.delivery_date, quantity["hour"])
+            product = get_time_of_use_period(
+                payload.delivery_date,
+                quantity["hour"],
+                holiday_dates,
+            )
             period_energy[product] += quantity["energy_mwh"]
     else:
         weighted_quantities = [
@@ -506,10 +572,11 @@ def _build_bid_hour_rows(bid: dict, delivery_date: date) -> list[dict]:
     quantities = bid.get("quantities", [])
     price_columns = bid.get("price_columns", [])
     market = bid.get("market", "dam")
+    holiday_dates = _holiday_dates_for_range(delivery_date, delivery_date)
     rows = []
 
     for hour in range(1, 25):
-        product = get_time_of_use_period(delivery_date, hour)
+        product = get_time_of_use_period(delivery_date, hour, holiday_dates)
         quantities_by_price = {_price_key(price): 0 for price in price_columns}
 
         for quantity in quantities:
@@ -544,10 +611,11 @@ def _build_result_hour_rows(db, market: str, delivery_date: date) -> list[dict]:
     portfolio_records = {
         record.get("hour"): record for record in _portfolio_hourly_records(db, delivery_date)
     }
+    holiday_dates = _holiday_dates_for_range(delivery_date, delivery_date)
     rows = []
 
     for hour in range(1, 25):
-        product = get_time_of_use_period(delivery_date, hour)
+        product = get_time_of_use_period(delivery_date, hour, holiday_dates)
         invoice_record = invoice_records.get(hour, {})
         portfolio_record = portfolio_records.get(hour, {})
         purchase_mwh = invoice_record.get("traded_purchases_mwh")
@@ -962,11 +1030,16 @@ def get_time_of_use_periods(
                 status_code=400,
                 detail="Use either delivery_date or start_date/end_date, not both",
             )
-        counts = count_time_of_use_hours(delivery_date, delivery_date)
+        holiday_dates = _holiday_dates_for_range(delivery_date, delivery_date)
+        counts = count_time_of_use_hours(
+            delivery_date,
+            delivery_date,
+            holiday_dates,
+        )
         return {
             "delivery_date": delivery_date.isoformat(),
             "period_hour_counts": counts,
-            "hours": build_time_of_use_schedule(delivery_date),
+            "hours": build_time_of_use_schedule(delivery_date, holiday_dates),
         }
 
     if not start_date or not end_date:
@@ -980,10 +1053,11 @@ def get_time_of_use_periods(
             detail="end_date must be greater than or equal to start_date",
         )
 
+    holiday_dates = _holiday_dates_for_range(start_date, end_date)
     return {
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "period_hour_counts": count_time_of_use_hours(start_date, end_date),
+        "period_hour_counts": count_time_of_use_hours(start_date, end_date, holiday_dates),
     }
 
 
@@ -1022,6 +1096,7 @@ def get_bid_trading_period(
         request_date_field = "month_start_date"
         bid_deadline_date = _fpm_month_bid_deadline(period_start_date)
 
+    holiday_dates = _holiday_dates_for_range(period_start_date, period_end_date)
     return {
         "market": market,
         "mode": mode,
@@ -1035,6 +1110,7 @@ def get_bid_trading_period(
         "period_hour_counts": count_time_of_use_hours(
             period_start_date,
             period_end_date,
+            holiday_dates,
         ),
     }
 
@@ -1949,6 +2025,50 @@ def get_fpm_w_area_results_for_range(
         end_date=end_date,
         records=[
             SappFpmWAreaResultRecord(**record.model_dump())
+            for record in _merge_dam_area_results(constrained_records, unconstrained_records)
+        ],
+    )
+
+
+@router.get("/fpm-m-area-results", response_model=SappFpmMAreaResultsRangeResponse)
+def get_fpm_m_area_results_for_range(
+    start_date: date = Query(..., description="First delivery date in the requested range."),
+    end_date: date = Query(..., description="Last delivery date in the requested range, inclusive."),
+):
+    """Return a minimal merged FPM-M area price series for charting."""
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be greater than or equal to start_date",
+        )
+
+    db = get_db()
+    constrained_collection = db["sapp_fpm_m_constrained_area_results"]
+    unconstrained_collection = db["sapp_fpm_m_unconstrained_area_results"]
+
+    base_filter = _build_sapp_time_filter(None, start_date, end_date, None, None)
+    constrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_FPM_M_CONSTRAINED_DATA_SOURCE,
+    }
+    unconstrained_filter = {
+        **base_filter,
+        "metadata.data_source": STANDALONE_FPM_M_UNCONSTRAINED_DATA_SOURCE,
+    }
+
+    constrained_records = list(
+        constrained_collection.find(constrained_filter).sort([("delivery_date", 1), ("hour", 1)])
+    )
+    unconstrained_records = list(
+        unconstrained_collection.find(unconstrained_filter).sort([("delivery_date", 1), ("hour", 1)])
+    )
+
+    return SappFpmMAreaResultsRangeResponse(
+        market="fpm_m",
+        start_date=start_date,
+        end_date=end_date,
+        records=[
+            SappFpmMAreaResultRecord(**record.model_dump())
             for record in _merge_dam_area_results(constrained_records, unconstrained_records)
         ],
     )

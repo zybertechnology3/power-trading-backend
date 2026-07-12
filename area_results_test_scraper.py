@@ -307,7 +307,7 @@ def get_toggle_state(driver, toggle) -> Optional[bool]:
 
 
 def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
-    print(f"[3/7] Setting constrained toggle to {enabled}")
+    print(f"[3/7] Setting area result toggle to {enabled}")
     wait_for_page_settle(driver, timeout=timeout)
     toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
@@ -317,7 +317,7 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
     if before_state is None and enabled is False:
         should_click = False
     if should_click:
-        print("[3/7] Toggling constrained switch")
+        print("[3/7] Toggling area result switch")
         try:
             driver.execute_script(
                 """
@@ -357,7 +357,7 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
     print(f"[3/7] Toggle state before={before_state}, after={after_state}")
     if after_state is not enabled:
         raise RuntimeError(
-            f"Failed to set constrained toggle to {enabled}. Final state was {after_state}."
+            f"Failed to set area result toggle to {enabled}. Final state was {after_state}."
         )
 
 
@@ -1057,26 +1057,8 @@ def scrape_area_results_for_search_date(
     set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
     select_category(driver, "Price in USD", timeout=timeout)
 
-    # Fill the schedule once, search constrained first, then reopen and only
-    # flip the switch for the unconstrained run.
+    # Toggle on now means unconstrained, so search that first.
     set_constrained_toggle(driver, True, timeout=timeout)
-    click_search(driver, timeout=timeout)
-    constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
-    validate_returned_dates_for_chunk(
-        "constrained",
-        constrained_table["returned_dates"],
-        chunk_start,
-        chunk_end,
-    )
-    constrained_records = enrich_hourly_records(
-        "constrained",
-        constrained_table["hourly_records"],
-        search_date,
-        constrained_table["returned_dates"],
-    )
-
-    click_select_schedule(driver, timeout=timeout)
-    set_constrained_toggle(driver, False, timeout=timeout)
     click_search(driver, timeout=timeout)
     unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
     validate_returned_dates_for_chunk(
@@ -1090,6 +1072,23 @@ def scrape_area_results_for_search_date(
         unconstrained_table["hourly_records"],
         search_date,
         unconstrained_table["returned_dates"],
+    )
+
+    click_select_schedule(driver, timeout=timeout)
+    set_constrained_toggle(driver, False, timeout=timeout)
+    click_search(driver, timeout=timeout)
+    constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
+    validate_returned_dates_for_chunk(
+        "constrained",
+        constrained_table["returned_dates"],
+        chunk_start,
+        chunk_end,
+    )
+    constrained_records = enrich_hourly_records(
+        "constrained",
+        constrained_table["hourly_records"],
+        search_date,
+        constrained_table["returned_dates"],
     )
 
     return {
