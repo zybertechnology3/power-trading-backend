@@ -262,6 +262,24 @@ def _initialize_collections():
         )
         print("Created 'sapp_fpm_w_unconstrained_area_results' collection")
 
+    if "sapp_bm_atc_results" not in db.list_collection_names():
+        db.create_collection("sapp_bm_atc_results")
+        bm_atc_collection = db["sapp_bm_atc_results"]
+        bm_atc_collection.create_index(
+            [("timestamp", DESCENDING)],
+            name="idx_sapp_bm_atc_timestamp",
+        )
+        bm_atc_collection.create_index(
+            [("delivery_date", ASCENDING), ("hour", ASCENDING), ("area", ASCENDING)],
+            unique=True,
+            name="idx_sapp_bm_atc_delivery_date_hour_area_unique",
+        )
+        bm_atc_collection.create_index(
+            [("metadata.data_source", ASCENDING)],
+            name="idx_sapp_bm_atc_data_source",
+        )
+        print("Created 'sapp_bm_atc_results' collection")
+
     if "sapp_participant_portfolio_results" not in db.list_collection_names():
         db.create_collection("sapp_participant_portfolio_results")
         print("Created 'sapp_participant_portfolio_results' collection")

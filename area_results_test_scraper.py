@@ -1,7 +1,9 @@
 import argparse
 import os
+import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -36,9 +38,61 @@ MONGO_CONNECT_TIMEOUT_MS = 30000
 MONGO_SOCKET_TIMEOUT_MS = 30000
 MONGO_PING_RETRIES = 3
 MONGO_PING_RETRY_DELAY_SECONDS = 5
+BULK_WRITE_CHUNK_SIZE = 500
+SCRAPE_SCOPE_CHOICES = ("prices", "volumes", "all")
+SCRAPE_VARIANTS = {
+    "prices": (
+        {
+            "category": "Price in USD",
+            "fields": {
+                "constrained": "area_price_usd_per_mwh",
+                "unconstrained": "price_usd_per_mwh",
+            },
+        },
+    ),
+    "volumes": (
+        {
+            "category": "Total Purchase Volume",
+            "fields": {
+                "constrained": "area_purchase_mw",
+                "unconstrained": "total_purchase_volume_mw",
+            },
+        },
+        {
+            "category": "Total Sale Volume",
+            "fields": {
+                "constrained": "area_sales_mw",
+                "unconstrained": "total_sales_volume_mw",
+            },
+        },
+    ),
+    "all": (
+        {
+            "category": "Price in USD",
+            "fields": {
+                "constrained": "area_price_usd_per_mwh",
+                "unconstrained": "price_usd_per_mwh",
+            },
+        },
+        {
+            "category": "Total Purchase Volume",
+            "fields": {
+                "constrained": "area_purchase_mw",
+                "unconstrained": "total_purchase_volume_mw",
+            },
+        },
+        {
+            "category": "Total Sale Volume",
+            "fields": {
+                "constrained": "area_sales_mw",
+                "unconstrained": "total_sales_volume_mw",
+            },
+        },
+    ),
+}
 
 
-def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 1.5) -> None:
+def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 0.75) -> None:
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") == "complete"
     )
@@ -126,6 +180,33 @@ def login(driver, username: str, password: str, timeout: int = 20) -> None:
     print("[1/7] Login completed")
 
 
+def open_area_results_page(
+    driver,
+    username: str,
+    password: str,
+    timeout: int = 20,
+) -> None:
+    driver.get(AREA_RESULTS_URL)
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
+
+    login_page_detected = driver.current_url.startswith(LOGIN_URL) or bool(
+        driver.execute_script(
+            """
+            return Boolean(
+                document.querySelector("input[id='login-input-user-name-or-email-address']")
+                || document.querySelector("input[id='password']")
+            );
+            """
+        )
+    )
+
+    if login_page_detected:
+        print("[2/7] Session expired on turnover page; logging in again")
+        login(driver, username, password, timeout=timeout)
+        driver.get(AREA_RESULTS_URL)
+        wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
+
+
 def format_delivery_day(value: date) -> str:
     return value.strftime("%Y/%m/%d")
 
@@ -168,34 +249,250 @@ def read_input_value(driver, input_element) -> str:
     )
 
 
+def select_all_input_text(driver, input_element) -> None:
+    driver.execute_script(
+        """
+        const input = arguments[0];
+        input.focus();
+        if (typeof input.select === "function") {
+            input.select();
+        }
+        if (typeof input.setSelectionRange === "function") {
+            input.setSelectionRange(0, input.value.length);
+        }
+        """,
+        input_element,
+    )
+
+
+def parse_month_year_from_text(text: str) -> Optional[tuple[int, int]]:
+    months = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+    match = re.search(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})",
+        text.lower(),
+    )
+    if not match:
+        return None
+    return months[match.group(1)], int(match.group(2))
+
+
+def find_calendar_nav_button(driver, calendar, direction: str):
+    return driver.execute_script(
+        r"""
+        const calendar = arguments[0];
+        const direction = arguments[1];
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+        };
+        const buttons = Array.from(calendar.querySelectorAll("button")).filter(isVisible);
+        const predicate = direction === "next"
+            ? (button) => {
+                const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                const aria = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+                const cls = (button.getAttribute("class") || "").toLowerCase();
+                return title.includes("next") || aria.includes("next") || cls.includes("next");
+            }
+            : (button) => {
+                const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                const aria = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+                const cls = (button.getAttribute("class") || "").toLowerCase();
+                return title.includes("previous") || title.includes("prev")
+                    || aria.includes("previous") || aria.includes("prev")
+                    || cls.includes("prev");
+            };
+        return buttons.find(predicate) || null;
+        """,
+        calendar,
+        direction,
+    )
+
+
+def click_calendar_day(driver, calendar, target_date: date):
+    return driver.execute_script(
+        r"""
+        const calendar = arguments[0];
+        const dayText = String(arguments[1]);
+        const targetMonth = Number(arguments[2]);
+        const targetYear = Number(arguments[3]);
+        const isVisible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+        };
+        const sameMonth = (button) => {
+            const cls = (button.getAttribute("class") || "").toLowerCase();
+            const aria = (button.getAttribute("aria-label") || "").toLowerCase();
+            const title = (button.getAttribute("title") || "").toLowerCase();
+            if (cls.includes("other-month") || cls.includes("adjacent")) return false;
+            if (aria.includes("other month") || title.includes("other month")) return false;
+            if (aria.includes(String(targetYear)) || title.includes(String(targetYear))) return true;
+            return true;
+        };
+        const buttons = Array.from(calendar.querySelectorAll("button")).filter(isVisible);
+        const candidates = buttons.filter((button) => {
+            const text = (button.textContent || "").replace(/\s+/g, " ").trim();
+            return text === dayText && sameMonth(button);
+        });
+        return candidates[0] || null;
+        """,
+        calendar,
+        target_date.day,
+        target_date.month,
+        target_date.year,
+    )
+
+
+def set_date_via_calendar(driver, label: str, value: str, timeout: int = 20) -> None:
+    print(f"🗓️ [2/7] Calendar fallback for {label}: {value}")
+    target_date = date.fromisoformat(value.replace("/", "-"))
+    wait_for_page_settle(driver, timeout=timeout)
+
+    def find_calendar_toggle(driver):
+        return driver.execute_script(
+            r"""
+            const labelText = arguments[0].toLowerCase();
+            const normalize = (value) => (value || "")
+                .replace(/\*/g, "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .toLowerCase();
+            const labels = Array.from(document.querySelectorAll("label, .form-label, div, span"))
+                .filter((element) => normalize(element.textContent) === labelText);
+
+            const isVisible = (element) => {
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+
+            for (const label of labels) {
+                let node = label;
+                for (let depth = 0; node && depth < 6; depth += 1) {
+                    const toggles = Array.from(node.querySelectorAll("button")).filter(isVisible);
+                    const toggle = toggles.find((button) => {
+                        const title = (button.getAttribute("title") || "").trim().toLowerCase();
+                        const aria = (button.getAttribute("aria-label") || "").trim().toLowerCase();
+                        return title === "toggle calendar" || aria === "toggle calendar";
+                    });
+                    if (toggle) return toggle;
+                    node = node.parentElement;
+                }
+            }
+            return null;
+            """,
+            label,
+        )
+
+    def find_visible_calendar_popup(driver):
+        return driver.execute_script(
+            r"""
+            const calendars = Array.from(document.querySelectorAll(
+                ".k-calendar, .k-daterangepicker .k-popup, .k-animation-container"
+            ));
+            const isVisible = (element) => {
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && element.offsetParent !== null;
+            };
+            return calendars.find(isVisible) || null;
+            """
+        )
+
+    toggle = WebDriverWait(driver, timeout).until(find_calendar_toggle)
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
+    time.sleep(0.12)
+    driver.execute_script("arguments[0].click();", toggle)
+
+    calendar = WebDriverWait(driver, timeout).until(find_visible_calendar_popup)
+
+    for _ in range(24):
+        popup_text = driver.execute_script(
+            """
+            const popup = arguments[0];
+            return (popup.innerText || popup.textContent || "").replace(/\\s+/g, " ").trim();
+            """,
+            calendar,
+        )
+        current_month_year = parse_month_year_from_text(popup_text)
+        if current_month_year == (target_date.month, target_date.year):
+            break
+
+        nav_direction = None
+        if current_month_year is not None:
+            current_month, current_year = current_month_year
+            current_serial = current_year * 12 + current_month
+            target_serial = target_date.year * 12 + target_date.month
+            nav_direction = "next" if target_serial > current_serial else "prev"
+
+        if nav_direction is None:
+            break
+
+        nav_button = find_calendar_nav_button(driver, calendar, nav_direction)
+        if nav_button is None:
+            break
+
+        driver.execute_script("arguments[0].click();", nav_button)
+        time.sleep(0.15)
+        calendar = WebDriverWait(driver, timeout).until(find_visible_calendar_popup)
+
+    day_button = WebDriverWait(driver, timeout).until(
+        lambda d: click_calendar_day(d, calendar, target_date)
+    )
+    driver.execute_script("arguments[0].click();", day_button)
+    time.sleep(0.3)
+
+
 def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> None:
-    print(f"[2/7] Setting {label}: {value}")
+    print(f"📝 [2/7] {label}: {value}")
     wait_for_page_settle(driver, timeout=timeout)
     input_element = WebDriverWait(driver, timeout).until(
         lambda d: find_field_input(d, label)
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
     for attempt in range(1, 4):
-        print(f"[2/7] {label} attempt {attempt}: writing '{value}'")
+        print(f"  ↳ attempt {attempt}: typing")
         input_element.click()
-        time.sleep(0.5)
-        input_element.send_keys(Keys.CONTROL, "a")
-        selected_value = read_input_value(driver, input_element)
-        print(f"[2/7] {label} attempt {attempt}: selected existing value '{selected_value}'")
+        time.sleep(0.15)
+        select_all_input_text(driver, input_element)
 
         for character in value:
             input_element.send_keys(character)
             time.sleep(0.12)
 
         input_element.send_keys(Keys.TAB)
-        time.sleep(1.0)
+        time.sleep(0.25)
 
         actual_value = read_input_value(driver, input_element)
-        print(f"[2/7] {label} attempt {attempt}: field now shows '{actual_value}'")
         if actual_value == value:
+            print(f"  ✓ {label} set")
             return
 
-        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.5)
+        if label == "Delivery Day":
+            try:
+                set_date_via_calendar(driver, label, value, timeout=timeout)
+                actual_value = read_input_value(driver, input_element)
+                if actual_value == value:
+                    print(f"  ✓ {label} set via calendar")
+                    return
+            except Exception as exc:
+                print(f"  ⚠️ {label} calendar fallback failed: {exc}")
+
+        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.2)
         input_element = WebDriverWait(driver, timeout).until(
             lambda d: find_field_input(d, label)
         )
@@ -206,15 +503,15 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
 
 
 def select_category(driver, value: str, timeout: int = 20) -> None:
-    print(f"[2/7] Selecting Category: {value}")
+    print(f"📝 [2/7] Category: {value}")
     wait_for_page_settle(driver, timeout=timeout)
     input_element = WebDriverWait(driver, timeout).until(
         lambda d: find_field_input(d, "Category")
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
     input_element.click()
-    time.sleep(0.5)
-    input_element.send_keys(Keys.CONTROL, "a")
+    time.sleep(0.15)
+    select_all_input_text(driver, input_element)
     input_element.send_keys(value)
 
     def visible_option(driver):
@@ -239,7 +536,7 @@ def select_category(driver, value: str, timeout: int = 20) -> None:
     except TimeoutException:
         input_element.send_keys(Keys.ENTER)
         input_element.send_keys(Keys.TAB)
-    time.sleep(1.0)
+    time.sleep(0.25)
 
 
 def find_constrained_toggle(driver):
@@ -307,17 +604,17 @@ def get_toggle_state(driver, toggle) -> Optional[bool]:
 
 
 def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
-    print(f"[3/7] Setting area result toggle to {enabled}")
+    print(f"🔁 [3/7] Toggle -> {'unconstrained' if enabled else 'constrained'}")
     wait_for_page_settle(driver, timeout=timeout)
     toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
-    time.sleep(0.5)
+    time.sleep(0.15)
     before_state = get_toggle_state(driver, toggle)
     should_click = before_state is not enabled
     if before_state is None and enabled is False:
         should_click = False
     if should_click:
-        print("[3/7] Toggling area result switch")
+        print("  ↳ flipping switch")
         try:
             driver.execute_script(
                 """
@@ -339,7 +636,7 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
                 )(find_constrained_toggle(d))
             )
         except TimeoutException:
-            print("[3/7] Switch did not flip after click; trying keyboard toggle")
+            print("  ↳ click did not stick; trying keyboard toggle")
             toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
             toggle.send_keys(Keys.SPACE)
             WebDriverWait(driver, timeout).until(
@@ -349,12 +646,12 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
                 )(find_constrained_toggle(d))
             )
 
-        time.sleep(1.0)
-        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.75)
+        time.sleep(0.25)
+        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.35)
 
     toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
     after_state = get_toggle_state(driver, toggle)
-    print(f"[3/7] Toggle state before={before_state}, after={after_state}")
+    print(f"  ✓ toggle state now {after_state}")
     if after_state is not enabled:
         raise RuntimeError(
             f"Failed to set area result toggle to {enabled}. Final state was {after_state}."
@@ -362,7 +659,7 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
 
 
 def click_search(driver, timeout: int = 20) -> dict:
-    print("[4/7] Clicking Search")
+    print("🔎 [4/7] Searching")
     wait_for_page_settle(driver, timeout=timeout)
     old_url = driver.current_url
     old_signature = driver.execute_script(
@@ -401,9 +698,8 @@ def click_search(driver, timeout: int = 20) -> dict:
         """,
         button,
     )
-    print(f"[4/7] Search button details: {button_info}")
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-    time.sleep(0.5)
+    time.sleep(0.15)
     try:
         button.click()
         click_method = "selenium_click"
@@ -429,16 +725,13 @@ def click_search(driver, timeout: int = 20) -> dict:
             )
         )
     )
-    wait_for_page_settle(driver, timeout=timeout, extra_delay=2.0)
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=0.9)
     new_url = driver.current_url
     content_changed = (
         driver.execute_script("return document.body ? document.body.innerText.slice(0, 2000) : '';")
         != old_signature
     )
-    print(
-        f"[4/7] Search dispatched via {click_method}; redirected={new_url != old_url}; "
-        f"content_changed={content_changed}"
-    )
+    print("  ✓ search complete")
     return {
         "search_click_method": click_method,
         "search_redirected": new_url != old_url,
@@ -447,7 +740,7 @@ def click_search(driver, timeout: int = 20) -> dict:
 
 
 def click_select_schedule(driver, timeout: int = 20) -> None:
-    print("[5/7] Reopening schedule panel")
+    print("📅 [5/7] Opening schedule panel")
     wait_for_page_settle(driver, timeout=timeout)
 
     def find_button(driver):
@@ -486,12 +779,11 @@ def click_select_schedule(driver, timeout: int = 20) -> None:
         """,
         button,
     )
-    print(f"[5/7] Select a Schedule button details: {button_info}")
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-    time.sleep(0.5)
+    time.sleep(0.15)
     driver.execute_script("arguments[0].click();", button)
     WebDriverWait(driver, timeout).until(lambda d: find_field_input(d, "Delivery Day"))
-    wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=0.55)
 
 
 def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
@@ -597,6 +889,8 @@ def enrich_hourly_records(
     records: list[dict],
     search_delivery_date: date,
     returned_dates: list[str],
+    category_label: str,
+    value_field: str,
 ) -> list[dict]:
     window_start_date = date.fromisoformat(returned_dates[0]) if returned_dates else None
     window_end_date = date.fromisoformat(returned_dates[-1]) if returned_dates else None
@@ -612,7 +906,8 @@ def enrich_hourly_records(
             else None,
             "window_end_date": window_end_date.isoformat() if window_end_date else None,
             "window_offset_days": (delivery_day - search_delivery_date).days,
-            "category": "Price in USD",
+            "category": category_label,
+            "value_field": value_field,
             "dataset": dataset,
         }
         enriched_records.append(enriched_record)
@@ -821,15 +1116,14 @@ def upsert_hourly_records(
         f"[db] Preparing {len(records_to_write)} {dataset} hourly records for collection "
         f"{collection.full_name}"
     )
-    if dataset == "constrained":
-        data_source = CONSTRAINED_DATA_SOURCE
-        field_name = "area_price_usd_per_mwh"
-    else:
-        data_source = UNCONSTRAINED_DATA_SOURCE
-        field_name = "price_usd_per_mwh"
 
     operations = []
     for record in records_to_write:
+        field_name = record["value_field"]
+        data_source = (
+            CONSTRAINED_DATA_SOURCE if dataset == "constrained"
+            else UNCONSTRAINED_DATA_SOURCE
+        )
         operations.append(
             UpdateOne(
                 {
@@ -853,6 +1147,7 @@ def upsert_hourly_records(
                             "data_source": data_source,
                             "source_page": AREA_RESULTS_URL,
                             "category": record["category"],
+                            "value_field": field_name,
                             "search_delivery_date": record["search_delivery_date"],
                             "window_start_date": record["window_start_date"],
                             "window_end_date": record["window_end_date"],
@@ -872,18 +1167,20 @@ def upsert_hourly_records(
     if not operations:
         return {"imported": 0, "updated": 0, "skipped_existing": skipped_existing}
 
-    result = collection.bulk_write(operations, ordered=False)
+    imported = 0
+    updated = 0
+    for index in range(0, len(operations), BULK_WRITE_CHUNK_SIZE):
+        batch = operations[index : index + BULK_WRITE_CHUNK_SIZE]
+        result = collection.bulk_write(batch, ordered=False)
+        imported += result.upserted_count
+        updated += result.matched_count
+
     _strictly_verify_written_records(collection, data_source, records_to_write)
     summary = {
-        "imported": result.upserted_count,
-        "updated": result.matched_count,
+        "imported": imported,
+        "updated": updated,
         "skipped_existing": skipped_existing,
     }
-    print(
-        f"[db] Upserted {dataset} records into {collection.name}: "
-        f"imported={summary['imported']}, updated={summary['updated']}, "
-        f"skipped_existing={summary['skipped_existing']}"
-    )
     return summary
 
 
@@ -1047,59 +1344,60 @@ def scrape_area_results_for_search_date(
     search_date: date,
     chunk_start: date,
     chunk_end: date,
+    category_label: str,
+    category_field_map: dict[str, str],
     timeout: int,
     reopen_schedule: bool,
+    configure_static_fields: bool,
 ) -> dict:
     formatted_date = format_delivery_day(search_date)
     if reopen_schedule:
         click_select_schedule(driver, timeout=timeout)
 
-    set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
-    select_category(driver, "Price in USD", timeout=timeout)
+    select_category(driver, category_label, timeout=timeout)
+    if configure_static_fields:
+        set_input_by_label(driver, "Delivery Day", formatted_date, timeout=timeout)
 
-    # Toggle on now means unconstrained, so search that first.
-    set_constrained_toggle(driver, True, timeout=timeout)
-    click_search(driver, timeout=timeout)
-    unconstrained_table = extract_hourly_table(driver, "unconstrained", timeout=timeout)
-    validate_returned_dates_for_chunk(
-        "unconstrained",
-        unconstrained_table["returned_dates"],
-        chunk_start,
-        chunk_end,
-    )
-    unconstrained_records = enrich_hourly_records(
-        "unconstrained",
-        unconstrained_table["hourly_records"],
-        search_date,
-        unconstrained_table["returned_dates"],
-    )
+    click_order = [
+        ("constrained", False),
+        ("unconstrained", True),
+    ]
 
-    click_select_schedule(driver, timeout=timeout)
-    set_constrained_toggle(driver, False, timeout=timeout)
-    click_search(driver, timeout=timeout)
-    constrained_table = extract_hourly_table(driver, "constrained", timeout=timeout)
-    validate_returned_dates_for_chunk(
-        "constrained",
-        constrained_table["returned_dates"],
-        chunk_start,
-        chunk_end,
-    )
-    constrained_records = enrich_hourly_records(
-        "constrained",
-        constrained_table["hourly_records"],
-        search_date,
-        constrained_table["returned_dates"],
-    )
+    tables: dict[str, dict] = {}
+    records: dict[str, list[dict]] = {}
+
+    for step_index, (dataset_name, toggle_state) in enumerate(click_order):
+        if step_index > 0:
+            click_select_schedule(driver, timeout=timeout)
+        set_constrained_toggle(driver, toggle_state, timeout=timeout)
+        click_search(driver, timeout=timeout)
+        table = extract_hourly_table(driver, dataset_name, timeout=timeout)
+        validate_returned_dates_for_chunk(
+            dataset_name,
+            table["returned_dates"],
+            chunk_start,
+            chunk_end,
+        )
+        tables[dataset_name] = table
+        records[dataset_name] = enrich_hourly_records(
+            dataset_name,
+            table["hourly_records"],
+            search_date,
+            table["returned_dates"],
+            category_label,
+            category_field_map[dataset_name],
+        )
 
     return {
         "search_date": search_date.isoformat(),
         "formatted_search_date": formatted_date,
+        "category": category_label,
         "returned_dates": {
-            "unconstrained": unconstrained_table["columns"],
-            "constrained": constrained_table["columns"],
+            "unconstrained": tables["unconstrained"]["columns"],
+            "constrained": tables["constrained"]["columns"],
         },
-        "unconstrained_records": unconstrained_records,
-        "constrained_records": constrained_records,
+        "unconstrained_records": records["unconstrained"],
+        "constrained_records": records["constrained"],
     }
 
 
@@ -1109,14 +1407,21 @@ def run(
     timeout: int,
     headless: bool,
     observe_seconds: int,
+    scrape_scope: str,
 ) -> dict:
+    run_started_at = time.perf_counter()
+    if scrape_scope not in SCRAPE_SCOPE_CHOICES:
+        raise ValueError(
+            f"Invalid scrape_scope '{scrape_scope}'. "
+            f"Choose one of: {', '.join(SCRAPE_SCOPE_CHOICES)}"
+        )
     username, password, mongodb_url, database_name = load_config()
     start_date, end_date = normalize_requested_range(start_date, end_date)
     chunks = build_search_chunks(start_date, end_date)
     print(
         f"[run] Starting area results scraper for start_date={start_date.isoformat()}, "
         f"end_date={end_date.isoformat()}, chunks={len(chunks)}, timeout={timeout}, "
-        f"headless={headless}, observe_seconds={observe_seconds}"
+        f"headless={headless}, observe_seconds={observe_seconds}, scope={scrape_scope}"
     )
     for index, chunk in enumerate(chunks, start=1):
         print(
@@ -1127,14 +1432,16 @@ def run(
 
     mongo_client, db = open_mongo_connection(mongodb_url, database_name)
     driver = None
+    storage_executor = ThreadPoolExecutor(max_workers=1)
+    run_succeeded = False
     try:
         driver = create_driver(headless=headless)
         login(driver, username, password, timeout=timeout)
         print(f"[2/7] Opening {AREA_RESULTS_URL}")
-        driver.get(AREA_RESULTS_URL)
-        wait_for_page_settle(driver, timeout=timeout, extra_delay=3.0)
+        open_area_results_page(driver, username, password, timeout=timeout)
 
         chunk_results = []
+        storage_jobs = []
         total_unconstrained_records = 0
         total_constrained_records = 0
         total_imported_unconstrained = 0
@@ -1147,21 +1454,30 @@ def run(
                 f"[run] Executing chunk {index}/{len(chunks)} with search date "
                 f"{chunk['search_date'].isoformat()}"
             )
-            chunk_result = scrape_area_results_for_search_date(
-                driver=driver,
-                search_date=chunk["search_date"],
-                chunk_start=chunk["chunk_start"],
-                chunk_end=chunk["chunk_end"],
-                timeout=timeout,
-                reopen_schedule=index > 1,
-            )
-            storage_result = store_results(
-                db,
-                chunk_result["unconstrained_records"],
-                chunk_result["constrained_records"],
-            )
+            for category_index, category_variant in enumerate(SCRAPE_VARIANTS[scrape_scope]):
+                category_result = scrape_area_results_for_search_date(
+                    driver=driver,
+                    search_date=chunk["search_date"],
+                    chunk_start=chunk["chunk_start"],
+                    chunk_end=chunk["chunk_end"],
+                    category_label=category_variant["category"],
+                    category_field_map=category_variant["fields"],
+                    timeout=timeout,
+                    reopen_schedule=index > 1 or category_index > 0,
+                    configure_static_fields=(category_index == 0),
+                )
+                storage_future = storage_executor.submit(
+                    store_results,
+                    db,
+                    category_result["unconstrained_records"],
+                    category_result["constrained_records"],
+                )
+                chunk_results.append(category_result)
+                storage_jobs.append((category_result, storage_future))
+
+        for chunk_result, storage_future in storage_jobs:
+            storage_result = storage_future.result()
             chunk_result["storage"] = storage_result
-            chunk_results.append(chunk_result)
 
             total_unconstrained_records += len(chunk_result["unconstrained_records"])
             total_constrained_records += len(chunk_result["constrained_records"])
@@ -1175,9 +1491,13 @@ def run(
             start_date,
             end_date,
         )
+        elapsed_seconds = time.perf_counter() - run_started_at
         result = {
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
+            "elapsed_seconds": round(elapsed_seconds, 2),
+            "scrape_scope": scrape_scope,
+            "categories_scraped": [variant["category"] for variant in SCRAPE_VARIANTS[scrape_scope]],
             "chunks": [
                 {
                     "chunk_start": chunk["chunk_start"].isoformat(),
@@ -1205,19 +1525,22 @@ def run(
             f"unconstrained imported={total_imported_unconstrained}, "
             f"constrained imported={total_imported_constrained}, "
             f"unconstrained skipped={total_skipped_unconstrained}, "
-            f"constrained skipped={total_skipped_constrained}"
+            f"constrained skipped={total_skipped_constrained}, "
+            f"elapsed={elapsed_seconds:.2f}s"
         )
         print(
             "[7/7] Delivery-date coverage: "
             f"both={coverage_summary['counts']['successful_both_dates']}, "
             f"constrained_only={coverage_summary['counts']['constrained_only_dates']}, "
             f"unconstrained_only={coverage_summary['counts']['unconstrained_only_dates']}, "
-            f"no_data={coverage_summary['counts']['no_data_dates']}"
+            f"no_data={coverage_summary['counts']['no_data_dates']}, "
+            f"elapsed={elapsed_seconds:.2f}s"
         )
-        print(f"[run] Final result summary: {result}")
+        run_succeeded = True
         return result
     finally:
-        if observe_seconds > 0:
+        storage_executor.shutdown(wait=True)
+        if not run_succeeded and observe_seconds > 0:
             print(f"Keeping browser open for {observe_seconds} seconds")
             time.sleep(observe_seconds)
         if driver is not None:
@@ -1228,7 +1551,7 @@ def run(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Standalone SAPP area results test scraper for constrained and unconstrained prices."
+        description="Standalone SAPP area results test scraper for DAM prices and volumes."
     )
     parser.add_argument(
         "--delivery-date",
@@ -1259,6 +1582,15 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Seconds to keep the browser open before closing.",
     )
+    parser.add_argument(
+        "--scrape-scope",
+        choices=SCRAPE_SCOPE_CHOICES,
+        default="prices",
+        help=(
+            "Choose which DAM categories to scrape: prices, volumes, or all "
+            "(prices + volumes)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1286,8 +1618,8 @@ def main():
         timeout=args.timeout,
         headless=args.headless,
         observe_seconds=args.observe_seconds,
+        scrape_scope=args.scrape_scope,
     )
-    print(result)
 
 
 if __name__ == "__main__":

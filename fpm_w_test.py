@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -42,9 +43,10 @@ MONGO_CONNECT_TIMEOUT_MS = 30000
 MONGO_SOCKET_TIMEOUT_MS = 30000
 MONGO_PING_RETRIES = 3
 MONGO_PING_RETRY_DELAY_SECONDS = 5
+BULK_WRITE_CHUNK_SIZE = 500
 
 
-def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 1.5) -> None:
+def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 0.75) -> None:
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") == "complete"
     )
@@ -125,6 +127,33 @@ def login(driver, username: str, password: str, timeout: int = 20) -> None:
 
 def format_delivery_day(value: date) -> str:
     return value.strftime("%Y/%m/%d")
+
+
+def open_area_results_page(
+    driver,
+    username: str,
+    password: str,
+    timeout: int = 20,
+) -> None:
+    login_page_detected = driver.current_url.startswith(LOGIN_URL) or bool(
+        driver.execute_script(
+            """
+            return Boolean(
+                document.querySelector("input[id='login-input-user-name-or-email-address']")
+                || document.querySelector("input[id='password']")
+            );
+            """
+        )
+    )
+
+    if login_page_detected:
+        print("🔐 [2/7] Session expired on turnover page; logging in again")
+        login(driver, username, password, timeout=timeout)
+
+    if AREA_RESULTS_URL not in driver.current_url:
+        driver.get(AREA_RESULTS_URL)
+
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
 
 
 def normalize_week_start(value: date) -> date:
@@ -422,7 +451,7 @@ def set_date_via_calendar(driver, label: str, value: str, timeout: int = 20) -> 
         lambda d: find_calendar_toggle(d, label)
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
-    time.sleep(0.3)
+    time.sleep(0.12)
     driver.execute_script("arguments[0].click();", toggle)
 
     calendar = WebDriverWait(driver, timeout).until(
@@ -456,7 +485,7 @@ def set_date_via_calendar(driver, label: str, value: str, timeout: int = 20) -> 
             break
 
         driver.execute_script("arguments[0].click();", nav_button)
-        time.sleep(0.4)
+        time.sleep(0.15)
         calendar = WebDriverWait(driver, timeout).until(
             lambda d: find_visible_calendar_popup(d)
         )
@@ -465,7 +494,7 @@ def set_date_via_calendar(driver, label: str, value: str, timeout: int = 20) -> 
         lambda d: click_calendar_day(d, calendar, target_date)
     )
     driver.execute_script("arguments[0].click();", day_button)
-    time.sleep(1.0)
+    time.sleep(0.3)
 
 
 def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> None:
@@ -478,7 +507,7 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
     for attempt in range(1, 4):
         print(f"  ↳ attempt {attempt}: typing")
         input_element.click()
-        time.sleep(0.5)
+        time.sleep(0.15)
         select_all_input_text(driver, input_element)
 
         for character in value:
@@ -486,7 +515,7 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
             time.sleep(0.12)
 
         input_element.send_keys(Keys.TAB)
-        time.sleep(1.0)
+        time.sleep(0.25)
 
         actual_value = read_input_value(driver, input_element)
         if actual_value == value:
@@ -503,7 +532,7 @@ def set_input_by_label(driver, label: str, value: str, timeout: int = 20) -> Non
             except Exception as exc:
                 print(f"  ⚠️ {label} calendar fallback failed: {exc}")
 
-        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.5)
+        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.2)
         input_element = WebDriverWait(driver, timeout).until(
             lambda d: find_field_input(d, label)
         )
@@ -521,7 +550,7 @@ def select_category(driver, value: str, timeout: int = 20) -> None:
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
     input_element.click()
-    time.sleep(0.5)
+    time.sleep(0.15)
     input_element.send_keys(Keys.CONTROL, "a")
     input_element.send_keys(value)
 
@@ -547,7 +576,7 @@ def select_category(driver, value: str, timeout: int = 20) -> None:
     except TimeoutException:
         input_element.send_keys(Keys.ENTER)
         input_element.send_keys(Keys.TAB)
-    time.sleep(1.0)
+    time.sleep(0.25)
 
 
 def find_constrained_toggle(driver):
@@ -619,7 +648,7 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
     wait_for_page_settle(driver, timeout=timeout)
     toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
-    time.sleep(0.5)
+    time.sleep(0.15)
     before_state = get_toggle_state(driver, toggle)
     should_click = before_state is not enabled
     if before_state is None and enabled is False:
@@ -657,8 +686,8 @@ def set_constrained_toggle(driver, enabled: bool, timeout: int = 20) -> None:
                 )(find_constrained_toggle(d))
             )
 
-        time.sleep(1.0)
-        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.75)
+        time.sleep(0.25)
+        wait_for_page_settle(driver, timeout=timeout, extra_delay=0.35)
 
     toggle = WebDriverWait(driver, timeout).until(find_constrained_toggle)
     after_state = get_toggle_state(driver, toggle)
@@ -710,7 +739,7 @@ def click_search(driver, timeout: int = 20) -> dict:
         button,
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-    time.sleep(0.5)
+    time.sleep(0.15)
     try:
         button.click()
         click_method = "selenium_click"
@@ -736,7 +765,7 @@ def click_search(driver, timeout: int = 20) -> dict:
             )
         )
     )
-    wait_for_page_settle(driver, timeout=timeout, extra_delay=2.0)
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=0.9)
     new_url = driver.current_url
     content_changed = (
         driver.execute_script("return document.body ? document.body.innerText.slice(0, 2000) : '';")
@@ -791,10 +820,10 @@ def click_select_schedule(driver, timeout: int = 20) -> None:
         button,
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-    time.sleep(0.5)
+    time.sleep(0.15)
     driver.execute_script("arguments[0].click();", button)
     WebDriverWait(driver, timeout).until(lambda d: find_field_input(d, "Delivery Week"))
-    wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=0.55)
 
 
 def extract_hourly_table(driver, dataset: str, timeout: int = 20) -> dict:
@@ -1203,11 +1232,18 @@ def upsert_hourly_records(
     if not operations:
         return {"imported": 0, "updated": 0, "skipped_existing": skipped_existing}
 
-    result = collection.bulk_write(operations, ordered=False)
+    imported = 0
+    updated = 0
+    for index in range(0, len(operations), BULK_WRITE_CHUNK_SIZE):
+        batch = operations[index : index + BULK_WRITE_CHUNK_SIZE]
+        result = collection.bulk_write(batch, ordered=False)
+        imported += result.upserted_count
+        updated += result.matched_count
+
     _strictly_verify_written_records(collection, data_source, records_to_write)
     summary = {
-        "imported": result.upserted_count,
-        "updated": result.matched_count,
+        "imported": imported,
+        "updated": updated,
         "skipped_existing": skipped_existing,
     }
     return summary
@@ -1435,6 +1471,7 @@ def run(
     headless: bool,
     observe_seconds: int,
 ) -> dict:
+    run_started_at = time.perf_counter()
     username, password, mongodb_url, database_name = load_config()
     start_date, end_date = normalize_requested_range(start_date, end_date)
     holiday_dates = _holiday_dates_for_range(
@@ -1456,15 +1493,16 @@ def run(
 
     mongo_client, db = open_mongo_connection(mongodb_url, database_name)
     driver = None
+    storage_executor = ThreadPoolExecutor(max_workers=1)
     run_succeeded = False
     try:
         driver = create_driver(headless=headless)
         login(driver, username, password, timeout=timeout)
         print(f"🌐 [2/7] Opening {AREA_RESULTS_URL}")
-        driver.get(AREA_RESULTS_URL)
-        wait_for_page_settle(driver, timeout=timeout, extra_delay=3.0)
+        open_area_results_page(driver, username, password, timeout=timeout)
 
         chunk_results = []
+        storage_jobs = []
         total_unconstrained_records = 0
         total_constrained_records = 0
         total_imported_unconstrained = 0
@@ -1474,6 +1512,7 @@ def run(
 
         for index, chunk in enumerate(chunks, start=1):
             print(f"⚙️ [run] chunk {index}/{len(chunks)}")
+            open_area_results_page(driver, username, password, timeout=timeout)
             chunk_result = scrape_area_results_for_search_date(
                 driver=driver,
                 search_date=chunk["search_date"],
@@ -1486,13 +1525,18 @@ def run(
                 weekstarts=chunk["weekstarts"],
                 holiday_dates=holiday_dates,
             )
-            storage_result = store_results(
+            chunk_results.append(chunk_result)
+            storage_future = storage_executor.submit(
+                store_results,
                 db,
                 chunk_result["unconstrained_records"],
                 chunk_result["constrained_records"],
             )
+            storage_jobs.append((chunk_result, storage_future))
+
+        for chunk_result, storage_future in storage_jobs:
+            storage_result = storage_future.result()
             chunk_result["storage"] = storage_result
-            chunk_results.append(chunk_result)
 
             total_unconstrained_records += len(chunk_result["unconstrained_records"])
             total_constrained_records += len(chunk_result["constrained_records"])
@@ -1506,9 +1550,11 @@ def run(
             start_date,
             end_date,
         )
+        elapsed_seconds = time.perf_counter() - run_started_at
         result = {
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
+            "elapsed_seconds": round(elapsed_seconds, 2),
             "chunks": [
                 {
                     "chunk_start": chunk["chunk_start"].isoformat(),
@@ -1533,17 +1579,19 @@ def run(
         }
         print(
             f"📦 [7/7] stored unconstrained={total_imported_unconstrained} "
-            f"constrained={total_imported_constrained}"
+            f"constrained={total_imported_constrained} elapsed={elapsed_seconds:.2f}s"
         )
         print(
             f"📈 [7/7] coverage both={coverage_summary['counts']['successful_both_dates']} "
             f"constrained_only={coverage_summary['counts']['constrained_only_dates']} "
             f"unconstrained_only={coverage_summary['counts']['unconstrained_only_dates']} "
-            f"no_data={coverage_summary['counts']['no_data_dates']}"
+            f"no_data={coverage_summary['counts']['no_data_dates']} "
+            f"elapsed={elapsed_seconds:.2f}s"
         )
         run_succeeded = True
         return result
     finally:
+        storage_executor.shutdown(wait=True)
         if not run_succeeded and observe_seconds > 0:
             print(f"🛑 keeping browser open for {observe_seconds}s")
             time.sleep(observe_seconds)

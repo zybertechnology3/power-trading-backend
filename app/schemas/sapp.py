@@ -561,6 +561,39 @@ class SappFpmMAreaResultsRangeResponse(BaseModel):
     records: list[SappFpmMAreaResultRecord] = Field(default_factory=list)
 
 
+class SappBmAtcResultRecord(BaseModel):
+    """Standalone BM ATC hourly row with dynamic column values."""
+
+    delivery_date: date
+    hour: int = Field(..., ge=1, le=24)
+    timestamp: datetime
+    hour_label: Optional[str] = None
+    product: Optional[str] = None
+    area: Optional[str] = None
+    column_values: dict[str, Optional[float]] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_file: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    id: Optional[str] = Field(None, alias="_id")
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+        extra = "allow"
+
+
+class SappBmAtcResultsRangeResponse(BaseModel):
+    """Standalone BM ATC hourly rows for a delivery date or range."""
+
+    market: Literal["bm"] = "bm"
+    delivery_date: Optional[date] = None
+    start_date: date
+    end_date: date
+    total: int
+    records: list[SappBmAtcResultRecord] = Field(default_factory=list)
+
+
 class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 

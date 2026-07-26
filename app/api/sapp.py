@@ -23,6 +23,8 @@ from app.core.config import settings
 from app.db.database import get_db
 from app.schemas.sapp import (
     BidStatus,
+    SappBmAtcResultRecord,
+    SappBmAtcResultsRangeResponse,
     SappDamAreaResultRecord,
     SappDamAreaResultsRangeResponse,
     SappFpmMAreaResultRecord,
@@ -92,6 +94,7 @@ STANDALONE_FPM_W_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RES
 STANDALONE_FPM_W_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
 STANDALONE_FPM_M_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_CONSTRAINED_PRICE_RESULTS"
 STANDALONE_FPM_M_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_UNCONSTRAINED_PRICE_RESULTS"
+STANDALONE_BM_ATC_DATA_SOURCE = "TSAM_BM_ATC_RESULTS"
 
 FREQUENCY_BUCKETS = {
     "4h": {"unit": "hour", "binSize": 4},
@@ -2071,6 +2074,84 @@ def get_fpm_m_area_results_for_range(
             SappFpmMAreaResultRecord(**record.model_dump())
             for record in _merge_dam_area_results(constrained_records, unconstrained_records)
         ],
+    )
+
+
+@router.get("/bm-atc-results", response_model=SappBmAtcResultsRangeResponse)
+def get_bm_atc_results_for_range(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Single delivery date to return. Use this or start_date/end_date.",
+    ),
+    start_date: Optional[date] = Query(
+        None,
+        description="First delivery date in the requested range.",
+    ),
+    end_date: Optional[date] = Query(
+        None,
+        description="Last delivery date in the requested range, inclusive.",
+    ),
+    area: Optional[str] = Query(
+        None,
+        description="Optional area filter. Defaults to all areas.",
+    ),
+):
+    """Return BM ATC hourly rows for a delivery date or range."""
+    if delivery_date:
+        if start_date or end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Use either delivery_date or start_date/end_date, not both",
+            )
+        normalized_start_date = delivery_date
+        normalized_end_date = delivery_date
+    else:
+        if not start_date and not end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide delivery_date or start_date/end_date",
+            )
+        normalized_start_date = start_date or end_date
+        normalized_end_date = end_date or start_date
+        if normalized_start_date is None or normalized_end_date is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide delivery_date or start_date/end_date",
+            )
+        if normalized_end_date < normalized_start_date:
+            raise HTTPException(
+                status_code=400,
+                detail="end_date must be greater than or equal to start_date",
+            )
+
+    db = get_db()
+    collection = db["sapp_bm_atc_results"]
+
+    query_filter = _build_sapp_time_filter(
+        delivery_date,
+        normalized_start_date,
+        normalized_end_date,
+        None,
+        None,
+    )
+    query_filter["metadata.data_source"] = STANDALONE_BM_ATC_DATA_SOURCE
+    if area:
+        query_filter["area"] = area
+
+    records = [
+        _serialize_result(record)
+        for record in collection.find(query_filter).sort(
+            [("delivery_date", 1), ("hour", 1), ("area", 1)]
+        )
+    ]
+
+    return SappBmAtcResultsRangeResponse(
+        market="bm",
+        delivery_date=delivery_date,
+        start_date=normalized_start_date,
+        end_date=normalized_end_date,
+        total=len(records),
+        records=[SappBmAtcResultRecord(**record) for record in records],
     )
 
 
