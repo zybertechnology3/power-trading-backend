@@ -1573,6 +1573,7 @@ def scrape_sapp_results(
             return run_portfolio_extraction_bundle(
                 delivery_date=delivery_date,
                 page_start=page_start,
+                headless=True,
             )
         requested_job_names = _scrape_job_names_for_request(job_name)
         results = [
@@ -1580,6 +1581,7 @@ def scrape_sapp_results(
                 get_extraction_job(requested_job_name),
                 delivery_date=delivery_date,
                 page_start=page_start,
+                headless=True,
             )
             for requested_job_name in requested_job_names
         ]
@@ -1641,6 +1643,7 @@ def scrape_sapp_results_for_date_range(
                 end_date=end_date,
                 continue_on_error=continue_on_error,
                 page_start=page_start,
+                headless=True,
             )
         requested_job_names = _scrape_job_names_for_request(job_name)
         range_results = [
@@ -1650,6 +1653,7 @@ def scrape_sapp_results_for_date_range(
                 end_date=end_date,
                 continue_on_error=continue_on_error,
                 page_start=page_start,
+                headless=True,
             )
             for requested_job_name in requested_job_names
         ]
@@ -2256,6 +2260,7 @@ def scrape_participant_portfolio_results(
         return run_portfolio_extraction_bundle(
             delivery_date=delivery_date,
             page_start=page_start,
+            headless=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2288,6 +2293,7 @@ def scrape_participant_portfolio_results_for_date_range(
             end_date=end_date,
             continue_on_error=continue_on_error,
             page_start=page_start,
+            headless=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2393,6 +2399,7 @@ def scrape_trading_invoice_credit_note(
             job,
             delivery_date=delivery_date,
             page_start=page_start,
+            headless=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2428,6 +2435,7 @@ def scrape_trading_invoice_credit_notes_for_date_range(
             end_date=end_date,
             continue_on_error=continue_on_error,
             page_start=page_start,
+            headless=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -186,9 +186,6 @@ def open_area_results_page(
     password: str,
     timeout: int = 20,
 ) -> None:
-    driver.get(AREA_RESULTS_URL)
-    wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
-
     login_page_detected = driver.current_url.startswith(LOGIN_URL) or bool(
         driver.execute_script(
             """
@@ -202,6 +199,23 @@ def open_area_results_page(
 
     if login_page_detected:
         print("[2/7] Session expired on turnover page; logging in again")
+        login(driver, username, password, timeout=timeout)
+
+    if AREA_RESULTS_URL not in driver.current_url:
+        driver.get(AREA_RESULTS_URL)
+    wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)
+
+    if driver.current_url.startswith(LOGIN_URL) or bool(
+        driver.execute_script(
+            """
+            return Boolean(
+                document.querySelector("input[id='login-input-user-name-or-email-address']")
+                || document.querySelector("input[id='password']")
+            );
+            """
+        )
+    ):
+        print("[2/7] Redirected back to login; authenticating again")
         login(driver, username, password, timeout=timeout)
         driver.get(AREA_RESULTS_URL)
         wait_for_page_settle(driver, timeout=timeout, extra_delay=1.5)

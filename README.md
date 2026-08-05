@@ -25,17 +25,18 @@ docker build -t power-trading-backend .
 docker run --rm --name power-trading-backend --env-file .env -p 8000:8000 power-trading-backend
 ```
 
-## Scraping Deployment Note
+## Render / Deployment Note
 
-Run SAPP scraping locally, not on the deployed server.
+The backend can be deployed on Render using the included Dockerfile.
 
-The scraping endpoints start Selenium, Firefox, and geckodriver. That browser stack needs more memory than the current hosted server can reliably provide, so server-side scraping may fail with memory limit restarts or browser startup errors. The deployed server should be used to serve already-imported data from MongoDB.
+The scraping endpoints run Selenium, Firefox, and geckodriver in headless mode on the server. That means the deployed API can be used both to scrape and to serve already-imported MongoDB data, provided the Render service has enough memory and time for the request.
 
 Recommended workflow:
 
-1. Run scraping locally against the same MongoDB database.
-2. Let the scraper upsert the extracted records into MongoDB.
-3. Use the deployed API for reading SAPP constrained area results.
+1. Deploy the Docker image to Render as a web service.
+2. Set the MongoDB and SAPP credentials as Render environment variables.
+3. Call the scrape endpoints remotely when you want the server to import fresh data.
+4. Use the read endpoints for charting and API access.
 
 ## Environment Variables
 

@@ -14,7 +14,7 @@ import httpx
 from app.core.config import settings
 from app.core.time_of_use import get_time_of_use_period
 from dotenv import load_dotenv
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -44,7 +44,7 @@ MONGO_CONNECT_TIMEOUT_MS = 30000
 MONGO_SOCKET_TIMEOUT_MS = 30000
 MONGO_PING_RETRIES = 3
 MONGO_PING_RETRY_DELAY_SECONDS = 5
-BULK_WRITE_CHUNK_SIZE = 500
+DB_WRITE_BATCH_SIZE = 2000
 
 
 def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 0.75) -> None:
@@ -954,7 +954,9 @@ def enrich_hourly_records(
 
     for monthstart in planned_monthstarts:
         target_month_text = monthstart.isoformat()
-        target_month_prices = monthly_prices[target_month_text]
+        target_month_prices = monthly_prices.get(target_month_text)
+        if target_month_prices is None:
+            continue
         days_in_month = calendar.monthrange(monthstart.year, monthstart.month)[1]
         for offset in range(days_in_month):
             delivery_day = monthstart + timedelta(days=offset)
@@ -984,7 +986,11 @@ def enrich_hourly_records(
                 )
 
     print(f"  ✓ expanded {len(enriched_records)} {dataset} hourly rows")
-    return enriched_records
+    return enriched_records, {
+        "expected_monthstarts": [monthstart.isoformat() for monthstart in planned_monthstarts],
+        "missing_monthstarts": missing_monthstarts,
+        "returned_monthstarts": sorted(monthly_prices.keys()),
+    }
 
 
 def build_search_chunks(start_date: date, end_date: date) -> list[dict]:
@@ -1034,34 +1040,44 @@ def validate_returned_dates_for_chunk(
     returned_dates: list[str],
     chunk_start: date,
     chunk_end: date,
-) -> None:
+) -> dict:
     expected_dates = expected_chunk_dates(chunk_start, chunk_end)
     if not returned_dates:
-        raise RuntimeError(
-            f"{dataset} search for chunk {chunk_start.isoformat()} to "
+        missing_dates = expected_dates
+        unexpected_dates = []
+        print(
+            f"  ⚠️ {dataset}: search for chunk {chunk_start.isoformat()} to "
             f"{chunk_end.isoformat()} returned no dates."
         )
+        return {
+            "expected_dates": expected_dates,
+            "returned_dates": returned_dates,
+            "missing_dates": missing_dates,
+            "unexpected_dates": unexpected_dates,
+        }
 
     returned_date_set = set(returned_dates)
     expected_date_set = set(expected_dates)
     unexpected_dates = sorted(returned_date_set - expected_date_set)
     missing_dates = sorted(expected_date_set - returned_date_set)
 
-    if missing_dates:
-        raise RuntimeError(
-            f"{dataset} search missed expected dates for chunk "
-            f"{chunk_start.isoformat()} to {chunk_end.isoformat()}. "
-            f"Returned={returned_dates}, missing={missing_dates or 'none'}, "
-            f"unexpected={unexpected_dates or 'none'}."
-        )
-
     print(
         f"  ✓ {dataset}: covers {chunk_start.isoformat()} → {chunk_end.isoformat()}"
     )
+    if missing_dates:
+        print(
+            f"  ⚠️ {dataset}: missing dates for chunk {missing_dates}"
+        )
     if unexpected_dates:
         print(
             f"  ℹ️ {dataset}: extra dates outside chunk {unexpected_dates}"
         )
+    return {
+        "expected_dates": expected_dates,
+        "returned_dates": returned_dates,
+        "missing_dates": missing_dates,
+        "unexpected_dates": unexpected_dates,
+    }
 
 
 def normalize_requested_range(start_date: date, end_date: date) -> tuple[date, date]:
@@ -1098,9 +1114,7 @@ def filter_existing_records(collection, records: list[dict]) -> tuple[list[dict]
             f"for {collection.full_name}"
         )
 
-    print(
-        f"💾 [db] Preparing {len(unique_records)} rows in {collection.full_name}"
-    )
+    print(f"💾 [db] Preparing {len(unique_records)} rows for {collection.full_name}")
     return unique_records, 0
 
 
@@ -1188,10 +1202,12 @@ def upsert_hourly_records(
     dataset: str,
     records: list[dict],
     now: datetime,
+    delete_start_date: date | None = None,
+    delete_end_date: date | None = None,
 ) -> dict:
     records_to_write, skipped_existing = filter_existing_records(collection, records)
     print(
-        f"💾 [db] {dataset}: preparing {len(records_to_write)} hourly rows for "
+        f"💾 [db] {dataset}: replacing {len(records_to_write)} hourly rows in "
         f"{collection.full_name}"
     )
     if dataset == "constrained":
@@ -1201,63 +1217,65 @@ def upsert_hourly_records(
         data_source = UNCONSTRAINED_DATA_SOURCE
         field_name = "price_usd_per_mwh"
 
-    operations = []
+    if delete_start_date is None or delete_end_date is None:
+        delivery_dates = sorted({record["delivery_date"] for record in records_to_write})
+        if delivery_dates:
+            delete_start_date = delete_start_date or date.fromisoformat(delivery_dates[0])
+            delete_end_date = delete_end_date or date.fromisoformat(delivery_dates[-1])
+
+    if delete_start_date is not None and delete_end_date is not None:
+        delete_result = collection.delete_many(
+            {
+                "delivery_date": {
+                    "$gte": delete_start_date.isoformat(),
+                    "$lte": delete_end_date.isoformat(),
+                },
+                "metadata.data_source": data_source,
+            }
+        )
+    else:
+        delete_result = collection.delete_many({"metadata.data_source": data_source})
+
+    documents = []
     for record in records_to_write:
-        operations.append(
-            UpdateOne(
-                {
-                    "delivery_date": record["delivery_date"],
-                    "hour": record["hour"],
+        documents.append(
+            {
+                "timestamp": delivery_timestamp(record["delivery_date"], record["hour"]),
+                "delivery_date": record["delivery_date"],
+                "hour": record["hour"],
+                "hour_label": record["hour_label"],
+                "product": record["product"],
+                field_name: record["value"],
+                "search_delivery_date": record["search_delivery_date"],
+                "window_start_date": record["window_start_date"],
+                "window_end_date": record["window_end_date"],
+                "window_offset_days": record["window_offset_days"],
+                "category": record["category"],
+                "metadata": {
+                    "data_source": data_source,
+                    "source_page": AREA_RESULTS_URL,
+                    "category": record["category"],
+                    "search_delivery_date": record["search_delivery_date"],
+                    "window_start_date": record["window_start_date"],
+                    "window_end_date": record["window_end_date"],
+                    "window_offset_days": record["window_offset_days"],
                 },
-                {
-                    "$set": {
-                        "timestamp": delivery_timestamp(record["delivery_date"], record["hour"]),
-                        "delivery_date": record["delivery_date"],
-                        "hour": record["hour"],
-                        "hour_label": record["hour_label"],
-                        "product": record["product"],
-                        field_name: record["value"],
-                        "search_delivery_date": record["search_delivery_date"],
-                        "window_start_date": record["window_start_date"],
-                        "window_end_date": record["window_end_date"],
-                        "window_offset_days": record["window_offset_days"],
-                        "category": record["category"],
-                        "metadata": {
-                            "data_source": data_source,
-                            "source_page": AREA_RESULTS_URL,
-                            "category": record["category"],
-                            "search_delivery_date": record["search_delivery_date"],
-                            "window_start_date": record["window_start_date"],
-                            "window_end_date": record["window_end_date"],
-                            "window_offset_days": record["window_offset_days"],
-                        },
-                        "source_file": None,
-                        "updated_at": now,
-                    },
-                    "$setOnInsert": {
-                        "created_at": now,
-                    },
-                },
-                upsert=True,
-            )
+                "source_file": None,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
 
-    if not operations:
-        return {"imported": 0, "updated": 0, "skipped_existing": skipped_existing}
-
-    imported = 0
-    updated = 0
-    for index in range(0, len(operations), BULK_WRITE_CHUNK_SIZE):
-        batch = operations[index : index + BULK_WRITE_CHUNK_SIZE]
-        result = collection.bulk_write(batch, ordered=False)
-        imported += result.upserted_count
-        updated += result.matched_count
+    if documents:
+        for index in range(0, len(documents), DB_WRITE_BATCH_SIZE):
+            batch = documents[index : index + DB_WRITE_BATCH_SIZE]
+            collection.insert_many(batch, ordered=False)
 
     _strictly_verify_written_records(collection, data_source, records_to_write)
     summary = {
-        "imported": imported,
-        "updated": updated,
-        "skipped_existing": skipped_existing,
+        "imported": len(documents),
+        "updated": delete_result.deleted_count,
+        "skipped_existing": 0,
     }
     return summary
 
@@ -1317,7 +1335,7 @@ def open_mongo_connection(mongodb_url: str, database_name: str):
         connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
         socketTimeoutMS=MONGO_SOCKET_TIMEOUT_MS,
         retryWrites=True,
-        maxPoolSize=1,
+        maxPoolSize=4,
     )
     _ping_mongo_with_retry(client, database_name)
     print(f"🗄️ [db] Connected to MongoDB database {database_name}")
@@ -1333,20 +1351,36 @@ def store_results(
     db,
     unconstrained_records: list[dict],
     constrained_records: list[dict],
+    delete_start_date: date | None = None,
+    delete_end_date: date | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc)
-    unconstrained_result = upsert_hourly_records(
-        db[UNCONSTRAINED_COLLECTION],
-        "unconstrained",
-        unconstrained_records,
-        now,
-    )
-    constrained_result = upsert_hourly_records(
-        db[CONSTRAINED_COLLECTION],
-        "constrained",
-        constrained_records,
-        now,
-    )
+    all_records = unconstrained_records + constrained_records
+    if all_records:
+        record_dates = sorted({record["delivery_date"] for record in all_records})
+        delete_start_date = date.fromisoformat(record_dates[0])
+        delete_end_date = date.fromisoformat(record_dates[-1])
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        unconstrained_future = executor.submit(
+            upsert_hourly_records,
+            db[UNCONSTRAINED_COLLECTION],
+            "unconstrained",
+            unconstrained_records,
+            now,
+            delete_start_date,
+            delete_end_date,
+        )
+        constrained_future = executor.submit(
+            upsert_hourly_records,
+            db[CONSTRAINED_COLLECTION],
+            "constrained",
+            constrained_records,
+            now,
+            delete_start_date,
+            delete_end_date,
+        )
+        unconstrained_result = unconstrained_future.result()
+        constrained_result = constrained_future.result()
     summary = {
         "database": db.name,
         "unconstrained": unconstrained_result,
@@ -1442,6 +1476,7 @@ def scrape_area_results_for_search_date(
 
     tables: dict[str, dict] = {}
     records: dict[str, list[dict]] = {}
+    validation: dict[str, dict] = {}
 
     for step_index, (dataset_name, toggle_state) in enumerate(click_order):
         if step_index > 0:
@@ -1449,14 +1484,14 @@ def scrape_area_results_for_search_date(
         set_constrained_toggle(driver, toggle_state, timeout=timeout)
         click_search(driver, timeout=timeout)
         table = extract_hourly_table(driver, dataset_name, timeout=timeout)
-        validate_returned_dates_for_chunk(
+        validation[dataset_name] = validate_returned_dates_for_chunk(
             dataset_name,
             table["returned_dates"],
             chunk_start,
             chunk_end,
         )
         tables[dataset_name] = table
-        records[dataset_name] = enrich_hourly_records(
+        records[dataset_name], validation[dataset_name]["monthstart_validation"] = enrich_hourly_records(
             dataset_name,
             table["monthly_records"],
             delivery_month_start,
@@ -1474,6 +1509,7 @@ def scrape_area_results_for_search_date(
         },
         "unconstrained_records": records["unconstrained"],
         "constrained_records": records["constrained"],
+        "validation": validation,
     }
 
 
@@ -1522,6 +1558,8 @@ def run(
         total_imported_constrained = 0
         total_skipped_unconstrained = 0
         total_skipped_constrained = 0
+        missing_monthstarts_by_dataset = {"unconstrained": [], "constrained": []}
+        missing_returned_dates_by_dataset = {"unconstrained": [], "constrained": []}
 
         for index, chunk in enumerate(chunks, start=1):
             print(f"⚙️ [run] chunk {index}/{len(chunks)}")
@@ -1544,6 +1582,8 @@ def run(
                 db,
                 chunk_result["unconstrained_records"],
                 chunk_result["constrained_records"],
+                chunk["chunk_start"],
+                chunk["chunk_end"],
             )
             storage_jobs.append((chunk_result, storage_future))
 
@@ -1557,6 +1597,16 @@ def run(
             total_imported_constrained += storage_result["constrained"]["imported"]
             total_skipped_unconstrained += storage_result["unconstrained"]["skipped_existing"]
             total_skipped_constrained += storage_result["constrained"]["skipped_existing"]
+            for dataset_name in ("unconstrained", "constrained"):
+                dataset_validation = chunk_result.get("validation", {}).get(dataset_name, {})
+                missing_returned_dates_by_dataset[dataset_name].extend(
+                    dataset_validation.get("missing_dates", [])
+                )
+                missing_monthstarts_by_dataset[dataset_name].extend(
+                    dataset_validation.get("monthstart_validation", {}).get(
+                        "missing_monthstarts", []
+                    )
+                )
 
         coverage_summary = summarize_delivery_date_coverage(
             chunk_results,
@@ -1600,6 +1650,16 @@ def run(
             f"unconstrained_only={coverage_summary['counts']['unconstrained_only_dates']} "
             f"no_data={coverage_summary['counts']['no_data_dates']} "
             f"elapsed={elapsed_seconds:.2f}s"
+        )
+        print(
+            f"⚠️ [7/7] missing returned dates: "
+            f"unconstrained={sorted(set(missing_returned_dates_by_dataset['unconstrained']))}, "
+            f"constrained={sorted(set(missing_returned_dates_by_dataset['constrained']))}"
+        )
+        print(
+            f"⚠️ [7/7] missing monthstarts: "
+            f"unconstrained={sorted(set(missing_monthstarts_by_dataset['unconstrained']))}, "
+            f"constrained={sorted(set(missing_monthstarts_by_dataset['constrained']))}"
         )
         run_succeeded = True
         return result

@@ -576,14 +576,26 @@ def load_config():
     return username, password
 
 
-def create_driver(download_dir: Path, headless: bool = False):
+def _default_headless_mode() -> bool:
+    if os.getenv("HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if os.getenv("RENDER") or os.getenv("CI"):
+        return True
+    return os.name != "nt" and not os.getenv("DISPLAY")
+
+
+def create_driver(download_dir: Path, headless: Optional[bool] = None):
     download_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[2/7] 🔧 Creating Firefox driver and setting download folder to: {download_dir}")
+    headless_mode = _default_headless_mode() if headless is None else headless
+    print(
+        f"[2/7] 🔧 Creating Firefox driver (headless={headless_mode}) and setting "
+        f"download folder to: {download_dir}"
+    )
 
     options = Options()
     options.add_argument("--width=1366")
     options.add_argument("--height=900")
-    if headless:
+    if headless_mode:
         options.add_argument("-headless")
         options.headless = True
     options.set_preference("browser.download.folderList", 2)
@@ -597,7 +609,7 @@ def create_driver(download_dir: Path, headless: bool = False):
     options.set_preference("browser.download.manager.focusWhenStarting", False)
     options.set_preference("browser.shell.checkDefaultBrowser", False)
 
-    if headless:
+    if headless_mode:
         os.environ["MOZ_HEADLESS"] = "1"
     else:
         os.environ.pop("MOZ_HEADLESS", None)
@@ -1287,7 +1299,7 @@ def run_area_results_test(
     username, password = load_config()
     with tempfile.TemporaryDirectory(prefix="sapp-area-results-test-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
-        driver = create_driver(download_dir, headless=False)
+        driver = create_driver(download_dir)
         try:
             login(driver, username, password)
             print(f"[4/7] Navigating directly to area results test URL: {AREA_RESULTS_TEST_URL}")
@@ -2632,6 +2644,7 @@ def run_extraction_job(
     job: SappExtractionJob,
     delivery_date: Optional[date] = None,
     page_start: int = 1,
+    headless: Optional[bool] = None,
 ) -> dict:
     delivery_date = delivery_date or datetime.now().date()
     if page_start < 1:
@@ -2674,6 +2687,7 @@ def run_extraction_job_for_date_range(
     end_date: date,
     continue_on_error: bool = True,
     page_start: int = 1,
+    headless: Optional[bool] = None,
 ) -> dict:
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
@@ -2825,6 +2839,7 @@ def run_extraction_job_for_date_range(
 def run_portfolio_extraction_bundle(
     delivery_date: Optional[date] = None,
     page_start: int = 1,
+    headless: Optional[bool] = None,
 ) -> dict:
     delivery_date = delivery_date or datetime.now().date()
     if page_start < 1:
@@ -2842,7 +2857,7 @@ def run_portfolio_extraction_bundle(
 
     with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
-        driver = create_driver(download_dir)
+        driver = create_driver(download_dir, headless=headless)
         try:
             login(driver, username, password)
             navigate_to_inbox(driver)
@@ -2951,6 +2966,7 @@ def run_portfolio_extraction_bundle_for_date_range(
     end_date: date,
     continue_on_error: bool = True,
     page_start: int = 1,
+    headless: Optional[bool] = None,
 ) -> dict:
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
@@ -2969,7 +2985,7 @@ def run_portfolio_extraction_bundle_for_date_range(
 
     with tempfile.TemporaryDirectory(prefix="sapp-download-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
-        driver = create_driver(download_dir)
+        driver = create_driver(download_dir, headless=headless)
         try:
             login(driver, username, password)
             navigate_to_inbox(driver)

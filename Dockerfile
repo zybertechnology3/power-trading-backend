@@ -11,6 +11,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     firefox-esr \
     wget \
     ca-certificates \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libdbus-glib-1-2 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libu2f-udev \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
+    libxshmfence1 \
+    libxcb1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
