@@ -26,6 +26,19 @@ class Settings(BaseSettings):
     # External public calendar APIs
     PUBLIC_HOLIDAYS_API_BASE_URL: str = "https://date.nager.at/api/v3"
 
+    # Scrape scheduler configuration
+    SCRAPE_SCHEDULER_ENABLED: bool = False
+    SCRAPE_SCHEDULER_TIMEZONE: str = "Africa/Lusaka"
+    SCRAPE_SCHEDULER_POLL_SECONDS: int = 30
+    SCRAPE_SCHEDULES_JSON: str = "[]"
+
+    @field_validator("SCRAPE_SCHEDULER_TIMEZONE", mode="before")
+    @classmethod
+    def normalize_scrape_scheduler_timezone(cls, value):
+        if isinstance(value, str) and value.strip().upper() == "CAT":
+            return "Africa/Lusaka"
+        return value
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug_value(cls, value):

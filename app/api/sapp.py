@@ -4,12 +4,12 @@ SAPP MTP constrained area result endpoints.
 
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import httpx
 from bson.errors import InvalidId
 from bson.objectid import ObjectId
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Body, HTTPException, Query, status
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pydantic import ValidationError
@@ -66,6 +66,18 @@ from sapp_scraper import (
     run_extraction_job_for_date_range,
     run_portfolio_extraction_bundle,
     run_portfolio_extraction_bundle_for_date_range,
+)
+from bm_atc_test_scraper import run as run_bm_atc_standalone
+from area_results_test_scraper import run as run_dam_standalone
+from fpm_w_test import run as run_fpm_w_standalone
+from fpm_m_test import run as run_fpm_m_standalone
+from app.services.scrape_scheduler import (
+    get_scrape_job_run,
+    get_scrape_scheduler_status,
+    list_scrape_job_runs,
+    list_supported_scrape_jobs,
+    reload_scrape_scheduler,
+    trigger_scrape_job,
 )
 
 router = APIRouter(prefix="/sapp", tags=["sapp"])
@@ -1497,6 +1509,66 @@ def list_scrape_jobs():
     }
 
 
+@router.get("/scheduled-scrapes")
+def get_scheduled_scrapes_status():
+    """Get the backend scrape scheduler status and recent runs."""
+    return get_scrape_scheduler_status()
+
+
+@router.get("/scheduled-scrapes/jobs")
+def list_scheduled_scrape_jobs():
+    """List scrape jobs that can be scheduled or triggered manually."""
+    return {"jobs": list_supported_scrape_jobs()}
+
+
+@router.post("/scheduled-scrapes/trigger")
+def trigger_scheduled_scrape_job(
+    job_name: str = Query(..., description="Job name to run."),
+    params: dict[str, Any] = Body(default_factory=dict),
+):
+    """Queue a scrape job to run in the backend."""
+    try:
+        return trigger_scrape_job(job_name, params=params, trigger_source="manual")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/scheduled-scrapes/reload")
+def reload_scheduled_scrape_jobs():
+    """Reload scheduled scrape definitions from the environment."""
+    try:
+        return {"jobs": reload_scrape_scheduler()}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/scheduled-scrapes/runs")
+def list_scheduled_scrape_runs(
+    job_name: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List recent backend scrape runs."""
+    return {
+        "runs": list_scrape_job_runs(
+            job_name=job_name,
+            status=status_filter,
+            limit=limit,
+        )
+    }
+
+
+@router.get("/scheduled-scrapes/runs/{run_id}")
+def get_scheduled_scrape_run(run_id: str):
+    """Get one backend scrape run."""
+    try:
+        return get_scrape_job_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Scrape run not found")
+
+
 @router.post(
     "/area-results-test",
     summary="Test the new SAPP area results navigation flow locally",
@@ -1533,6 +1605,197 @@ def area_results_test(
             target_text=target_text,
             timeout=timeout,
             delivery_date=delivery_date,
+            headless=True,
+            observe_seconds=0,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/standalone/bm-atc/scrape",
+    summary="Scrape BM ATC data using the standalone BM scraper",
+)
+def scrape_bm_atc_standalone(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Single delivery day to fetch. Defaults to today if omitted.",
+    ),
+    start_date: Optional[date] = Query(
+        None,
+        description="First delivery day in the requested range.",
+    ),
+    end_date: Optional[date] = Query(
+        None,
+        description="Last delivery day in the requested range, inclusive.",
+    ),
+    area: str = Query(
+        "All Areas",
+        description="Area to scrape, for example All Areas.",
+    ),
+    timeout: int = Query(
+        20,
+        ge=1,
+        le=120,
+        description="Selenium wait timeout in seconds.",
+    ),
+    debug: bool = Query(
+        False,
+        description="Enable live debug logging while the scraper runs.",
+    ),
+):
+    try:
+        return run_bm_atc_standalone(
+            delivery_date=delivery_date,
+            start_date=start_date,
+            end_date=end_date,
+            area=area,
+            timeout=timeout,
+            headless=True,
+            observe_seconds=0,
+            debug=debug,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/standalone/dam-area-results/scrape",
+    summary="Scrape DAM constrained/unconstrained data using the standalone scraper",
+)
+def scrape_dam_area_results_standalone(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Single delivery day to fetch. Defaults to today if omitted.",
+    ),
+    start_date: Optional[date] = Query(
+        None,
+        description="First delivery day in the requested range.",
+    ),
+    end_date: Optional[date] = Query(
+        None,
+        description="Last delivery day in the requested range, inclusive.",
+    ),
+    timeout: int = Query(
+        20,
+        ge=1,
+        le=120,
+        description="Selenium wait timeout in seconds.",
+    ),
+    scrape_scope: str = Query(
+        "all",
+        description="Choose prices, volumes, or all.",
+    ),
+):
+    if start_date is not None:
+        normalized_start_date = start_date
+        normalized_end_date = end_date or (start_date + timedelta(days=6))
+    else:
+        normalized_delivery_date = delivery_date or date.today()
+        normalized_start_date = normalized_delivery_date
+        normalized_end_date = normalized_delivery_date
+    try:
+        return run_dam_standalone(
+            start_date=normalized_start_date,
+            end_date=normalized_end_date,
+            timeout=timeout,
+            headless=True,
+            observe_seconds=0,
+            scrape_scope=scrape_scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/standalone/fpm-w/scrape",
+    summary="Scrape FPM-W data using the standalone weekly scraper",
+)
+def scrape_fpm_w_standalone(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Single delivery date to fetch. Defaults to today if omitted.",
+    ),
+    start_date: Optional[date] = Query(
+        None,
+        description="First delivery week start to fetch.",
+    ),
+    end_date: Optional[date] = Query(
+        None,
+        description="Last delivery week start to fetch, inclusive.",
+    ),
+    timeout: int = Query(
+        20,
+        ge=1,
+        le=120,
+        description="Selenium wait timeout in seconds.",
+    ),
+):
+    if start_date is not None:
+        normalized_start_date = start_date
+        normalized_end_date = end_date or (start_date + timedelta(days=6))
+    else:
+        normalized_delivery_date = delivery_date or date.today()
+        normalized_start_date = normalized_delivery_date
+        normalized_end_date = normalized_delivery_date
+    try:
+        return run_fpm_w_standalone(
+            start_date=normalized_start_date,
+            end_date=normalized_end_date,
+            timeout=timeout,
+            headless=True,
+            observe_seconds=0,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/standalone/fpm-m/scrape",
+    summary="Scrape FPM-M data using the standalone monthly scraper",
+)
+def scrape_fpm_m_standalone(
+    delivery_date: Optional[date] = Query(
+        None,
+        description="Single delivery date to fetch. Defaults to today if omitted.",
+    ),
+    start_date: Optional[date] = Query(
+        None,
+        description="First delivery month start to fetch.",
+    ),
+    end_date: Optional[date] = Query(
+        None,
+        description="Last delivery month start to fetch, inclusive.",
+    ),
+    timeout: int = Query(
+        20,
+        ge=1,
+        le=120,
+        description="Selenium wait timeout in seconds.",
+    ),
+):
+    if start_date is not None:
+        normalized_start_date = start_date
+        normalized_end_date = end_date or (start_date + timedelta(days=6))
+    else:
+        normalized_delivery_date = delivery_date or date.today()
+        normalized_start_date = normalized_delivery_date
+        normalized_end_date = normalized_delivery_date
+    try:
+        return run_fpm_m_standalone(
+            start_date=normalized_start_date,
+            end_date=normalized_end_date,
+            timeout=timeout,
+            headless=True,
+            observe_seconds=0,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

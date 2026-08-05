@@ -38,6 +38,18 @@ Recommended workflow:
 3. Call the scrape endpoints remotely when you want the server to import fresh data.
 4. Use the read endpoints for charting and API access.
 
+If you enable the backend scheduler, keep the app on a single worker/process and set:
+
+```text
+SCRAPE_SCHEDULER_ENABLED=true
+SCRAPE_SCHEDULER_TIMEZONE=CAT
+SCRAPE_SCHEDULER_POLL_SECONDS=30
+SCRAPE_SCHEDULES_JSON=[...]
+```
+
+The scheduler runs inside the FastAPI process, so it should not be paired with multiple Uvicorn workers.
+`CAT` is normalized to Zambia time (`Africa/Lusaka`).
+
 ## Environment Variables
 
 ```text
@@ -56,6 +68,11 @@ SAPP_PASSWORD=
 GET  /health
 GET  /health/db
 GET  /sapp/scrape-jobs
+GET  /sapp/scheduled-scrapes
+GET  /sapp/scheduled-scrapes/jobs
+POST /sapp/scheduled-scrapes/trigger
+GET  /sapp/scheduled-scrapes/runs
+GET  /sapp/scheduled-scrapes/runs/{run_id}
 POST /sapp/scrape
 POST /sapp/scrape-range
 GET  /sapp/public-holidays

@@ -1295,11 +1295,14 @@ def run_area_results_test(
     target_text: Optional[str] = None,
     timeout: int = 20,
     delivery_date: Optional[date] = None,
+    headless: Optional[bool] = None,
+    observe_seconds: int = 30,
 ) -> dict:
     username, password = load_config()
+    run_succeeded = False
     with tempfile.TemporaryDirectory(prefix="sapp-area-results-test-") as temp_download_dir:
         download_dir = Path(temp_download_dir)
-        driver = create_driver(download_dir)
+        driver = create_driver(download_dir, headless=headless)
         try:
             login(driver, username, password)
             print(f"[4/7] Navigating directly to area results test URL: {AREA_RESULTS_TEST_URL}")
@@ -1329,7 +1332,7 @@ def run_area_results_test(
                 constrained=True,
                 timeout=timeout,
             )
-            return {
+            result = {
                 "status": "success",
                 "target_text": target_text,
                 "target_url": AREA_RESULTS_TEST_URL,
@@ -1344,8 +1347,11 @@ def run_area_results_test(
                 "current_url": driver.current_url,
                 "title": driver.title,
             }
+            run_succeeded = True
+            return result
         finally:
-            time.sleep(30)
+            if not run_succeeded and observe_seconds > 0:
+                time.sleep(observe_seconds)
             driver.quit()
 
 

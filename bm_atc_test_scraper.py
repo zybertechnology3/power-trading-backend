@@ -60,6 +60,14 @@ def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 0.75) -
     time.sleep(extra_delay)
 
 
+def _default_headless_mode() -> bool:
+    if os.getenv("HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if os.getenv("RENDER") or os.getenv("CI"):
+        return True
+    return os.name != "nt" and not os.getenv("DISPLAY")
+
+
 def load_config() -> tuple[str, str, str, str]:
     env_path = Path(__file__).resolve().parent / ".env"
     print(f"[config] Loading configuration from {env_path}")
@@ -85,12 +93,13 @@ def load_config() -> tuple[str, str, str, str]:
     return username, password, mongodb_url, database_name
 
 
-def create_driver(headless: bool = False):
-    print(f"[driver] Creating Firefox driver with headless={headless}")
+def create_driver(headless: Optional[bool] = None):
+    headless_mode = _default_headless_mode() if headless is None else headless
+    print(f"[driver] Creating Firefox driver with headless={headless_mode}")
     options = Options()
     options.add_argument("--width=1366")
     options.add_argument("--height=900")
-    if headless:
+    if headless_mode:
         options.add_argument("-headless")
         options.headless = True
         os.environ["MOZ_HEADLESS"] = "1"
@@ -693,7 +702,7 @@ def run(
     end_date: Optional[date],
     area: str,
     timeout: int,
-    headless: bool,
+    headless: Optional[bool],
     observe_seconds: int,
     debug: bool = False,
 ) -> dict:
@@ -802,6 +811,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--headless",
         action="store_true",
+        default=None,
         help="Run Firefox headless. Default is visible.",
     )
     parser.add_argument(
