@@ -26,7 +26,6 @@ from app.api import (
 )
 from app.core.config import settings
 from app.db.database import connect_db, disconnect_db
-from app.services.scrape_scheduler import start_scrape_scheduler, stop_scrape_scheduler
 
 
 # ===== LIFECYCLE EVENTS =====
@@ -40,13 +39,11 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize database connection
     print("\nStarting Power Trading Backend...")
     connect_db()
-    start_scrape_scheduler()
 
     yield
 
     # Shutdown: Close database connection
     print("\nShutting down Power Trading Backend...")
-    stop_scrape_scheduler()
     disconnect_db()
 
 

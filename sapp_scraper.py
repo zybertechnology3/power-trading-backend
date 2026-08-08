@@ -2615,6 +2615,31 @@ PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES = [
     "participant_portfolio_results_fpm_m",
 ]
 
+PARTICIPANT_PORTFOLIO_BUNDLE_MARKET_TO_JOB_NAME = {
+    "dam": "participant_portfolio_results",
+    "fpm_w": "participant_portfolio_results_fpm_w",
+    "fpm_m": "participant_portfolio_results_fpm_m",
+}
+
+
+def _normalize_participant_portfolio_market(market: Optional[str]) -> Optional[str]:
+    if market is None:
+        return None
+
+    normalized_market = str(market).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized_market in {"", "all", "*"}:
+        return None
+    if normalized_market not in PARTICIPANT_PORTFOLIO_BUNDLE_MARKET_TO_JOB_NAME:
+        raise ValueError("market must be one of: dam, fpm_w, fpm_m, all")
+    return normalized_market
+
+
+def _get_participant_portfolio_jobs(market: Optional[str]) -> list[SappExtractionJob]:
+    normalized_market = _normalize_participant_portfolio_market(market)
+    if normalized_market is None:
+        return [get_extraction_job(job_name) for job_name in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES]
+    return [get_extraction_job(PARTICIPANT_PORTFOLIO_BUNDLE_MARKET_TO_JOB_NAME[normalized_market])]
+
 
 def get_extraction_job(job_name: str) -> SappExtractionJob:
     try:
@@ -2846,15 +2871,18 @@ def run_portfolio_extraction_bundle(
     delivery_date: Optional[date] = None,
     page_start: int = 1,
     headless: Optional[bool] = None,
+    market: Optional[str] = None,
 ) -> dict:
     delivery_date = delivery_date or datetime.now().date()
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
 
-    jobs = [get_extraction_job(job_name) for job_name in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES]
+    jobs = _get_participant_portfolio_jobs(market)
+    requested_jobs = [job.name for job in jobs]
     print(
         f"Starting bundled SAPP participant portfolio scrape for {delivery_date.isoformat()} "
         f"from inbox page {page_start}"
+        + ("" if market in (None, "", "all", "*") else f" for market {market}")
     )
 
     username, password = load_config()
@@ -2956,7 +2984,7 @@ def run_portfolio_extraction_bundle(
         {
             "job": "participant_portfolio_results",
             "page_start": page_start,
-            "requested_jobs": PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES,
+            "requested_jobs": requested_jobs,
             "successful_jobs": len(successful_results),
             "failed_jobs": len(failed_results),
             "imported": sum(result.get("imported", 0) for result in successful_results),
@@ -2973,16 +3001,19 @@ def run_portfolio_extraction_bundle_for_date_range(
     continue_on_error: bool = True,
     page_start: int = 1,
     headless: Optional[bool] = None,
+    market: Optional[str] = None,
 ) -> dict:
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
     delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
-    jobs = [get_extraction_job(job_name) for job_name in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES]
+    jobs = _get_participant_portfolio_jobs(market)
     pending_items = {(job.name, delivery_date): job for job in jobs for delivery_date in delivery_dates}
+    requested_jobs = [job.name for job in jobs]
     print(
         f"Starting bundled SAPP participant portfolio scrape for date range "
         f"{start_date.isoformat()} to {end_date.isoformat()} from newest to oldest, "
         f"starting at inbox page {page_start}"
+        + ("" if market in (None, "", "all", "*") else f" for market {market}")
     )
 
     username, password = load_config()
@@ -3118,9 +3149,9 @@ def run_portfolio_extraction_bundle_for_date_range(
         "imported": sum(result.get("imported", 0) for result in successful_results),
         "updated": sum(result.get("updated", 0) for result in successful_results),
         "results": results,
-        "requested_jobs": PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES,
-        "successful_jobs": len([job for job in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES if any(r.get("job") == job and r.get("status") == "success" for r in results)]),
-        "failed_jobs": len([job for job in PARTICIPANT_PORTFOLIO_BUNDLE_JOB_NAMES if not any(r.get("job") == job and r.get("status") == "success" for r in results)]),
+        "requested_jobs": requested_jobs,
+        "successful_jobs": len([job for job in requested_jobs if any(r.get("job") == job and r.get("status") == "success" for r in results)]),
+        "failed_jobs": len([job for job in requested_jobs if not any(r.get("job") == job and r.get("status") == "success" for r in results)]),
     }
 
 

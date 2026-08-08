@@ -543,30 +543,6 @@ def _initialize_collections():
         name="idx_energy_yearly_budgets_year_created",
     )
 
-    if "sapp_scrape_job_runs" not in db.list_collection_names():
-        db.create_collection("sapp_scrape_job_runs")
-        print("Created 'sapp_scrape_job_runs' collection")
-    scrape_job_runs_collection = db["sapp_scrape_job_runs"]
-    scrape_job_runs_collection.create_index(
-        [("run_id", ASCENDING)],
-        unique=True,
-        name="idx_sapp_scrape_job_runs_run_id_unique",
-    )
-    scrape_job_runs_collection.create_index(
-        [("job_name", ASCENDING), ("created_at", DESCENDING)],
-        name="idx_sapp_scrape_job_runs_job_created",
-    )
-    scrape_job_runs_collection.create_index(
-        [("status", ASCENDING), ("updated_at", DESCENDING)],
-        name="idx_sapp_scrape_job_runs_status_updated",
-    )
-    scrape_job_runs_collection.create_index(
-        [("schedule_key", ASCENDING)],
-        unique=True,
-        sparse=True,
-        name="idx_sapp_scrape_job_runs_schedule_key_unique",
-    )
-
 
 def get_db():
     """Get MongoDB database reference."""

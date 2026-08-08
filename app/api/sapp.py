@@ -71,15 +71,6 @@ from bm_atc_test_scraper import run as run_bm_atc_standalone
 from area_results_test_scraper import run as run_dam_standalone
 from fpm_w_test import run as run_fpm_w_standalone
 from fpm_m_test import run as run_fpm_m_standalone
-from app.services.scrape_scheduler import (
-    get_scrape_job_run,
-    get_scrape_scheduler_status,
-    list_scrape_job_runs,
-    list_supported_scrape_jobs,
-    reload_scrape_scheduler,
-    trigger_scrape_job,
-)
-
 router = APIRouter(prefix="/sapp", tags=["sapp"])
 
 Frequency = Literal["1h", "4h", "1d", "1w", "1mo", "1y"]
@@ -1509,66 +1500,6 @@ def list_scrape_jobs():
     }
 
 
-@router.get("/scheduled-scrapes")
-def get_scheduled_scrapes_status():
-    """Get the backend scrape scheduler status and recent runs."""
-    return get_scrape_scheduler_status()
-
-
-@router.get("/scheduled-scrapes/jobs")
-def list_scheduled_scrape_jobs():
-    """List scrape jobs that can be scheduled or triggered manually."""
-    return {"jobs": list_supported_scrape_jobs()}
-
-
-@router.post("/scheduled-scrapes/trigger")
-def trigger_scheduled_scrape_job(
-    job_name: str = Query(..., description="Job name to run."),
-    params: dict[str, Any] = Body(default_factory=dict),
-):
-    """Queue a scrape job to run in the backend."""
-    try:
-        return trigger_scrape_job(job_name, params=params, trigger_source="manual")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.post("/scheduled-scrapes/reload")
-def reload_scheduled_scrape_jobs():
-    """Reload scheduled scrape definitions from the environment."""
-    try:
-        return {"jobs": reload_scrape_scheduler()}
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@router.get("/scheduled-scrapes/runs")
-def list_scheduled_scrape_runs(
-    job_name: Optional[str] = Query(None),
-    status_filter: Optional[str] = Query(None, alias="status"),
-    limit: int = Query(50, ge=1, le=200),
-):
-    """List recent backend scrape runs."""
-    return {
-        "runs": list_scrape_job_runs(
-            job_name=job_name,
-            status=status_filter,
-            limit=limit,
-        )
-    }
-
-
-@router.get("/scheduled-scrapes/runs/{run_id}")
-def get_scheduled_scrape_run(run_id: str):
-    """Get one backend scrape run."""
-    try:
-        return get_scrape_job_run(run_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Scrape run not found")
-
-
 @router.post(
     "/area-results-test",
     summary="Test the new SAPP area results navigation flow locally",
@@ -2512,6 +2443,10 @@ def scrape_participant_portfolio_results(
         None,
         description="Delivery date to fetch. Defaults to today's date if omitted.",
     ),
+    market: str = Query(
+        "all",
+        description="Participant portfolio market to scrape: dam, fpm_w, fpm_m, or all.",
+    ),
     page_start: int = Query(
         1,
         ge=1,
@@ -2524,6 +2459,7 @@ def scrape_participant_portfolio_results(
             delivery_date=delivery_date,
             page_start=page_start,
             headless=True,
+            market=market,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2539,6 +2475,10 @@ def scrape_participant_portfolio_results(
 def scrape_participant_portfolio_results_for_date_range(
     start_date: date = Query(..., description="First delivery date to fetch."),
     end_date: date = Query(..., description="Last delivery date to fetch, inclusive."),
+    market: str = Query(
+        "all",
+        description="Participant portfolio market to scrape: dam, fpm_w, fpm_m, or all.",
+    ),
     continue_on_error: bool = Query(
         True,
         description="Continue with later dates if one date fails.",
@@ -2557,6 +2497,7 @@ def scrape_participant_portfolio_results_for_date_range(
             continue_on_error=continue_on_error,
             page_start=page_start,
             headless=True,
+            market=market,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
