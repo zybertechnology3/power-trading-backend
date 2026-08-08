@@ -2641,6 +2641,32 @@ def _get_participant_portfolio_jobs(market: Optional[str]) -> list[SappExtractio
     return [get_extraction_job(PARTICIPANT_PORTFOLIO_BUNDLE_MARKET_TO_JOB_NAME[normalized_market])]
 
 
+def _participant_portfolio_market_date_requirement(market: Optional[str]) -> Optional[str]:
+    normalized_market = _normalize_participant_portfolio_market(market)
+    if normalized_market == "fpm_w":
+        return "monday"
+    if normalized_market == "fpm_m":
+        return "first_of_month"
+    return None
+
+
+def _is_valid_participant_portfolio_delivery_date(market: Optional[str], delivery_date: date) -> bool:
+    requirement = _participant_portfolio_market_date_requirement(market)
+    if requirement == "monday":
+        return delivery_date.weekday() == 0
+    if requirement == "first_of_month":
+        return delivery_date.day == 1
+    return True
+
+
+def _validate_participant_portfolio_delivery_date(market: Optional[str], delivery_date: date) -> None:
+    requirement = _participant_portfolio_market_date_requirement(market)
+    if requirement == "monday" and delivery_date.weekday() != 0:
+        raise ValueError("FPM-W participant portfolio results can only be scraped for Mondays.")
+    if requirement == "first_of_month" and delivery_date.day != 1:
+        raise ValueError("FPM-M participant portfolio results can only be scraped for the first day of the month.")
+
+
 def get_extraction_job(job_name: str) -> SappExtractionJob:
     try:
         return SAPP_EXTRACTION_JOBS[job_name]
@@ -2876,6 +2902,7 @@ def run_portfolio_extraction_bundle(
     delivery_date = delivery_date or datetime.now().date()
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
+    _validate_participant_portfolio_delivery_date(market, delivery_date)
 
     jobs = _get_participant_portfolio_jobs(market)
     requested_jobs = [job.name for job in jobs]
@@ -3005,7 +3032,16 @@ def run_portfolio_extraction_bundle_for_date_range(
 ) -> dict:
     if page_start < 1:
         raise ValueError("page_start must be greater than or equal to 1.")
-    delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
+    delivery_dates = [
+        delivery_date
+        for delivery_date in iter_delivery_dates_descending(start_date, end_date)
+        if _is_valid_participant_portfolio_delivery_date(market, delivery_date)
+    ]
+    if not delivery_dates:
+        raise ValueError(
+            "No valid participant portfolio delivery dates were found for the selected market "
+            "in the requested range."
+        )
     jobs = _get_participant_portfolio_jobs(market)
     pending_items = {(job.name, delivery_date): job for job in jobs for delivery_date in delivery_dates}
     requested_jobs = [job.name for job in jobs]

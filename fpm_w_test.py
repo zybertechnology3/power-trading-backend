@@ -1077,22 +1077,10 @@ def validate_returned_dates_for_chunk(
 
 
 def normalize_requested_range(start_date: date, end_date: date) -> tuple[date, date]:
-    today = datetime.now().date()
-    normalized_end_date = end_date
-    if end_date > today:
-        normalized_end_date = today
-        print(
-            f"⚠️ [run] Requested end_date {end_date.isoformat()} is in the future; "
-            f"using {normalized_end_date.isoformat()} instead"
-        )
+    if end_date < start_date:
+        raise ValueError("end_date must be greater than or equal to start_date.")
 
-    if normalized_end_date < start_date:
-        raise ValueError(
-            "Requested range starts in the future. No scrapeable delivery dates remain "
-            "after clamping end_date to today."
-        )
-
-    return start_date, normalized_end_date
+    return start_date, end_date
 
 
 def filter_existing_records(collection, records: list[dict]) -> tuple[list[dict], int]:
