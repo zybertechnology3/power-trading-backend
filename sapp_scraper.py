@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1693,6 +1694,50 @@ def find_latest_download_file(download_dir: Path) -> Path:
     return max(files, key=lambda p: p.stat().st_mtime)
 
 
+def _find_attachment_buttons(driver, extension: str = ".xlsx"):
+    attachment_xpath = (
+        f"//button[contains(@data-cy, {xpath_literal(extension)}) "
+        f"or contains(@title, {xpath_literal(extension)})]"
+    )
+    return [
+        button
+        for button in driver.find_elements(By.XPATH, attachment_xpath)
+        if button.is_displayed()
+    ]
+
+
+def _click_attachment_button(driver, attachment_button) -> None:
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+        attachment_button,
+    )
+    time.sleep(0.5)
+    try:
+        attachment_button.click()
+    except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException):
+        driver.execute_script("arguments[0].click();", attachment_button)
+
+
+def _download_single_attachment(
+    driver,
+    download_dir: Path,
+    attachment_button,
+    *,
+    extension: str = ".xlsx",
+    existing_names: set[str],
+) -> Path:
+    _click_attachment_button(driver, attachment_button)
+    downloaded_file = wait_for_new_download_file(
+        download_dir,
+        existing_names,
+        extension=extension,
+        timeout=60,
+    )
+    existing_names.add(downloaded_file.name)
+    print(f"[6/7] 📥 Downloaded file: {downloaded_file.name}")
+    return downloaded_file
+
+
 def extract_data_from_file(file_path: Path):
     print(f"[7/7] 📄 Extracting data from downloaded file: {file_path.name}")
     workbook = openpyxl.load_workbook(file_path, data_only=True)
@@ -1765,6 +1810,263 @@ def extract_data_from_file(file_path: Path):
     output_wb.save(output_path)
     print(f"💾 Saved extracted data to: {output_path}")
     return output_path
+
+
+def download_attachment(driver, download_dir: Path, extension: str = ".xlsx"):
+    attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+    if not attachment_buttons:
+        raise RuntimeError(f"No attachment buttons found for {extension} files.")
+
+    existing_names = {p.name for p in download_dir.glob(f"*{extension}")}
+    return _download_single_attachment(
+        driver,
+        download_dir,
+        attachment_buttons[0],
+        extension=extension,
+        existing_names=existing_names,
+    )
+
+
+def download_all_attachments(driver, download_dir: Path, extension: str = ".xlsx") -> list[Path]:
+    attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+    if not attachment_buttons:
+        raise RuntimeError(f"No attachment buttons found for {extension} files.")
+
+    existing_names = {p.name for p in download_dir.glob(f"*{extension}")}
+    downloaded_files: list[Path] = []
+    for index, attachment_button in enumerate(attachment_buttons, start=1):
+        print(
+            f"[6/7] 📥 Downloading attachment {index}/{len(attachment_buttons)} "
+            f"for {extension} files"
+        )
+        downloaded_files.append(
+            _download_single_attachment(
+                driver,
+                download_dir,
+                attachment_button,
+                extension=extension,
+                existing_names=existing_names,
+            )
+        )
+    return downloaded_files
+
+
+def _is_trading_invoice_hourly_detail_record(record: dict) -> bool:
+    return "hour" in record and "market" in record and "delivery_date" in record
+
+
+def _merge_summary_value_dicts(values: list[dict]) -> dict:
+    has_mwh = any(value.get("mwh") is not None for value in values)
+    has_amount = any(value.get("amount_usd") is not None for value in values)
+    total_mwh = sum((value.get("mwh") or 0.0) for value in values)
+    total_amount = sum((value.get("amount_usd") or 0.0) for value in values)
+    return {
+        "mwh": total_mwh if has_mwh else None,
+        "amount_usd": total_amount if has_amount else None,
+        "average_price_usd_per_mwh": (
+            total_amount / total_mwh if has_mwh and total_mwh not in (None, 0) else None
+        ),
+    }
+
+
+def _merge_market_section_dicts(sections: list[dict]) -> dict:
+    if not sections:
+        return {}
+
+    purchases = _merge_summary_value_dicts(
+        [section.get("purchases", {}) for section in sections if section.get("purchases")]
+    )
+    sales = _merge_summary_value_dicts(
+        [section.get("sales", {}) for section in sections if section.get("sales")]
+    )
+
+    purchase_mwh = purchases["mwh"] or 0.0
+    purchase_amount = purchases["amount_usd"] or 0.0
+    sales_mwh = sales["mwh"] or 0.0
+    sales_amount = sales["amount_usd"] or 0.0
+    net_mwh = purchase_mwh - sales_mwh
+    net_amount = purchase_amount + sales_amount
+
+    has_purchases = purchase_mwh != 0.0 or purchase_amount != 0.0
+    has_sales = sales_mwh != 0.0 or sales_amount != 0.0
+
+    if has_purchases and (not has_sales or abs(purchase_amount) >= abs(sales_amount)):
+        direction = "PURCHASE"
+        display_mwh = purchase_mwh
+        display_amount = purchase_amount
+    elif has_sales:
+        direction = "SALE"
+        display_mwh = sales_mwh
+        display_amount = sales_amount
+    else:
+        direction = "NONE"
+        display_mwh = max(purchase_mwh, sales_mwh)
+        display_amount = max(purchase_amount, sales_amount)
+
+    return {
+        "direction": direction,
+        "mwh": display_mwh,
+        "amount_usd": display_amount,
+        "average_price_usd_per_mwh": (
+            display_amount / display_mwh if display_mwh not in (None, 0) else None
+        ),
+        "purchases": purchases,
+        "sales": sales,
+        "net_mwh": net_mwh,
+        "net_amount_usd": net_amount,
+        "net_average_price_usd_per_mwh": (
+            abs(net_amount) / abs(net_mwh) if net_mwh not in (None, 0) else None
+        ),
+    }
+
+
+def merge_trading_invoice_records(records: list[dict]) -> list[dict]:
+    summary_records = [record for record in records if not _is_trading_invoice_hourly_detail_record(record)]
+    hourly_records = [record for record in records if _is_trading_invoice_hourly_detail_record(record)]
+
+    if not summary_records:
+        raise RuntimeError("Could not find a trading invoice summary record to merge.")
+
+    merged_summary = deepcopy(summary_records[0])
+    merged_summary_sources: list[str] = []
+    merged_unset_fields: set[str] = set()
+    present_markets: set[str] = set()
+
+    for record in summary_records:
+        source_file = record.get("source_file")
+        if source_file:
+            merged_summary_sources.append(source_file)
+        unset_fields = record.get(INTERNAL_UNSET_FIELDS_FIELD)
+        if unset_fields:
+            merged_unset_fields.update(unset_fields)
+        for market in ("fpm_m", "fpm_w", "dam", "idm"):
+            if record.get(market):
+                present_markets.add(market)
+
+    merged_summary["delivery_date"] = summary_records[0]["delivery_date"]
+    if merged_summary.get("timestamp") is None:
+        merged_summary["timestamp"] = summary_records[0].get("timestamp")
+
+    merged_summary["currency"] = next(
+        (record.get("currency") for record in summary_records if record.get("currency") is not None),
+        None,
+    )
+
+    for field in (
+        "market_turnover_usd",
+        "net_amount_traded_usd",
+        "admin_fee_mwh",
+        "admin_fee_usd",
+        "wheeling_fee_usd",
+        "losses_fee_usd",
+        "total_fees_usd",
+        "total_amount_due_usd",
+        "gross_total_mwh",
+        "gross_total_amount_usd",
+        "total_expenditure_usd",
+        "sapp_net_turnover_usd",
+    ):
+        values = [record.get(field) for record in summary_records if record.get(field) is not None]
+        merged_summary[field] = sum(values) if values else None
+
+    merged_summary["gross_average_price_usd_per_mwh"] = (
+        merged_summary["gross_total_amount_usd"] / merged_summary["gross_total_mwh"]
+        if merged_summary.get("gross_total_mwh") not in (None, 0)
+        else None
+    )
+    merged_summary["total_purchases"] = _merge_summary_value_dicts(
+        [record.get("total_purchases", {}) for record in summary_records if record.get("total_purchases")]
+    )
+    merged_summary["total_sales"] = _merge_summary_value_dicts(
+        [record.get("total_sales", {}) for record in summary_records if record.get("total_sales")]
+    )
+
+    for market in ("fpm_m", "fpm_w", "dam", "idm"):
+        sections = [record.get(market) for record in summary_records if record.get(market)]
+        if sections:
+            merged_summary[market] = _merge_market_section_dicts(sections)
+        else:
+            merged_summary.pop(market, None)
+
+    balancing_market = {}
+    for key in {
+        nested_key
+        for record in summary_records
+        for nested_key in (record.get("balancing_market") or {}).keys()
+    }:
+        nested_values = [
+            record.get("balancing_market", {}).get(key)
+            for record in summary_records
+            if record.get("balancing_market", {}).get(key)
+        ]
+        if nested_values:
+            balancing_market[key] = _merge_summary_value_dicts(nested_values)
+    merged_summary["balancing_market"] = balancing_market
+
+    merged_summary["confirmed_trade_type"] = (
+        "PURCHASE"
+        if (merged_summary.get("net_amount_traded_usd") or 0.0) > 0
+        else "SALE"
+        if (merged_summary.get("net_amount_traded_usd") or 0.0) < 0
+        else "NONE"
+    )
+
+    merged_summary_sources = list(dict.fromkeys(merged_summary_sources))
+    merged_summary["source_file"] = " + ".join(merged_summary_sources) if merged_summary_sources else None
+    if merged_summary.get("metadata") is not None:
+        merged_summary["metadata"] = {
+            **merged_summary["metadata"],
+            "source_file": merged_summary["source_file"],
+        }
+
+    merged_unset_fields -= present_markets
+    merged_summary[INTERNAL_UNSET_FIELDS_FIELD] = tuple(sorted(merged_unset_fields))
+
+    merged_hourly: dict[tuple[str, str, int], dict] = {}
+    for record in hourly_records:
+        key = (record["delivery_date"], record["market"], record["hour"])
+        existing = merged_hourly.get(key)
+        if existing is None:
+            merged_hourly[key] = deepcopy(record)
+            continue
+
+        for field in (
+            "traded_purchases_mwh",
+            "traded_sales_mwh",
+            "purchase_turnover_usd",
+            "sale_turnover_usd",
+            "admin_fees_usd",
+            "wheeling_cost_usd",
+        ):
+            values = [existing.get(field), record.get(field)]
+            values = [value for value in values if value is not None]
+            existing[field] = sum(values) if values else None
+
+        if existing.get("price_usd_per_mwh") is None:
+            existing["price_usd_per_mwh"] = record.get("price_usd_per_mwh")
+        if existing.get("hour_label") is None:
+            existing["hour_label"] = record.get("hour_label")
+        if existing.get("timestamp") is None:
+            existing["timestamp"] = record.get("timestamp")
+        if existing.get("source_file"):
+            existing["source_file"] = f"{existing['source_file']} + {record.get('source_file')}"
+        else:
+            existing["source_file"] = record.get("source_file")
+        if existing.get("metadata") is not None and record.get("metadata") is not None:
+            existing["metadata"] = {
+                **existing["metadata"],
+                "source_file": existing["source_file"],
+            }
+
+    merged_records = [merged_summary, *merged_hourly.values()]
+    return sorted(
+        merged_records,
+        key=lambda record: (
+            record["delivery_date"],
+            record.get("market", ""),
+            record.get("hour", 0),
+        ),
+    )
 
 
 def extract_constrained_area_results(
@@ -2724,12 +3026,27 @@ def run_extraction_job(
                 delivery_date,
                 page_start=page_start,
             )
-            downloaded_file = download_attachment(
-                driver,
-                download_dir,
-                extension=job.attachment_extension,
-            )
-            records = job.extractor(downloaded_file, job)
+            if job.name == TRADING_INVOICE_RESULTS_JOB.name:
+                downloaded_files = download_all_attachments(
+                    driver,
+                    download_dir,
+                    extension=job.attachment_extension,
+                )
+            else:
+                downloaded_files = [
+                    download_attachment(
+                        driver,
+                        download_dir,
+                        extension=job.attachment_extension,
+                    )
+                ]
+
+            records: list[dict] = []
+            for downloaded_file in downloaded_files:
+                records.extend(job.extractor(downloaded_file, job))
+            if job.name == TRADING_INVOICE_RESULTS_JOB.name:
+                records = merge_trading_invoice_records(records)
+
             result = store_records_in_database(records, job)
             result["page_start"] = page_start
             print(f"SAPP scraper completed successfully: {result}")
@@ -2800,12 +3117,27 @@ def run_extraction_job_for_date_range(
                                 f"[5/7] Opened target message for "
                                 f"{delivery_date.isoformat()} on inbox page {page_number}"
                             )
-                            downloaded_file = download_attachment(
-                                driver,
-                                download_dir,
-                                extension=job.attachment_extension,
-                            )
-                            records = job.extractor(downloaded_file, job)
+                            if job.name == TRADING_INVOICE_RESULTS_JOB.name:
+                                downloaded_files = download_all_attachments(
+                                    driver,
+                                    download_dir,
+                                    extension=job.attachment_extension,
+                                )
+                            else:
+                                downloaded_files = [
+                                    download_attachment(
+                                        driver,
+                                        download_dir,
+                                        extension=job.attachment_extension,
+                                    )
+                                ]
+
+                            records: list[dict] = []
+                            for downloaded_file in downloaded_files:
+                                records.extend(job.extractor(downloaded_file, job))
+                            if job.name == TRADING_INVOICE_RESULTS_JOB.name:
+                                records = merge_trading_invoice_records(records)
+
                             result = store_records_in_database(records, job)
                             results.append(
                                 {
