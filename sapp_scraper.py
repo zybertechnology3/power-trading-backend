@@ -1695,15 +1695,83 @@ def find_latest_download_file(download_dir: Path) -> Path:
 
 
 def _find_attachment_buttons(driver, extension: str = ".xlsx"):
-    attachment_xpath = (
-        f"//button[contains(@data-cy, {xpath_literal(extension)}) "
-        f"or contains(@title, {xpath_literal(extension)})]"
+    normalized_extension = extension.lower().lstrip(".")
+    return driver.execute_script(
+        r"""
+        const targetExtension = arguments[0];
+        const normalize = (value) => (value || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+        const isVisible = (element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && window.getComputedStyle(element).visibility !== "hidden";
+        };
+        const fields = (element) => [
+            normalize(element.textContent),
+            normalize(element.getAttribute("title")),
+            normalize(element.getAttribute("aria-label")),
+            normalize(element.getAttribute("data-cy")),
+            normalize(element.getAttribute("href")),
+            normalize(element.getAttribute("download")),
+        ].filter(Boolean).join(" | ");
+        const isExcluded = (haystack) => [
+            "search",
+            "export",
+            "next page",
+            "previous page",
+            "select a schedule",
+            "login",
+            "sign in",
+        ].some((term) => haystack.includes(term));
+        const isFileLike = (haystack) => (
+            haystack.includes(`.${targetExtension}`)
+            || haystack.includes(targetExtension)
+            || haystack.includes("xlsx")
+            || haystack.includes("xlsm")
+            || haystack.includes("excel")
+        );
+        const isAttachmentLike = (element) => {
+            const haystack = fields(element);
+            if (!haystack || isExcluded(haystack)) return false;
+            return isFileLike(haystack) || (haystack.includes("download") && !haystack.includes("export"));
+        };
+        const clickableSelector = "button, a, [role='button'], [onclick], [download]";
+        const closestClickable = (element) => {
+            let current = element;
+            while (current && current !== document.body) {
+                if (current.matches && current.matches(clickableSelector)) {
+                    return current;
+                }
+                current = current.parentElement;
+            }
+            return null;
+        };
+        const seen = new Set();
+        const candidates = [];
+        for (const element of Array.from(document.querySelectorAll("body *"))) {
+            if (!isVisible(element) || !isAttachmentLike(element)) {
+                continue;
+            }
+            const clickable = closestClickable(element) || element;
+            if (!isVisible(clickable)) {
+                continue;
+            }
+            const key = fields(clickable) || clickable.outerHTML || clickable.innerText || "";
+            if (!key || seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            candidates.push(clickable);
+        }
+        if (candidates.length > 0) {
+            return candidates;
+        }
+        return Array.from(document.querySelectorAll(clickableSelector))
+            .filter((element) => isVisible(element) && isAttachmentLike(element));
+        """,
+        normalized_extension,
     )
-    return [
-        button
-        for button in driver.find_elements(By.XPATH, attachment_xpath)
-        if button.is_displayed()
-    ]
 
 
 def _click_attachment_button(driver, attachment_button) -> None:
@@ -2814,38 +2882,18 @@ def store_results_in_database(records: list[dict]) -> dict:
 
 
 def download_attachment(driver, download_dir: Path, extension: str = ".xlsx"):
-    # Click the attachment button for the Excel file using the data-cy/title attribute.
-    attachment_xpath = (
-        f"//button[contains(@data-cy, {xpath_literal(extension)}) "
-        f"or contains(@title, {xpath_literal(extension)})]"
-    )
-
-    attachment_button = WebDriverWait(driver, 20).until(
-        EC.element_to_be_clickable((By.XPATH, attachment_xpath))
-    )
+    attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+    if not attachment_buttons:
+        raise RuntimeError(f"No attachment buttons found for {extension} files.")
 
     existing_files = {p.name for p in download_dir.glob(f"*{extension}")}
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-        attachment_button,
-    )
-    time.sleep(0.5)
-    try:
-        attachment_button.click()
-    except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException):
-        attachment_button = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.XPATH, attachment_xpath))
-        )
-        driver.execute_script("arguments[0].click();", attachment_button)
-
-    downloaded_file = wait_for_new_download_file(
+    return _download_single_attachment(
+        driver,
         download_dir,
-        existing_files,
+        attachment_buttons[0],
         extension=extension,
-        timeout=60,
+        existing_names=existing_files,
     )
-    print(f"📥 Downloaded file: {downloaded_file.name}")
-    return downloaded_file
 
 
 CONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
