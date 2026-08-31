@@ -1539,6 +1539,12 @@ def click_message(driver, target_subject: str):
         driver.execute_script("arguments[0].click();", message_span)
 
 
+def find_message_on_current_page(driver, target_subject: str):
+    return WebDriverWait(driver, MESSAGE_CLICK_TIMEOUT).until(
+        lambda d: d.find_element(By.XPATH, f"//span[@title={xpath_literal(target_subject)}]")
+    )
+
+
 def find_enabled_next_page_button(driver):
     for button in driver.find_elements(By.CSS_SELECTOR, NEXT_PAGE_SELECTOR):
         try:
@@ -1675,16 +1681,32 @@ def wait_for_new_download_file(
     timeout: int = 30,
 ) -> Path:
     print("[6/7] ⏳ Waiting for the downloaded Excel file to appear")
+    extension = extension.lower().strip()
+    allowed_suffixes = {extension}
+    if extension == ".xlsx":
+        allowed_suffixes.update({".xlsm", ".xls"})
     deadline = time.time() + timeout
     while time.time() < deadline:
-        files = [p for p in download_dir.glob(f"*{extension}") if p.name not in existing_names]
+        files = [
+            p
+            for p in download_dir.iterdir()
+            if p.is_file()
+            and p.name not in existing_names
+            and any(p.name.lower().endswith(suffix) for suffix in allowed_suffixes)
+        ]
         if files:
             latest = max(files, key=lambda p: p.stat().st_mtime)
             if latest.stat().st_size > 0:
                 print(f"[6/7] 📥 Download detected: {latest.name}")
                 return latest
         time.sleep(1)
-    raise RuntimeError("Timed out waiting for the downloaded Excel file.")
+    current_files = sorted(
+        p.name for p in download_dir.iterdir() if p.is_file() and p.name not in existing_names
+    )
+    raise RuntimeError(
+        "Timed out waiting for the downloaded Excel file. "
+        f"Observed new files: {current_files}"
+    )
 
 
 def find_latest_download_file(download_dir: Path) -> Path:
