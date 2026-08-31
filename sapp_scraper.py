@@ -1708,35 +1708,28 @@ def _find_attachment_buttons(driver, extension: str = ".xlsx"):
             return rect.width > 0 && rect.height > 0 && window.getComputedStyle(element).visibility !== "hidden";
         };
         const fields = (element) => [
+            normalize(element.tagName),
             normalize(element.textContent),
             normalize(element.getAttribute("title")),
             normalize(element.getAttribute("aria-label")),
             normalize(element.getAttribute("data-cy")),
             normalize(element.getAttribute("href")),
             normalize(element.getAttribute("download")),
+            normalize(element.outerHTML),
         ].filter(Boolean).join(" | ");
-        const isExcluded = (haystack) => [
-            "search",
-            "export",
-            "next page",
-            "previous page",
-            "select a schedule",
-            "login",
-            "sign in",
-        ].some((term) => haystack.includes(term));
-        const isFileLike = (haystack) => (
-            haystack.includes(`.${targetExtension}`)
-            || haystack.includes(targetExtension)
-            || haystack.includes("xlsx")
-            || haystack.includes("xlsm")
-            || haystack.includes("excel")
-        );
-        const isAttachmentLike = (element) => {
+        const isAttachmentButton = (element) => {
             const haystack = fields(element);
-            if (!haystack || isExcluded(haystack)) return false;
-            return isFileLike(haystack) || (haystack.includes("download") && !haystack.includes("export"));
+            if (!haystack) return false;
+            if (haystack.includes("search") || haystack.includes("export")) return false;
+            const matchesFileName = haystack.includes(`.${targetExtension}`)
+                || haystack.includes(targetExtension)
+                || haystack.includes("xlsx")
+                || haystack.includes("xlsm");
+            const matchesExcelIcon = haystack.includes("file-excel");
+            const matchesDownloadHint = haystack.includes("download") && !haystack.includes("export");
+            return matchesFileName || matchesExcelIcon || matchesDownloadHint;
         };
-        const clickableSelector = "button, a, [role='button'], [onclick], [download]";
+        const clickableSelector = "nexweb-button button, button, a, [role='button'], [onclick], [download]";
         const closestClickable = (element) => {
             let current = element;
             while (current && current !== document.body) {
@@ -1749,8 +1742,8 @@ def _find_attachment_buttons(driver, extension: str = ".xlsx"):
         };
         const seen = new Set();
         const candidates = [];
-        for (const element of Array.from(document.querySelectorAll("body *"))) {
-            if (!isVisible(element) || !isAttachmentLike(element)) {
+        for (const element of Array.from(document.querySelectorAll(clickableSelector))) {
+            if (!isVisible(element) || !isAttachmentButton(element)) {
                 continue;
             }
             const clickable = closestClickable(element) || element;
@@ -1767,8 +1760,13 @@ def _find_attachment_buttons(driver, extension: str = ".xlsx"):
         if (candidates.length > 0) {
             return candidates;
         }
-        return Array.from(document.querySelectorAll(clickableSelector))
-            .filter((element) => isVisible(element) && isAttachmentLike(element));
+        return Array.from(document.querySelectorAll("body *"))
+            .filter((element) => isVisible(element) && isAttachmentButton(element))
+            .map((element) => closestClickable(element) || element)
+            .filter((element, index, self) => {
+                const key = fields(element) || element.outerHTML || element.innerText || "";
+                return key && self.findIndex((candidate) => (fields(candidate) || candidate.outerHTML || candidate.innerText || "") === key) === index;
+            });
         """,
         normalized_extension,
     )
