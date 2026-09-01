@@ -66,7 +66,32 @@ def load_config() -> tuple[str, str]:
     return username, password
 
 
-def create_driver(headless: bool = False):
+def _default_headless_mode() -> bool:
+    configured = os.getenv("SAPP_HEADLESS")
+    if configured is None:
+        configured = os.getenv("HEADLESS")
+    if configured is None or not configured.strip():
+        return True
+
+    normalized = configured.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    print(f"[config] Invalid SAPP_HEADLESS={configured!r}; defaulting to headless=True")
+    return True
+
+
+def create_driver(headless: Optional[bool] = None):
+    configured_headless = os.getenv("SAPP_HEADLESS")
+    if configured_headless is None:
+        configured_headless = os.getenv("HEADLESS")
+    headless = (
+        _default_headless_mode()
+        if configured_headless is not None
+        else (True if headless is None else headless)
+    )
     print(f"[driver] Creating Firefox driver with headless={headless}")
     options = Options()
     options.add_argument("--width=1366")

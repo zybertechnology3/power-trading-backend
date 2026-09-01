@@ -65,11 +65,20 @@ def wait_for_page_settle(driver, timeout: int = 20, extra_delay: float = 0.75) -
 
 
 def _default_headless_mode() -> bool:
-    if os.getenv("HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}:
+    configured = os.getenv("SAPP_HEADLESS")
+    if configured is None:
+        configured = os.getenv("HEADLESS")
+    if configured is None or not configured.strip():
         return True
-    if os.getenv("RENDER") or os.getenv("CI"):
+
+    normalized = configured.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
         return True
-    return os.name != "nt" and not os.getenv("DISPLAY")
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    print(f"[config] Invalid SAPP_HEADLESS={configured!r}; defaulting to headless=True")
+    return True
 
 
 def load_config() -> tuple[str, str, str, str]:
@@ -89,7 +98,14 @@ def load_config() -> tuple[str, str, str, str]:
 
 
 def create_driver(headless: Optional[bool] = None):
-    headless_mode = _default_headless_mode() if headless is None else headless
+    configured_headless = os.getenv("SAPP_HEADLESS")
+    if configured_headless is None:
+        configured_headless = os.getenv("HEADLESS")
+    headless_mode = (
+        _default_headless_mode()
+        if configured_headless is not None
+        else (True if headless is None else headless)
+    )
     print(f"🦊 [driver] Starting Firefox (headless={headless_mode})")
     options = Options()
     options.add_argument("--width=1366")

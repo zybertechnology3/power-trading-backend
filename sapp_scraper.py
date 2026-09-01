@@ -578,16 +578,32 @@ def load_config():
 
 
 def _default_headless_mode() -> bool:
-    if os.getenv("HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}:
+    configured = os.getenv("SAPP_HEADLESS")
+    if configured is None:
+        configured = os.getenv("HEADLESS")
+    if configured is None or not configured.strip():
         return True
-    if os.getenv("RENDER") or os.getenv("CI"):
+
+    normalized = configured.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
         return True
-    return os.name != "nt" and not os.getenv("DISPLAY")
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    print(f"[config] Invalid SAPP_HEADLESS={configured!r}; defaulting to headless=True")
+    return True
 
 
 def create_driver(download_dir: Path, headless: Optional[bool] = None):
     download_dir.mkdir(parents=True, exist_ok=True)
-    headless_mode = _default_headless_mode() if headless is None else headless
+    configured_headless = os.getenv("SAPP_HEADLESS")
+    if configured_headless is None:
+        configured_headless = os.getenv("HEADLESS")
+    headless_mode = (
+        _default_headless_mode()
+        if configured_headless is not None
+        else (True if headless is None else headless)
+    )
     print(
         f"[2/7] 🔧 Creating Firefox driver (headless={headless_mode}) and setting "
         f"download folder to: {download_dir}"
@@ -1748,8 +1764,8 @@ def _find_attachment_buttons(driver, extension: str = ".xlsx"):
                 || haystack.includes("xlsx")
                 || haystack.includes("xlsm");
             const matchesExcelIcon = haystack.includes("file-excel");
-            const matchesDownloadHint = haystack.includes("download") && !haystack.includes("export");
-            return matchesFileName || matchesExcelIcon || matchesDownloadHint;
+            // Do not match generic navigation links such as Bulk Download Logs.
+            return matchesFileName || matchesExcelIcon;
         };
         const clickableSelector = "nexweb-button button, button, a, [role='button'], [onclick], [download]";
         const closestClickable = (element) => {
@@ -1795,15 +1811,51 @@ def _find_attachment_buttons(driver, extension: str = ".xlsx"):
 
 
 def _click_attachment_button(driver, attachment_button) -> None:
+    click_target = attachment_button
+    try:
+        click_target = attachment_button.find_element(By.CSS_SELECTOR, "span.k-button-text")
+    except (StaleElementReferenceException, WebDriverException):
+        pass
     driver.execute_script(
         "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-        attachment_button,
+        click_target,
     )
     time.sleep(0.5)
     try:
-        attachment_button.click()
+        click_target.click()
     except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException):
-        driver.execute_script("arguments[0].click();", attachment_button)
+        driver.execute_script("arguments[0].click();", click_target)
+
+
+def _attachment_button_identity(attachment_button) -> str:
+    """Return the stable filename exposed by the SAPP attachment button."""
+    for attribute in ("data-cy", "title", "aria-label", "download"):
+        value = attachment_button.get_attribute(attribute)
+        if value and value.strip():
+            return value.strip()
+    return " ".join((attachment_button.text or "").split())
+
+
+def _find_attachment_button_by_identity(driver, identity: str):
+    """Re-find a Kendo attachment button after the message DOM is refreshed."""
+    identity_literal = xpath_literal(identity)
+    selectors = (
+        f"//button[@data-cy={identity_literal}]",
+        f"//button[@title={identity_literal}]",
+        f"//a[@download={identity_literal}]",
+    )
+    for selector in selectors:
+        for element in driver.find_elements(By.XPATH, selector):
+            if element.is_displayed() and element.is_enabled():
+                return element
+
+    for element in _find_attachment_buttons(driver, extension=".xlsx"):
+        try:
+            if _attachment_button_identity(element) == identity:
+                return element
+        except StaleElementReferenceException:
+            continue
+    return None
 
 
 def _download_single_attachment(
@@ -1814,13 +1866,28 @@ def _download_single_attachment(
     extension: str = ".xlsx",
     existing_names: set[str],
 ) -> Path:
-    _click_attachment_button(driver, attachment_button)
-    downloaded_file = wait_for_new_download_file(
-        download_dir,
-        existing_names,
-        extension=extension,
-        timeout=60,
-    )
+    identity = _attachment_button_identity(attachment_button)
+    for attempt in range(1, 4):
+        try:
+            print(f"[6/7] Clicking Excel attachment button: {identity}")
+            _click_attachment_button(driver, attachment_button)
+            downloaded_file = wait_for_new_download_file(
+                download_dir,
+                existing_names,
+                extension=extension,
+                timeout=60,
+            )
+            break
+        except (StaleElementReferenceException, WebDriverException, RuntimeError) as exc:
+            if attempt == 3:
+                raise
+            print(f"[6/7] Download attempt {attempt} failed for {identity}; retrying")
+            time.sleep(0.5)
+            attachment_button = _find_attachment_button_by_identity(driver, identity)
+            if attachment_button is None:
+                raise RuntimeError(
+                    f"Excel attachment button disappeared after click attempt {attempt}: {identity}"
+                ) from exc
     existing_names.add(downloaded_file.name)
     print(f"[6/7] 📥 Downloaded file: {downloaded_file.name}")
     return downloaded_file
@@ -1901,32 +1968,57 @@ def extract_data_from_file(file_path: Path):
 
 
 def download_attachment(driver, download_dir: Path, extension: str = ".xlsx"):
-    attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+    deadline = time.time() + 15
+    attachment_buttons = []
+    while time.time() < deadline and not attachment_buttons:
+        attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+        if not attachment_buttons:
+            time.sleep(0.25)
     if not attachment_buttons:
         raise RuntimeError(f"No attachment buttons found for {extension} files.")
 
-    existing_names = {p.name for p in download_dir.glob(f"*{extension}")}
+    attachment_identity = _attachment_button_identity(attachment_buttons[0])
+    attachment_button = _find_attachment_button_by_identity(
+        driver,
+        attachment_identity,
+    ) or attachment_buttons[0]
+    existing_names = {p.name for p in download_dir.iterdir() if p.is_file()}
     return _download_single_attachment(
         driver,
         download_dir,
-        attachment_buttons[0],
+        attachment_button,
         extension=extension,
         existing_names=existing_names,
     )
 
 
 def download_all_attachments(driver, download_dir: Path, extension: str = ".xlsx") -> list[Path]:
-    attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+    deadline = time.time() + 15
+    attachment_buttons = []
+    while time.time() < deadline and not attachment_buttons:
+        attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+        if not attachment_buttons:
+            time.sleep(0.25)
     if not attachment_buttons:
         raise RuntimeError(f"No attachment buttons found for {extension} files.")
 
-    existing_names = {p.name for p in download_dir.glob(f"*{extension}")}
+    # Keep filenames, not WebElements. Angular can rebuild this row after each download.
+    attachment_identities = []
+    for button in attachment_buttons:
+        identity = _attachment_button_identity(button)
+        if identity and identity not in attachment_identities:
+            attachment_identities.append(identity)
+
+    existing_names = {p.name for p in download_dir.iterdir() if p.is_file()}
     downloaded_files: list[Path] = []
-    for index, attachment_button in enumerate(attachment_buttons, start=1):
+    for index, identity in enumerate(attachment_identities, start=1):
         print(
             f"[6/7] 📥 Downloading attachment {index}/{len(attachment_buttons)} "
             f"for {extension} files"
         )
+        attachment_button = _find_attachment_button_by_identity(driver, identity)
+        if attachment_button is None:
+            raise RuntimeError(f"Could not re-find Excel attachment button: {identity}")
         downloaded_files.append(
             _download_single_attachment(
                 driver,
@@ -2902,15 +2994,25 @@ def store_results_in_database(records: list[dict]) -> dict:
 
 
 def download_attachment(driver, download_dir: Path, extension: str = ".xlsx"):
-    attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+    deadline = time.time() + 15
+    attachment_buttons = []
+    while time.time() < deadline and not attachment_buttons:
+        attachment_buttons = _find_attachment_buttons(driver, extension=extension)
+        if not attachment_buttons:
+            time.sleep(0.25)
     if not attachment_buttons:
         raise RuntimeError(f"No attachment buttons found for {extension} files.")
 
-    existing_files = {p.name for p in download_dir.glob(f"*{extension}")}
+    attachment_identity = _attachment_button_identity(attachment_buttons[0])
+    attachment_button = _find_attachment_button_by_identity(
+        driver,
+        attachment_identity,
+    ) or attachment_buttons[0]
+    existing_files = {p.name for p in download_dir.iterdir() if p.is_file()}
     return _download_single_attachment(
         driver,
         download_dir,
-        attachment_buttons[0],
+        attachment_button,
         extension=extension,
         existing_names=existing_files,
     )
@@ -3498,6 +3600,10 @@ def run_portfolio_extraction_bundle_for_date_range(
                                 f"{delivery_date.isoformat()} on inbox page {page_number}"
                             )
                             click_message(driver, target_subject)
+                            print(
+                                f"[5/7] Opened {job.name} message for "
+                                f"{delivery_date.isoformat()} on inbox page {page_number}"
+                            )
                             downloaded_file = download_attachment(
                                 driver,
                                 download_dir,
@@ -3513,6 +3619,10 @@ def run_portfolio_extraction_bundle_for_date_range(
                                 }
                             )
                             pending_items.pop(key, None)
+                            print(
+                                f"[7/7] Stored {job.name} results for "
+                                f"{delivery_date.isoformat()}"
+                            )
                         except Exception as exc:
                             results.append(
                                 {
@@ -3523,6 +3633,10 @@ def run_portfolio_extraction_bundle_for_date_range(
                                 }
                             )
                             pending_items.pop(key, None)
+                            print(
+                                f"SAPP scraper failed for {job.name} "
+                                f"{delivery_date.isoformat()}: {exc}"
+                            )
                             if not continue_on_error:
                                 raise
 
