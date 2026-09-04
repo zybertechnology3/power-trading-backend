@@ -1464,10 +1464,11 @@ def find_visible_subject_titles(driver) -> list[str]:
     try:
         return driver.execute_script(
             """
-            return Array.from(document.querySelectorAll("span[title]"))
+            return Array.from(document.querySelectorAll("[title]"))
                 .filter((element) => {
                     const rect = element.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
+                    return rect.width > 0 && rect.height > 0
+                        && window.getComputedStyle(element).visibility !== "hidden";
                 })
                 .map((element) => (element.getAttribute("title") || "").trim())
                 .filter(Boolean);
@@ -1539,7 +1540,7 @@ def extract_job_delivery_dates_from_current_page(
 
 
 def click_message(driver, target_subject: str):
-    subject_xpath = f"//span[@title={xpath_literal(target_subject)}]"
+    subject_xpath = f"//*[@title={xpath_literal(target_subject)}]"
     try:
         message_span = WebDriverWait(driver, MESSAGE_CLICK_TIMEOUT).until(
             EC.element_to_be_clickable((By.XPATH, subject_xpath))
@@ -1557,7 +1558,7 @@ def click_message(driver, target_subject: str):
 
 def find_message_on_current_page(driver, target_subject: str):
     return WebDriverWait(driver, MESSAGE_CLICK_TIMEOUT).until(
-        lambda d: d.find_element(By.XPATH, f"//span[@title={xpath_literal(target_subject)}]")
+        lambda d: d.find_element(By.XPATH, f"//*[@title={xpath_literal(target_subject)}]")
     )
 
 
@@ -1673,6 +1674,17 @@ def find_message_and_open(
             job,
             delivery_date,
         )
+        if matched_subject is None and job.name == TRADING_INVOICE_RESULTS_JOB.name:
+            # The inbox can finish rendering the message row after the grid settles.
+            for _ in range(5):
+                time.sleep(0.4)
+                matched_subject = find_matching_subject_title_on_current_page(
+                    driver,
+                    job,
+                    delivery_date,
+                )
+                if matched_subject is not None:
+                    break
         if matched_subject is not None:
             click_message(driver, matched_subject)
             print(f"[5/7] Opened target message on inbox page {page_number}")
