@@ -1506,6 +1506,68 @@ def find_matching_subjects_on_current_page(
     return matches
 
 
+def find_opportunistic_subjects_on_current_page(
+    driver,
+    job: SappExtractionJob,
+    start_date: date,
+    processed_dates: set[date],
+) -> dict[str, date]:
+    """Find all visible messages for a job on or after the requested start date."""
+    matches = {}
+    keywords = job_subject_keywords(job)
+    date_pattern = re.compile(
+        r"\b(?:\d{4}[/-]\d{2}[/-]\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b"
+    )
+    for subject in find_visible_subject_titles(driver):
+        normalized_subject = normalize_subject_text(subject)
+        if not all(keyword in normalized_subject for keyword in keywords):
+            continue
+
+        parsed_date = None
+        for candidate in date_pattern.findall(subject):
+            parsed_date = parse_delivery_date_value(candidate)
+            if parsed_date is not None:
+                break
+        if parsed_date is None or parsed_date < start_date:
+            continue
+        if parsed_date in processed_dates or subject in matches:
+            continue
+        matches[subject] = parsed_date
+    return matches
+
+
+def find_opportunistic_job_subjects_on_current_page(
+    driver,
+    jobs: list[SappExtractionJob],
+    start_date: date,
+    processed_items: set[tuple[str, date]],
+) -> dict[str, tuple[SappExtractionJob, date]]:
+    """Find newer-than-range messages for each participant portfolio job."""
+    matches = {}
+    date_pattern = re.compile(
+        r"\b(?:\d{4}[/-]\d{2}[/-]\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b"
+    )
+    visible_subjects = find_visible_subject_titles(driver)
+    for subject in visible_subjects:
+        normalized_subject = normalize_subject_text(subject)
+        parsed_date = None
+        for candidate in date_pattern.findall(subject):
+            parsed_date = parse_delivery_date_value(candidate)
+            if parsed_date is not None:
+                break
+        if parsed_date is None or parsed_date < start_date:
+            continue
+
+        for job in jobs:
+            if not all(keyword in normalized_subject for keyword in job_subject_keywords(job)):
+                continue
+            key = (job.name, parsed_date)
+            if key not in processed_items and subject not in matches:
+                matches[subject] = (job, parsed_date)
+            break
+    return matches
+
+
 def find_matching_job_subjects_on_current_page(
     driver,
     jobs: list[SappExtractionJob],
@@ -3249,6 +3311,8 @@ def run_extraction_job_for_date_range(
         raise ValueError("page_start must be greater than or equal to 1.")
     delivery_dates = list(iter_delivery_dates_descending(start_date, end_date))
     pending_dates = set(delivery_dates)
+    processed_opportunistic_dates: set[date] = set()
+    start_date_found = False
     print(
         f"Starting SAPP scraper job '{job.name}' for date range "
         f"{start_date.isoformat()} to {end_date.isoformat()} "
@@ -3268,26 +3332,27 @@ def run_extraction_job_for_date_range(
             go_to_inbox_page(driver, page_start)
 
             for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
-                if not pending_dates:
+                if start_date_found:
                     break
 
                 wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
                 print(
                     f"[5/7] Scanning inbox page {page_number} for "
-                    f"{len(pending_dates)} remaining target messages"
+                    f"messages on or after {start_date.isoformat()}"
                 )
 
-                while pending_dates:
-                    found_subjects = find_matching_subjects_on_current_page(
+                while not start_date_found:
+                    found_subjects = find_opportunistic_subjects_on_current_page(
                         driver,
                         job,
-                        sorted(pending_dates, reverse=True),
+                        start_date,
+                        processed_opportunistic_dates,
                     )
                     if not found_subjects:
                         break
 
                     for target_subject, delivery_date in found_subjects.items():
-                        if delivery_date not in pending_dates:
+                        if delivery_date in processed_opportunistic_dates:
                             continue
                         try:
                             print(
@@ -3329,6 +3394,9 @@ def run_extraction_job_for_date_range(
                                 }
                             )
                             pending_dates.discard(delivery_date)
+                            processed_opportunistic_dates.add(delivery_date)
+                            if delivery_date == start_date:
+                                start_date_found = True
                         except Exception as exc:
                             failure = {
                                 "job": job.name,
@@ -3338,26 +3406,32 @@ def run_extraction_job_for_date_range(
                             }
                             results.append(failure)
                             pending_dates.discard(delivery_date)
+                            processed_opportunistic_dates.add(delivery_date)
                             print(
                                 f"SAPP scraper failed for "
                                 f"{delivery_date.isoformat()}: {exc}"
                             )
+                            if delivery_date == start_date:
+                                start_date_found = True
                             if not continue_on_error:
                                 raise
 
-                if not pending_dates:
+                if start_date_found:
                     break
 
-                oldest_pending_date = min(pending_dates)
                 visible_job_dates = extract_job_delivery_dates_from_current_page(driver, job)
-                if visible_job_dates and max(visible_job_dates) < oldest_pending_date:
+                visible_boundary_reached = (
+                    bool(visible_job_dates) and max(visible_job_dates) < start_date
+                )
+                boundary_date = start_date
+                if visible_boundary_reached:
                     stop_reason = (
                         "Visible matching inbox subjects are older than the oldest pending "
-                        f"requested date {oldest_pending_date.isoformat()}"
+                        f"requested date {boundary_date.isoformat()}"
                     )
                     print(
                         f"[5/7] Visible {job.name} subjects are older than the oldest "
-                        f"pending date {oldest_pending_date.isoformat()}. "
+                        f"pending date {boundary_date.isoformat()}. "
                         "Stopping further page scans."
                     )
                     break
@@ -3368,7 +3442,7 @@ def run_extraction_job_for_date_range(
 
                 print(
                     f"[5/7] Moving to inbox page {page_number + 1}; "
-                    f"{len(pending_dates)} target messages still pending"
+                    f"start boundary {start_date.isoformat()} not reached"
                 )
                 click_next_inbox_page(driver, page_number)
 
@@ -3558,6 +3632,9 @@ def run_portfolio_extraction_bundle_for_date_range(
         )
     jobs = _get_participant_portfolio_jobs(market)
     pending_items = {(job.name, delivery_date): job for job in jobs for delivery_date in delivery_dates}
+    processed_opportunistic_items: set[tuple[str, date]] = set()
+    start_boundary_items = {(job.name, start_date) for job in jobs}
+    reached_start_items: set[tuple[str, date]] = set()
     requested_jobs = [job.name for job in jobs]
     print(
         f"Starting bundled SAPP participant portfolio scrape for date range "
@@ -3579,32 +3656,28 @@ def run_portfolio_extraction_bundle_for_date_range(
             go_to_inbox_page(driver, page_start)
 
             for page_number in range(page_start, page_start + MAX_INBOX_PAGES_TO_SEARCH):
-                if not pending_items:
+                if start_boundary_items.issubset(reached_start_items):
                     break
 
                 wait_for_inbox_grid_to_settle(driver, timeout=INBOX_GRID_READY_TIMEOUT)
                 print(
                     f"[5/7] Scanning inbox page {page_number} for "
-                    f"{len(pending_items)} remaining participant portfolio messages"
+                    f"participant portfolio messages on or after {start_date.isoformat()}"
                 )
 
-                while pending_items:
-                    ordered_pending = sorted(
-                        ((job, delivery_date) for (job_name, delivery_date), job in pending_items.items()),
-                        key=lambda item: item[1],
-                        reverse=True,
-                    )
-                    found_subjects = find_matching_job_subjects_on_current_page(
+                while not start_boundary_items.issubset(reached_start_items):
+                    found_subjects = find_opportunistic_job_subjects_on_current_page(
                         driver,
                         jobs,
-                        ordered_pending,
+                        start_date,
+                        processed_opportunistic_items,
                     )
                     if not found_subjects:
                         break
 
                     for target_subject, (job, delivery_date) in found_subjects.items():
                         key = (job.name, delivery_date)
-                        if key not in pending_items:
+                        if key in processed_opportunistic_items:
                             continue
                         try:
                             print(
@@ -3631,6 +3704,9 @@ def run_portfolio_extraction_bundle_for_date_range(
                                 }
                             )
                             pending_items.pop(key, None)
+                            processed_opportunistic_items.add(key)
+                            if delivery_date == start_date:
+                                reached_start_items.add(key)
                             print(
                                 f"[7/7] Stored {job.name} results for "
                                 f"{delivery_date.isoformat()}"
@@ -3645,6 +3721,9 @@ def run_portfolio_extraction_bundle_for_date_range(
                                 }
                             )
                             pending_items.pop(key, None)
+                            processed_opportunistic_items.add(key)
+                            if delivery_date == start_date:
+                                reached_start_items.add(key)
                             print(
                                 f"SAPP scraper failed for {job.name} "
                                 f"{delivery_date.isoformat()}: {exc}"
@@ -3652,21 +3731,21 @@ def run_portfolio_extraction_bundle_for_date_range(
                             if not continue_on_error:
                                 raise
 
-                if not pending_items:
+                if start_boundary_items.issubset(reached_start_items):
                     break
 
-                oldest_pending_date = min(delivery_date for _, delivery_date in pending_items.keys())
-                visible_job_dates = sorted(
-                    {
-                        visible_date
-                        for job in jobs
-                        for visible_date in extract_job_delivery_dates_from_current_page(driver, job)
-                    }
-                )
-                if visible_job_dates and max(visible_job_dates) < oldest_pending_date:
+                all_unfinished_jobs_are_older = True
+                for job in jobs:
+                    if (job.name, start_date) in reached_start_items:
+                        continue
+                    visible_dates = extract_job_delivery_dates_from_current_page(driver, job)
+                    if not visible_dates or max(visible_dates) >= start_date:
+                        all_unfinished_jobs_are_older = False
+                        break
+                if all_unfinished_jobs_are_older:
                     stop_reason = (
-                        "Visible participant portfolio subjects are older than the oldest pending "
-                        f"requested date {oldest_pending_date.isoformat()}"
+                        "Visible participant portfolio subjects are older than the requested "
+                        f"start date {start_date.isoformat()}"
                     )
                     print(f"[5/7] {stop_reason}. Stopping further page scans.")
                     break
