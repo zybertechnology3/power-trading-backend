@@ -22,10 +22,12 @@ from app.api import (
     outage_requests,
     resource_forecasting,
     sapp,
+    sapp_auto_scraper,
     telemetry,
 )
 from app.core.config import settings
 from app.db.database import connect_db, disconnect_db
+from app.services.sapp_auto_scraper import sapp_auto_scraper as auto_scraper_service
 
 
 # ===== LIFECYCLE EVENTS =====
@@ -39,10 +41,12 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize database connection
     print("\nStarting Power Trading Backend...")
     connect_db()
+    await auto_scraper_service.start()
 
     yield
 
     # Shutdown: Close database connection
+    await auto_scraper_service.stop()
     print("\nShutting down Power Trading Backend...")
     disconnect_db()
 
@@ -77,6 +81,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(telemetry.router)
 app.include_router(sapp.router)
+app.include_router(sapp_auto_scraper.router)
 app.include_router(Contract.router)
 app.include_router(resource_forecasting.router)
 app.include_router(energy_scheduling.router)
