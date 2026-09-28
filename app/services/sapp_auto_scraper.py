@@ -7,7 +7,6 @@ local calendar slot. Selenium jobs are serialized because each job owns Firefox.
 
 import asyncio
 import os
-import threading
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -25,7 +24,7 @@ from fpm_w_test import run as run_fpm_w_standalone
 from sapp_scraper import (
     get_extraction_job,
     run_extraction_job_for_date_range,
-    run_portfolio_extraction_bundle,
+    run_portfolio_extraction_bundle_for_date_range,
 )
 
 load_dotenv()
@@ -75,15 +74,26 @@ class ScheduledJob:
 
 
 JOB_DEFINITIONS = (
-    ScheduledJob("dam_area_results", "DAM area prices", "SAPP_SCHEDULE_DAM", "12:00", "daily"),
-    ScheduledJob("fpm_w_area_results", "FPM-W area prices", "SAPP_SCHEDULE_FPM_W", "15:00", "weekly", weekday=3),
-    ScheduledJob("fpm_m_area_results", "FPM-M area prices", "SAPP_SCHEDULE_FPM_M", "15:00", "monthly", last_weekday=2),
     ScheduledJob("portfolio_dam", "DAM participant portfolio", "SAPP_SCHEDULE_PORTFOLIO", "12:00", "daily"),
     ScheduledJob("portfolio_fpm_w", "FPM-W participant portfolio", "SAPP_SCHEDULE_PORTFOLIO", "12:00", "weekly", weekday=0),
     ScheduledJob("portfolio_fpm_m", "FPM-M participant portfolio", "SAPP_SCHEDULE_PORTFOLIO", "12:00", "monthly", last_weekday=2),
-    ScheduledJob("bm_atc", "BM ATC", "SAPP_SCHEDULE_BM_ATC", "12:00", "daily"),
     ScheduledJob("credit_notes", "Trading invoice credit notes", "SAPP_SCHEDULE_CREDIT_NOTES", "12:00", "daily"),
+    ScheduledJob("dam_area_results", "DAM area prices", "SAPP_SCHEDULE_DAM", "12:00", "daily"),
+    ScheduledJob("fpm_w_area_results", "FPM-W area prices", "SAPP_SCHEDULE_FPM_W", "15:00", "weekly", weekday=3),
+    ScheduledJob("fpm_m_area_results", "FPM-M area prices", "SAPP_SCHEDULE_FPM_M", "15:00", "monthly", last_weekday=2),
+    ScheduledJob("bm_atc", "BM ATC", "SAPP_SCHEDULE_BM_ATC", "12:00", "daily"),
 )
+
+DATASET_IDS = {
+    "portfolio_dam": "portfolio_dam",
+    "portfolio_fpm_w": "portfolio_fpm_w",
+    "portfolio_fpm_m": "portfolio_fpm_m",
+    "credit_notes": "credit_notes",
+    "dam_area_results": "dam",
+    "fpm_w_area_results": "fpm_w",
+    "fpm_m_area_results": "fpm_m",
+    "bm_atc": "bm_atc",
+}
 
 
 def _local_now() -> datetime:
@@ -152,11 +162,43 @@ def _date_range_for_job(job_name: str, current_date: date) -> tuple[date, date]:
     return current_date, current_date
 
 
+def _latest_portfolio_date(market: str, fallback: date) -> date:
+    record = get_db()["sapp_participant_portfolio_results"].find_one(
+        {"market": market, "delivery_date": {"$exists": True}},
+        sort=[("delivery_date", -1)],
+        projection={"delivery_date": 1},
+    )
+    if record:
+        try:
+            return date.fromisoformat(str(record["delivery_date"])[:10])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return fallback
+
+
+def _portfolio_lookahead_range(job_name: str, current_date: date) -> tuple[date, date]:
+    if job_name == "portfolio_dam":
+        start = _latest_portfolio_date("dam", current_date)
+        return start, start + timedelta(days=7)
+    if job_name == "portfolio_fpm_w":
+        fallback = current_date - timedelta(days=current_date.weekday())
+        start = _latest_portfolio_date("fpm_w", fallback)
+        start -= timedelta(days=start.weekday())
+        return start, start + timedelta(days=7)
+    if job_name == "portfolio_fpm_m":
+        fallback = current_date.replace(day=1)
+        start = _latest_portfolio_date("fpm_m", fallback).replace(day=1)
+        next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        month_after_next = (next_month.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return start, month_after_next - timedelta(days=1)
+    return _date_range_for_job(job_name, current_date)
+
+
 def _run_job(job_name: str, current_date: date) -> dict[str, Any]:
     timeout = _env_int("SAPP_SCRAPER_TIMEOUT", 20)
     observe_seconds = _env_int("SAPP_SCRAPER_OBSERVE_SECONDS", 1) - 1
     headless = None
-    start_date, end_date = _date_range_for_job(job_name, current_date)
+    start_date, end_date = _portfolio_lookahead_range(job_name, current_date)
 
     if job_name == "dam_area_results":
         return run_dam_standalone(start_date, end_date, timeout, headless, observe_seconds, "prices")
@@ -170,11 +212,17 @@ def _run_job(job_name: str, current_date: date) -> dict[str, Any]:
         job = get_extraction_job("trading_invoice_credit_note")
         return run_extraction_job_for_date_range(job, start_date, end_date, continue_on_error=True, headless=headless)
     if job_name == "portfolio_dam":
-        return run_portfolio_extraction_bundle(delivery_date=current_date, market="dam", headless=headless)
+        return run_portfolio_extraction_bundle_for_date_range(
+            start_date, end_date, market="dam", headless=headless
+        )
     if job_name == "portfolio_fpm_w":
-        return run_portfolio_extraction_bundle(delivery_date=start_date, market="fpm_w", headless=headless)
+        return run_portfolio_extraction_bundle_for_date_range(
+            start_date, end_date, market="fpm_w", headless=headless
+        )
     if job_name == "portfolio_fpm_m":
-        return run_portfolio_extraction_bundle(delivery_date=start_date, market="fpm_m", headless=headless)
+        return run_portfolio_extraction_bundle_for_date_range(
+            start_date, end_date, market="fpm_m", headless=headless
+        )
     raise ValueError(f"Unknown scheduled job: {job_name}")
 
 
@@ -194,7 +242,7 @@ class SappAutoScraper:
         self.poll_seconds = _env_int("SAPP_SCHEDULER_POLL_SECONDS", 30)
         self.task: Optional[asyncio.Task] = None
         self.job_lock = asyncio.Lock()
-        self.thread_lock = threading.Lock()
+        self.busy = False
 
     def configure_database(self) -> None:
         collection = get_db()[RUNS_COLLECTION]
@@ -226,6 +274,7 @@ class SappAutoScraper:
                     "run_id": run_id,
                     "scheduler_key": scheduler_key,
                     "job": job.name,
+                    "dataset_id": DATASET_IDS.get(job.name, job.name),
                     "label": job.label,
                     "status": "running",
                     "scheduled_for": scheduled_for,
@@ -246,18 +295,21 @@ class SappAutoScraper:
 
     async def _execute(self, job: ScheduledJob, scheduler_key: str, scheduled_for: datetime) -> dict[str, Any]:
         async with self.job_lock:
+            self.busy = True
             run_id = self._claim(job, scheduler_key, scheduled_for)
             if run_id is None:
+                self.busy = False
                 return {"status": "already_claimed", "job": job.name}
             try:
-                with self.thread_lock:
-                    result = await asyncio.to_thread(_run_job, job.name, scheduled_for.date())
+                result = await asyncio.to_thread(_run_job, job.name, scheduled_for.date())
                 self._finish(run_id, "success", result=result)
                 return {"status": "success", "job": job.name, "run_id": run_id}
             except Exception as exc:
                 self._finish(run_id, "failed", error=str(exc))
                 print(f"[scheduler] {job.name} failed: {exc}")
                 return {"status": "failed", "job": job.name, "run_id": run_id, "error": str(exc)}
+            finally:
+                self.busy = False
 
     async def _loop(self) -> None:
         while True:
@@ -271,7 +323,10 @@ class SappAutoScraper:
         job = next((item for item in JOB_DEFINITIONS if item.name == job_name), None)
         if job is None:
             raise ValueError(f"Unknown scheduled job: {job_name}")
+        if self.busy or self.job_lock.locked():
+            raise RuntimeError("A scrape is already in progress")
         current = _local_now()
+        self.busy = True
         asyncio.create_task(self._execute(job, f"manual:{uuid.uuid4()}", current))
         return {"status": "accepted", "job": job.name, "scheduled_for": current.isoformat()}
 
@@ -284,6 +339,7 @@ class SappAutoScraper:
             jobs.append(
                 {
                     "job": job.name,
+                    "dataset_id": DATASET_IDS.get(job.name, job.name),
                     "label": job.label,
                     "enabled": self.enabled,
                     "frequency": job.frequency,
@@ -293,7 +349,7 @@ class SappAutoScraper:
                     "last_run": _summary(latest) if latest else None,
                 }
             )
-        return {"enabled": self.enabled, "timezone": str(current.tzinfo), "jobs": jobs}
+        return {"enabled": self.enabled, "busy": self.busy, "timezone": str(current.tzinfo), "jobs": jobs}
 
     def runs(self, limit: int = 50) -> list[dict[str, Any]]:
         return [_summary(item) for item in get_db()[RUNS_COLLECTION].find().sort("started_at", -1).limit(limit)]

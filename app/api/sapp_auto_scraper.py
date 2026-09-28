@@ -26,3 +26,5 @@ async def trigger_auto_scraper(job_name: str):
         return await sapp_auto_scraper.trigger(job_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
