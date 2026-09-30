@@ -63,6 +63,7 @@ def send_ready_notification(payload: dict[str, Any]) -> dict[str, Any]:
     url = os.getenv("SAPP_SYNC_NOTIFY_URL", "").strip()
     secret = os.getenv("SAPP_SYNC_NOTIFY_SECRET", "").strip()
     if not url or not secret:
+        LOGGER.info("SAPP sync webhook disabled: URL or secret is not configured")
         return {"status": "disabled", "reason": "notify URL or secret is not configured"}
 
     body = _json_bytes(payload)
@@ -81,6 +82,11 @@ def send_ready_notification(payload: dict[str, Any]) -> dict[str, Any]:
             timeout=_timeout_seconds(),
         )
         response.raise_for_status()
+        LOGGER.info(
+            "SAPP sync webhook delivered event_id=%s status=%s",
+            payload.get("event_id"),
+            response.status_code,
+        )
         return {"status": "sent", "http_status": response.status_code}
     except Exception as exc:
         LOGGER.warning("SAPP sync webhook failed: %s", exc)

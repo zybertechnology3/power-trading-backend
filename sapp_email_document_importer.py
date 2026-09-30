@@ -365,6 +365,16 @@ class CreditNoteEmailImporter:
                         result=result,
                         source="email_importer",
                     )
+                    LOGGER.info(
+                        "🔔 UID %s | webhook=%s%s",
+                        uid,
+                        result["notification"].get("status"),
+                        (
+                            f" | http={result['notification'].get('http_status')}"
+                            if result["notification"].get("http_status") is not None
+                            else ""
+                        ),
+                    )
                 job_results.append(result)
 
             return {
