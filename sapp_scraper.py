@@ -1,4 +1,5 @@
 import os
+import calendar
 import re
 import shutil
 import subprocess
@@ -7,10 +8,13 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
+import httpx
 import openpyxl
+from app.core.config import settings
 from dotenv import load_dotenv
 from pymongo import UpdateOne
 from selenium import webdriver
@@ -33,6 +37,7 @@ BASE_URL = "https://trading.sappmtp.com"
 LOGIN_URL = f"{BASE_URL}/account/login?returnUrl=%2F"
 INBOX_URL = f"{BASE_URL}/mdd/message-inbox"
 AREA_RESULTS_TEST_URL = f"{BASE_URL}/amt/prices-and-turnover-X-dam"
+FPM_W_AREA_RESULTS_URL = f"{BASE_URL}/amt/prices-and-turnover-X-fpm"
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 CONSTRAINED_AREA_SUBJECT_TEMPLATE = "MTP - DAM - Constrained Area Results for {delivery_date}"
 CONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
@@ -40,6 +45,22 @@ UNCONSTRAINED_AREA_SUBJECT_TEMPLATE = (
     "MTP - DAM - Unconstrained Results for {delivery_date}"
 )
 UNCONSTRAINED_AREA_DATA_SOURCE = "SAPP_MTP_DAM_UNCONSTRAINED_RESULTS"
+FPM_W_CONSTRAINED_AREA_SUBJECT_TEMPLATE = (
+    "MTP - FPM-W - Constrained Area Results for {delivery_date}"
+)
+FPM_W_CONSTRAINED_AREA_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RESULTS"
+FPM_W_UNCONSTRAINED_AREA_SUBJECT_TEMPLATE = (
+    "MTP - FPM-W - Unconstrained Results for {delivery_date}"
+)
+FPM_W_UNCONSTRAINED_AREA_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
+FPM_M_CONSTRAINED_AREA_SUBJECT_TEMPLATE = (
+    "MTP - FPM-M - Constrained Area Results for {delivery_date}"
+)
+FPM_M_CONSTRAINED_AREA_DATA_SOURCE = "SAPP_AMT_FPM_M_CONSTRAINED_PRICE_RESULTS"
+FPM_M_UNCONSTRAINED_AREA_SUBJECT_TEMPLATE = (
+    "MTP - FPM-M - Unconstrained Results for {delivery_date}"
+)
+FPM_M_UNCONSTRAINED_AREA_DATA_SOURCE = "SAPP_AMT_FPM_M_UNCONSTRAINED_PRICE_RESULTS"
 PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE = (
     "MTP - DAM - Participant Portfolio Results for {delivery_date}"
 )
@@ -2510,6 +2531,266 @@ def extract_unconstrained_area_job(file_path: Path, job: SappExtractionJob) -> l
     return extract_unconstrained_area_results(file_path, data_source=job.data_source)
 
 
+@lru_cache(maxsize=None)
+def _public_holidays_for_year(year: int) -> tuple[date, ...]:
+    url = (
+        f"{settings.PUBLIC_HOLIDAYS_API_BASE_URL.rstrip('/')}"
+        f"/PublicHolidays/{year}/ZW"
+    )
+    response = httpx.get(url, timeout=10)
+    response.raise_for_status()
+    return tuple(
+        parse_delivery_date_value(record.get("date"))
+        for record in response.json()
+        if (not record.get("types") or "Public" in record.get("types", []))
+        and parse_delivery_date_value(record.get("date")) is not None
+    )
+
+
+def _effective_fpm_w_holiday_dates(start_date: date, end_date: date) -> set[date]:
+    """Match the standalone FPM-W holiday and Sunday-observed-day rules."""
+    actual_dates: set[date] = set()
+    for year in range(start_date.year - 1, end_date.year + 2):
+        actual_dates.update(_public_holidays_for_year(year))
+
+    effective_dates = set(actual_dates)
+    sorted_dates = sorted(actual_dates)
+    if not sorted_dates:
+        return effective_dates
+
+    run_start = run_end = sorted_dates[0]
+
+    def finalize_run(start: date, end: date) -> None:
+        current = start
+        while current <= end:
+            if current.weekday() == 6:
+                effective_dates.add(end + timedelta(days=1))
+                break
+            current += timedelta(days=1)
+
+    for current in sorted_dates[1:]:
+        if current == run_end + timedelta(days=1):
+            run_end = current
+        else:
+            finalize_run(run_start, run_end)
+            run_start = run_end = current
+    finalize_run(run_start, run_end)
+    return {
+        holiday_date
+        for holiday_date in effective_dates
+        if start_date <= holiday_date <= end_date
+    }
+
+
+def _find_fpm_w_week_start(sheet) -> Optional[date]:
+    for row in sheet.iter_rows(min_row=1, max_row=50, values_only=True):
+        if not row:
+            continue
+        for index, value in enumerate(row):
+            label = normalize_excel_header(value)
+            if label not in {"week starting:", "delivery week starting:"}:
+                continue
+            candidate = row[index + 1] if index + 1 < len(row) else None
+            parsed = parse_delivery_date_value(candidate)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def extract_fpm_w_area_results(
+    file_path: Path,
+    job: SappExtractionJob,
+) -> list[dict]:
+    """Extract one weekly FPM-W workbook and expand it to hourly rows."""
+    print(f"[7/7] Extracting FPM-W area rows from downloaded file: {file_path.name}")
+    workbook = openpyxl.load_workbook(file_path, data_only=True)
+    sheet = workbook.active
+    week_start = _find_fpm_w_week_start(sheet)
+    if week_start is None:
+        raise RuntimeError("Could not find the FPM-W delivery week start in the workbook.")
+
+    constrained = job.name == "fpm_w_constrained_area_results"
+    price_header = (
+        "area price (usd/mwh)" if constrained else "price (usd/mwh)"
+    )
+    header_row_index = None
+    product_col = price_col = None
+    for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+        normalized = [normalize_excel_header(value) for value in row]
+        if "product" in normalized and price_header in normalized:
+            header_row_index = row_index
+            product_col = normalized.index("product")
+            price_col = normalized.index(price_header)
+            break
+
+    if header_row_index is None or product_col is None or price_col is None:
+        raise RuntimeError(
+            f"Could not find the FPM-W {('constrained' if constrained else 'unconstrained')} "
+            "product and USD price columns."
+        )
+
+    weekly_prices: dict[str, float] = {}
+    for row in sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
+        if not row or product_col >= len(row):
+            continue
+        product = normalize_portfolio_product(row[product_col])
+        if product is None:
+            continue
+        value = to_float(row[price_col] if price_col < len(row) else None)
+        if value is not None:
+            weekly_prices[product] = value
+
+    missing_products = sorted({"off_peak", "peak", "standard"} - weekly_prices.keys())
+    if missing_products:
+        raise RuntimeError(
+            f"FPM-W workbook is missing price rows: {', '.join(missing_products)}"
+        )
+
+    week_end = week_start + timedelta(days=6)
+    holiday_dates = _effective_fpm_w_holiday_dates(week_start, week_end)
+    field_name = "area_price_usd_per_mwh" if constrained else "price_usd_per_mwh"
+    data_source = job.data_source
+    records = []
+    for offset in range(7):
+        delivery_day = week_start + timedelta(days=offset)
+        for hour in range(1, 25):
+            product = get_time_of_use_period(delivery_day, hour, holiday_dates)
+            record = {
+                "timestamp": delivery_timestamp(delivery_day, hour),
+                "delivery_date": delivery_day.isoformat(),
+                "hour": hour,
+                "hour_label": hour_label_from_hour(hour),
+                "product": product,
+                field_name: weekly_prices[product],
+                "search_delivery_date": week_start.isoformat(),
+                "window_start_date": week_start.isoformat(),
+                "window_end_date": week_end.isoformat(),
+                "window_offset_days": offset,
+                "category": "Price in USD",
+                "metadata": {
+                    "data_source": data_source,
+                    "source_page": FPM_W_AREA_RESULTS_URL,
+                    "category": "Price in USD",
+                    "search_delivery_date": week_start.isoformat(),
+                    "window_start_date": week_start.isoformat(),
+                    "window_end_date": week_end.isoformat(),
+                    "window_offset_days": offset,
+                },
+                "source_file": file_path.name,
+            }
+            records.append(record)
+
+    return records
+
+
+def extract_fpm_w_area_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
+    return extract_fpm_w_area_results(file_path, job)
+
+
+def _find_fpm_m_month_start(sheet) -> Optional[date]:
+    for row in sheet.iter_rows(min_row=1, max_row=50, values_only=True):
+        if not row:
+            continue
+        for index, value in enumerate(row):
+            if normalize_excel_header(value) != "delivery month:":
+                continue
+            candidate = row[index + 1] if index + 1 < len(row) else None
+            parsed = parse_delivery_date_value(candidate)
+            if parsed is not None:
+                return parsed.replace(day=1)
+    return None
+
+
+def extract_fpm_m_area_results(
+    file_path: Path,
+    job: SappExtractionJob,
+) -> list[dict]:
+    """Extract one monthly FPM-M workbook and expand it to hourly rows."""
+    print(f"[7/7] Extracting FPM-M area rows from downloaded file: {file_path.name}")
+    workbook = openpyxl.load_workbook(file_path, data_only=True)
+    sheet = workbook.active
+    month_start = _find_fpm_m_month_start(sheet)
+    if month_start is None:
+        raise RuntimeError("Could not find the FPM-M delivery month in the workbook.")
+
+    constrained = job.name == "fpm_m_constrained_area_results"
+    price_header = "area price (usd/mwh)" if constrained else "price (usd/mwh)"
+    header_row_index = None
+    product_col = price_col = None
+    for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+        normalized = [normalize_excel_header(value) for value in row]
+        if "product" in normalized and price_header in normalized:
+            header_row_index = row_index
+            product_col = normalized.index("product")
+            price_col = normalized.index(price_header)
+            break
+
+    if header_row_index is None or product_col is None or price_col is None:
+        raise RuntimeError(
+            f"Could not find the FPM-M {('constrained' if constrained else 'unconstrained')} "
+            "product and USD price columns."
+        )
+
+    monthly_prices: dict[str, float] = {}
+    for row in sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
+        if not row or product_col >= len(row):
+            continue
+        product = normalize_portfolio_product(row[product_col])
+        if product is None:
+            continue
+        value = to_float(row[price_col] if price_col < len(row) else None)
+        if value is not None:
+            monthly_prices[product] = value
+
+    missing_products = sorted({"off_peak", "peak", "standard"} - monthly_prices.keys())
+    if missing_products:
+        raise RuntimeError(
+            f"FPM-M workbook is missing price rows: {', '.join(missing_products)}"
+        )
+
+    month_end_date = month_start + timedelta(
+        days=calendar.monthrange(month_start.year, month_start.month)[1] - 1
+    )
+    holiday_dates = _effective_fpm_w_holiday_dates(month_start, month_end_date)
+    field_name = "area_price_usd_per_mwh" if constrained else "price_usd_per_mwh"
+    data_source = job.data_source
+    records = []
+    for offset in range((month_end_date - month_start).days + 1):
+        delivery_day = month_start + timedelta(days=offset)
+        for hour in range(1, 25):
+            product = get_time_of_use_period(delivery_day, hour, holiday_dates)
+            record = {
+                "timestamp": delivery_timestamp(delivery_day, hour),
+                "delivery_date": delivery_day.isoformat(),
+                "hour": hour,
+                "hour_label": hour_label_from_hour(hour),
+                "product": product,
+                field_name: monthly_prices[product],
+                "search_delivery_date": month_start.isoformat(),
+                "window_start_date": month_start.isoformat(),
+                "window_end_date": month_end_date.isoformat(),
+                "window_offset_days": offset,
+                "category": "Price in USD",
+                "metadata": {
+                    "data_source": data_source,
+                    "source_page": FPM_W_AREA_RESULTS_URL,
+                    "category": "Price in USD",
+                    "search_delivery_date": month_start.isoformat(),
+                    "window_start_date": month_start.isoformat(),
+                    "window_end_date": month_end_date.isoformat(),
+                    "window_offset_days": offset,
+                },
+                "source_file": file_path.name,
+            }
+            records.append(record)
+
+    return records
+
+
+def extract_fpm_m_area_job(file_path: Path, job: SappExtractionJob) -> list[dict]:
+    return extract_fpm_m_area_results(file_path, job)
+
+
 def extract_participant_portfolio_results(
     file_path: Path,
     data_source: str = PARTICIPANT_PORTFOLIO_DATA_SOURCE,
@@ -3110,6 +3391,42 @@ UNCONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
     extractor=extract_unconstrained_area_job,
 )
 
+FPM_W_CONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
+    name="fpm_w_constrained_area_results",
+    subject_template=FPM_W_CONSTRAINED_AREA_SUBJECT_TEMPLATE,
+    data_source=FPM_W_CONSTRAINED_AREA_DATA_SOURCE,
+    collection_name="sapp_fpm_w_constrained_area_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_fpm_w_area_job,
+)
+
+FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
+    name="fpm_w_unconstrained_area_results",
+    subject_template=FPM_W_UNCONSTRAINED_AREA_SUBJECT_TEMPLATE,
+    data_source=FPM_W_UNCONSTRAINED_AREA_DATA_SOURCE,
+    collection_name="sapp_fpm_w_unconstrained_area_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_fpm_w_area_job,
+)
+
+FPM_M_CONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
+    name="fpm_m_constrained_area_results",
+    subject_template=FPM_M_CONSTRAINED_AREA_SUBJECT_TEMPLATE,
+    data_source=FPM_M_CONSTRAINED_AREA_DATA_SOURCE,
+    collection_name="sapp_fpm_m_constrained_area_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_fpm_m_area_job,
+)
+
+FPM_M_UNCONSTRAINED_AREA_RESULTS_JOB = SappExtractionJob(
+    name="fpm_m_unconstrained_area_results",
+    subject_template=FPM_M_UNCONSTRAINED_AREA_SUBJECT_TEMPLATE,
+    data_source=FPM_M_UNCONSTRAINED_AREA_DATA_SOURCE,
+    collection_name="sapp_fpm_m_unconstrained_area_results",
+    unique_key_fields=("delivery_date", "hour"),
+    extractor=extract_fpm_m_area_job,
+)
+
 PARTICIPANT_PORTFOLIO_RESULTS_JOB = SappExtractionJob(
     name="participant_portfolio_results",
     subject_template=PARTICIPANT_PORTFOLIO_SUBJECT_TEMPLATE,
@@ -3149,6 +3466,10 @@ TRADING_INVOICE_RESULTS_JOB = SappExtractionJob(
 SAPP_EXTRACTION_JOBS: dict[str, SappExtractionJob] = {
     CONSTRAINED_AREA_RESULTS_JOB.name: CONSTRAINED_AREA_RESULTS_JOB,
     UNCONSTRAINED_AREA_RESULTS_JOB.name: UNCONSTRAINED_AREA_RESULTS_JOB,
+    FPM_W_CONSTRAINED_AREA_RESULTS_JOB.name: FPM_W_CONSTRAINED_AREA_RESULTS_JOB,
+    FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB.name: FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB,
+    FPM_M_CONSTRAINED_AREA_RESULTS_JOB.name: FPM_M_CONSTRAINED_AREA_RESULTS_JOB,
+    FPM_M_UNCONSTRAINED_AREA_RESULTS_JOB.name: FPM_M_UNCONSTRAINED_AREA_RESULTS_JOB,
     PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_RESULTS_JOB,
     PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB,
     PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB.name: PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB,

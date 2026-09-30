@@ -33,6 +33,10 @@ from app.db.database import get_db
 from app.services.sapp_sync_notifier import record_external_run
 from sapp_scraper import (
     CONSTRAINED_AREA_RESULTS_JOB,
+    FPM_M_CONSTRAINED_AREA_RESULTS_JOB,
+    FPM_M_UNCONSTRAINED_AREA_RESULTS_JOB,
+    FPM_W_CONSTRAINED_AREA_RESULTS_JOB,
+    FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB,
     INTERNAL_COLLECTION_FIELD,
     INTERNAL_UNIQUE_KEY_FIELDS_FIELD,
     PARTICIPANT_PORTFOLIO_RESULTS_JOB,
@@ -54,6 +58,10 @@ DEFAULT_SUBJECT_SEARCH_TERMS = (
     "MTP - DAM - Participant Portfolio Results",
     "MTP - DAM - Unconstrained Results",
     "MTP - DAM - Constrained Area Results",
+    "MTP - FPM-W - Constrained Area Results",
+    "MTP - FPM-W - Unconstrained Results",
+    "MTP - FPM-M - Constrained Area Results",
+    "MTP - FPM-M - Unconstrained Results",
 )
 LOGGER = logging.getLogger("sapp.email_documents")
 
@@ -102,6 +110,14 @@ def _job_for_attachment(filename: str):
     normalized = re.sub(r"[^a-z0-9]+", "", filename.lower())
     if "tradinginvoicecreditnote" in normalized:
         return TRADING_INVOICE_RESULTS_JOB
+    if "fpmw" in normalized and "unconstrainedresults" in normalized:
+        return FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB
+    if "fpmw" in normalized and "constrainedarearesults" in normalized:
+        return FPM_W_CONSTRAINED_AREA_RESULTS_JOB
+    if "fpmm" in normalized and "unconstrainedresults" in normalized:
+        return FPM_M_UNCONSTRAINED_AREA_RESULTS_JOB
+    if "fpmm" in normalized and "constrainedarearesults" in normalized:
+        return FPM_M_CONSTRAINED_AREA_RESULTS_JOB
     if "unconstrainedresults" in normalized:
         return UNCONSTRAINED_AREA_RESULTS_JOB
     if "constrainedarearesults" in normalized:
@@ -357,6 +373,10 @@ class CreditNoteEmailImporter:
                             PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: "portfolio_dam",
                             CONSTRAINED_AREA_RESULTS_JOB.name: "dam",
                             UNCONSTRAINED_AREA_RESULTS_JOB.name: "dam",
+                            FPM_W_CONSTRAINED_AREA_RESULTS_JOB.name: "fpm_w",
+                            FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB.name: "fpm_w",
+                            FPM_M_CONSTRAINED_AREA_RESULTS_JOB.name: "fpm_m",
+                            FPM_M_UNCONSTRAINED_AREA_RESULTS_JOB.name: "fpm_m",
                         }.get(job.name, job.name),
                         job=job.name,
                         status="success",
