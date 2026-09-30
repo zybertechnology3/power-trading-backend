@@ -17,6 +17,11 @@ from dotenv import load_dotenv
 from pymongo.errors import DuplicateKeyError
 
 from app.db.database import get_db
+from app.services.sapp_sync_notifier import (
+    build_ready_payload,
+    send_ready_notification,
+    utc_now,
+)
 from area_results_test_scraper import run as run_dam_standalone
 from bm_atc_test_scraper import run as run_bm_atc_standalone
 from fpm_m_test import run as run_fpm_m_standalone
@@ -266,8 +271,16 @@ class SappAutoScraper:
                 pass
             self.task = None
 
-    def _claim(self, job: ScheduledJob, scheduler_key: str, scheduled_for: datetime) -> Optional[str]:
+    def _claim(
+        self,
+        job: ScheduledJob,
+        scheduler_key: str,
+        scheduled_for: datetime,
+        start_date: date,
+        end_date: date,
+    ) -> Optional[str]:
         run_id = str(uuid.uuid4())
+        started_at = utc_now()
         try:
             get_db()[RUNS_COLLECTION].insert_one(
                 {
@@ -278,34 +291,111 @@ class SappAutoScraper:
                     "label": job.label,
                     "status": "running",
                     "scheduled_for": scheduled_for,
-                    "started_at": datetime.utcnow(),
+                    "started_at": started_at,
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "source": "scheduler",
                 }
             )
             return run_id
         except DuplicateKeyError:
             return None
 
-    def _finish(self, run_id: str, status: str, result: Any = None, error: Optional[str] = None) -> None:
-        update = {"status": status, "finished_at": datetime.utcnow()}
+    def _finish(
+        self,
+        run_id: str,
+        status: str,
+        result: Any = None,
+        error: Optional[str] = None,
+        finished_at: Optional[datetime] = None,
+    ) -> None:
+        update = {"status": status, "finished_at": finished_at or utc_now()}
         if result is not None:
             update["result"] = _summary(result)
         if error:
             update["error"] = error
         get_db()[RUNS_COLLECTION].update_one({"run_id": run_id}, {"$set": update})
 
+    async def _notify_run(
+        self,
+        *,
+        run_id: str,
+        job: ScheduledJob,
+        status: str,
+        start_date: date,
+        end_date: date,
+        started_at: datetime,
+        finished_at: datetime,
+        result: Any = None,
+        error: Optional[str] = None,
+    ) -> None:
+        payload = build_ready_payload(
+            run_id=run_id,
+            dataset_id=DATASET_IDS.get(job.name, job.name),
+            job=job.name,
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+            result=_summary(result) if result is not None else {"error": error},
+            source="scheduler",
+        )
+        try:
+            notification = await asyncio.to_thread(send_ready_notification, payload)
+            get_db()[RUNS_COLLECTION].update_one(
+                {"run_id": run_id},
+                {"$set": {"notification": notification}},
+            )
+        except Exception as exc:
+            # A notification outage must not turn a successful scrape into a
+            # failed scrape. The finished-runs endpoint remains the fallback.
+            print(f"[scheduler] Notification recording failed for {run_id}: {exc}")
+
     async def _execute(self, job: ScheduledJob, scheduler_key: str, scheduled_for: datetime) -> dict[str, Any]:
         async with self.job_lock:
             self.busy = True
-            run_id = self._claim(job, scheduler_key, scheduled_for)
+            start_date, end_date = _portfolio_lookahead_range(job.name, scheduled_for.date())
+            started_at = utc_now()
+            run_id = self._claim(job, scheduler_key, scheduled_for, start_date, end_date)
             if run_id is None:
                 self.busy = False
                 return {"status": "already_claimed", "job": job.name}
             try:
-                result = await asyncio.to_thread(_run_job, job.name, scheduled_for.date())
-                self._finish(run_id, "success", result=result)
+                result = await asyncio.to_thread(
+                    _run_job,
+                    job.name,
+                    scheduled_for.date(),
+                )
+                finished_at = utc_now()
+                self._finish(run_id, "success", result=result, finished_at=finished_at)
+                await self._notify_run(
+                    run_id=run_id,
+                    job=job,
+                    status="success",
+                    start_date=start_date,
+                    end_date=end_date,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    result=result,
+                )
                 return {"status": "success", "job": job.name, "run_id": run_id}
             except Exception as exc:
-                self._finish(run_id, "failed", error=str(exc))
+                finished_at = utc_now()
+                self._finish(run_id, "failed", error=str(exc), finished_at=finished_at)
+                try:
+                    await self._notify_run(
+                        run_id=run_id,
+                        job=job,
+                        status="failed",
+                        start_date=start_date,
+                        end_date=end_date,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        error=str(exc),
+                    )
+                except Exception as notification_exc:
+                    print(f"[scheduler] Notification failed for {job.name}: {notification_exc}")
                 print(f"[scheduler] {job.name} failed: {exc}")
                 return {"status": "failed", "job": job.name, "run_id": run_id, "error": str(exc)}
             finally:
@@ -353,6 +443,41 @@ class SappAutoScraper:
 
     def runs(self, limit: int = 50) -> list[dict[str, Any]]:
         return [_summary(item) for item in get_db()[RUNS_COLLECTION].find().sort("started_at", -1).limit(limit)]
+
+    def finished_runs(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        dataset_id: Optional[str] = None,
+        status: str = "success",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return a bounded, cursor-friendly feed for frontend data sync."""
+        as_of = utc_now()
+        query: dict[str, Any] = {
+            "finished_at": {"$lte": as_of},
+            "status": {"$in": ["success", "failed"]}
+            if status == "all"
+            else status,
+        }
+        if since is not None:
+            query["finished_at"]["$gt"] = since
+        if dataset_id:
+            query["dataset_id"] = dataset_id
+
+        runs = [
+            _summary(item)
+            for item in get_db()[RUNS_COLLECTION]
+            .find(query)
+            .sort([("finished_at", 1), ("run_id", 1)])
+            .limit(limit)
+        ]
+        return {
+            "runs": runs,
+            "server_time": as_of.isoformat(),
+            "next_since": as_of.isoformat(),
+            "has_more": len(runs) >= limit,
+        }
 
 
 sapp_auto_scraper = SappAutoScraper()
