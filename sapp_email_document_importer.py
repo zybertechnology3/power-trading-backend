@@ -40,6 +40,8 @@ from sapp_scraper import (
     INTERNAL_COLLECTION_FIELD,
     INTERNAL_UNIQUE_KEY_FIELDS_FIELD,
     PARTICIPANT_PORTFOLIO_RESULTS_JOB,
+    PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB,
+    PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB,
     TRADING_INVOICE_HOURLY_COLLECTION,
     TRADING_INVOICE_RESULTS_JOB,
     UNCONSTRAINED_AREA_RESULTS_JOB,
@@ -56,6 +58,8 @@ STATE_VERSION = 3
 DEFAULT_SUBJECT_SEARCH_TERMS = (
     "MTP - Trading Invoice / Credit Note",
     "MTP - DAM - Participant Portfolio Results",
+    "MTP - FPM-W - Participant Portfolio Results",
+    "MTP - FPM-M - Participant Portfolio Results",
     "MTP - DAM - Unconstrained Results",
     "MTP - DAM - Constrained Area Results",
     "MTP - FPM-W - Constrained Area Results",
@@ -110,6 +114,12 @@ def _job_for_attachment(filename: str):
     normalized = re.sub(r"[^a-z0-9]+", "", filename.lower())
     if "tradinginvoicecreditnote" in normalized:
         return TRADING_INVOICE_RESULTS_JOB
+    if "participant" in normalized and "portfolio" in normalized and "fpmw" in normalized:
+        return PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB
+    if "participant" in normalized and "portfolio" in normalized and "fpmm" in normalized:
+        return PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB
+    if "participant" in normalized and "portfolio" in normalized and "dam" in normalized:
+        return PARTICIPANT_PORTFOLIO_RESULTS_JOB
     if "fpmw" in normalized and "unconstrainedresults" in normalized:
         return FPM_W_UNCONSTRAINED_AREA_RESULTS_JOB
     if "fpmw" in normalized and "constrainedarearesults" in normalized:
@@ -122,8 +132,6 @@ def _job_for_attachment(filename: str):
         return UNCONSTRAINED_AREA_RESULTS_JOB
     if "constrainedarearesults" in normalized:
         return CONSTRAINED_AREA_RESULTS_JOB
-    if "participant" in normalized and "portfolio" in normalized and "dam" in normalized:
-        return PARTICIPANT_PORTFOLIO_RESULTS_JOB
     return None
 
 
@@ -371,6 +379,8 @@ class CreditNoteEmailImporter:
                         dataset_id={
                             TRADING_INVOICE_RESULTS_JOB.name: "credit_notes",
                             PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: "portfolio_dam",
+                            PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB.name: "portfolio_fpm_w",
+                            PARTICIPANT_PORTFOLIO_FPM_M_RESULTS_JOB.name: "portfolio_fpm_m",
                             CONSTRAINED_AREA_RESULTS_JOB.name: "dam",
                             UNCONSTRAINED_AREA_RESULTS_JOB.name: "dam",
                             FPM_W_CONSTRAINED_AREA_RESULTS_JOB.name: "fpm_w",
