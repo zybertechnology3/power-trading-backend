@@ -93,6 +93,8 @@ TRADING_INVOICE_MARKET_ALIASES = {
 }
 STANDALONE_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_CONSTRAINED_PRICE_RESULTS"
 STANDALONE_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_DAM_UNCONSTRAINED_PRICE_RESULTS"
+EMAIL_CONSTRAINED_DATA_SOURCE = "SAPP_MTP_DAM_CONSTRAINED_AREA_RESULTS"
+EMAIL_UNCONSTRAINED_DATA_SOURCE = "SAPP_MTP_DAM_UNCONSTRAINED_RESULTS"
 STANDALONE_FPM_W_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_CONSTRAINED_PRICE_RESULTS"
 STANDALONE_FPM_W_UNCONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_W_UNCONSTRAINED_PRICE_RESULTS"
 STANDALONE_FPM_M_CONSTRAINED_DATA_SOURCE = "SAPP_AMT_FPM_M_CONSTRAINED_PRICE_RESULTS"
@@ -2116,11 +2118,15 @@ def get_standalone_area_results_for_range(
     )
     constrained_filter = {
         **base_filter,
-        "metadata.data_source": STANDALONE_CONSTRAINED_DATA_SOURCE,
+        "metadata.data_source": {
+            "$in": [STANDALONE_CONSTRAINED_DATA_SOURCE, EMAIL_CONSTRAINED_DATA_SOURCE]
+        },
     }
     unconstrained_filter = {
         **base_filter,
-        "metadata.data_source": STANDALONE_UNCONSTRAINED_DATA_SOURCE,
+        "metadata.data_source": {
+            "$in": [STANDALONE_UNCONSTRAINED_DATA_SOURCE, EMAIL_UNCONSTRAINED_DATA_SOURCE]
+        },
     }
 
     constrained_records = [
@@ -2165,11 +2171,15 @@ def get_dam_area_results_for_range(
     base_filter = _build_sapp_time_filter(None, start_date, end_date, None, None)
     constrained_filter = {
         **base_filter,
-        "metadata.data_source": STANDALONE_CONSTRAINED_DATA_SOURCE,
+        "metadata.data_source": {
+            "$in": [STANDALONE_CONSTRAINED_DATA_SOURCE, EMAIL_CONSTRAINED_DATA_SOURCE]
+        },
     }
     unconstrained_filter = {
         **base_filter,
-        "metadata.data_source": STANDALONE_UNCONSTRAINED_DATA_SOURCE,
+        "metadata.data_source": {
+            "$in": [STANDALONE_UNCONSTRAINED_DATA_SOURCE, EMAIL_UNCONSTRAINED_DATA_SOURCE]
+        },
     }
 
     constrained_records = list(
