@@ -272,6 +272,10 @@ class CreditNoteEmailImporter:
                 "Set SAPP_EMAIL_USERNAME and SAPP_EMAIL_PASSWORD in .env "
                 "(an app password is recommended)."
             )
+        LOGGER.info(
+            "Configured subject filters: %s",
+            " | ".join(self.subject_search_terms),
+        )
 
     def _search_uids(self, mailbox: imaplib.IMAP4_SSL) -> list[str]:
         criteria: list[str] = ["UNSEEN"] if self.unseen_only else ["ALL"]
@@ -448,6 +452,7 @@ class CreditNoteEmailImporter:
                     continue
                 LOGGER.info("📨 UID %s | new message", uid)
                 subject = ""
+                processed_successfully = False
                 try:
                     message = self._fetch_message(mailbox, uid)
                     subject = str(message.get("subject", ""))
@@ -455,6 +460,7 @@ class CreditNoteEmailImporter:
                     if self.mark_seen:
                         mailbox.uid("store", uid, "+FLAGS", "(\\Seen)")
                     results.append(result)
+                    processed_successfully = True
                     LOGGER.info(
                         "✅ UID %s | status=%s | jobs=%s | dates=%s",
                         uid,
@@ -468,10 +474,16 @@ class CreditNoteEmailImporter:
                     LOGGER.error("❌ UID %s | %s", uid, exc)
                     LOGGER.debug("UID %s failure details", uid, exc_info=True)
                 finally:
-                    # A message is considered checked even when it has no
-                    # Excel attachment or contains an invalid workbook.
-                    # This prevents every polling cycle from retrying it.
-                    processed.add(uid)
+                    # Only successful messages are permanently acknowledged.
+                    # Failed extraction or storage can be transient, so leave
+                    # those UIDs eligible for retry.
+                    if processed_successfully:
+                        processed.add(uid)
+                    else:
+                        LOGGER.warning(
+                            "UID %s was not marked processed; it will be retried",
+                            uid,
+                        )
                     _save_state(self.state_file, processed)
             LOGGER.info(
                 "📊 Scan complete | found=%d | skipped=%d | handled=%d | elapsed=%.2fs",
