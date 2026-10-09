@@ -539,7 +539,8 @@ def main() -> None:
     while True:
         try:
             importer.scan_once()
-        except Exception:
+        except Exception as exc:
+            LOGGER.error("Mailbox scan failed; retrying: %s", exc)
             LOGGER.error("❌ Mailbox scan failed; retrying")
             LOGGER.debug("Mailbox scan failure details", exc_info=True)
         if args.once:
