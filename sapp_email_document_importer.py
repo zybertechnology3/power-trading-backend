@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import email
+import hashlib
+import html
 import imaplib
 import json
 import logging
@@ -21,7 +23,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email import policy
 from email.message import Message
 from pathlib import Path
@@ -55,6 +57,8 @@ load_dotenv()
 DATE_PATTERN = re.compile(r"(?:for|credit[- ]note)[^0-9]*(\d{4}[/-]\d{2}[/-]\d{2})", re.I)
 DOWNLOAD_COPY_PATTERN = re.compile(r" \(\d+\)(?=\.[^.]+$)")
 STATE_VERSION = 3
+IDM_TRADE_JOB = "idm_trade_concluded"
+IDM_TRADE_DATA_SOURCE = "SAPP_MTP_IDM_TRADE_EMAIL"
 DEFAULT_SUBJECT_SEARCH_TERMS = (
     "MTP - Trading Invoice / Credit Note",
     "MTP - DAM - Participant Portfolio Results",
@@ -66,6 +70,8 @@ DEFAULT_SUBJECT_SEARCH_TERMS = (
     "MTP - FPM-W - Unconstrained Results",
     "MTP - FPM-M - Constrained Area Results",
     "MTP - FPM-M - Unconstrained Results",
+    "Idm Buy Trade Concluded",
+    "Idm Sell Trade Concluded",
 )
 LOGGER = logging.getLogger("sapp.email_documents")
 
@@ -107,6 +113,243 @@ def _attachment_parts(message: Message) -> list[tuple[str, bytes]]:
         if payload:
             attachments.append((_safe_filename(filename), payload))
     return attachments
+
+
+def _message_text(message: Message) -> str:
+    """Return readable plain text from a plain-text or HTML email body."""
+    parts: list[str] = []
+    for part in message.walk():
+        if part.get_content_disposition() == "attachment":
+            continue
+        if part.get_content_type() not in {"text/plain", "text/html"}:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            value = payload.decode(charset, errors="replace")
+        except LookupError:
+            value = payload.decode("utf-8", errors="replace")
+        if part.get_content_type() == "text/html":
+            value = re.sub(r"<br\s*/?>", "\n", value, flags=re.I)
+            value = re.sub(r"</(?:div|li|p|tr)>", "\n", value, flags=re.I)
+            value = re.sub(r"<[^>]+>", " ", value)
+            value = html.unescape(value)
+        parts.append(value)
+    return "\n".join(parts)
+
+
+def _label_value(text: str, label: str) -> str | None:
+    match = re.search(rf"^\s*{re.escape(label)}\s*:\s*(.+?)\s*$", text, re.I | re.M)
+    return match.group(1).strip() if match else None
+
+
+def _number(value: str | None) -> float | None:
+    if value is None:
+        return None
+    match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", value)
+    if not match:
+        return None
+    return float(match.group(0).replace(",", ""))
+
+
+def _extract_idm_trade(message: Message, uid: str) -> dict | None:
+    """Extract one IDM trade-concluded email into hourly-detail fields."""
+    subject = str(message.get("subject", ""))
+    trade_match = re.search(
+        r"\bidm\s+(buy|sell)\s+trade\s+concluded\b",
+        subject,
+        re.I,
+    )
+    if not trade_match:
+        return None
+
+    body = _message_text(message)
+    quantity = _number(_label_value(body, "Quantity"))
+    price_line = _label_value(body, "Price")
+    price_usd = _number(
+        re.search(r"\bUSD\s*([-+]?\d[\d,]*(?:\.\d+)?)", price_line or "", re.I).group(1)
+        if re.search(r"\bUSD\s*([-+]?\d[\d,]*(?:\.\d+)?)", price_line or "", re.I)
+        else None
+    )
+    price_zar = _number(
+        re.search(r"\bZAR\s*([-+]?\d[\d,]*(?:\.\d+)?)", price_line or "", re.I).group(1)
+        if re.search(r"\bZAR\s*([-+]?\d[\d,]*(?:\.\d+)?)", price_line or "", re.I)
+        else None
+    )
+    delivery_value = _label_value(body, "Delivery Day")
+    interval_value = _label_value(body, "Delivery Interval Hour")
+    portfolio = _label_value(body, "Portfolio")
+    interval_match = re.search(r"(\d{1,2})\s*[-–]\s*(\d{1,2})", interval_value or "")
+
+    missing = []
+    if quantity is None:
+        missing.append("Quantity")
+    if price_usd is None:
+        missing.append("USD price")
+    if delivery_value is None:
+        missing.append("Delivery Day")
+    if interval_match is None:
+        missing.append("Delivery Interval Hour")
+    if missing:
+        raise RuntimeError(
+            f"IDM trade email is missing required fields: {', '.join(missing)}"
+        )
+
+    delivery_date = _parse_date(delivery_value)
+    interval_start = int(interval_match.group(1))
+    interval_end = int(interval_match.group(2))
+    if interval_start < 0 or interval_start > 23 or interval_end != interval_start + 1:
+        raise RuntimeError(f"Invalid IDM delivery interval: {interval_value!r}")
+    hour = interval_start + 1
+
+    trade_type = trade_match.group(1).upper()
+    amount_usd = quantity * price_usd
+    trade_id = hashlib.sha256(
+        f"{uid}|{delivery_date.isoformat()}|{hour}|{trade_type}|{portfolio or ''}".encode()
+    ).hexdigest()[:24]
+    return {
+        "timestamp": datetime.combine(delivery_date, datetime.min.time())
+        + timedelta(hours=hour - 1),
+        "delivery_date": delivery_date.isoformat(),
+        "market": "idm",
+        "hour": hour,
+        "hour_label": f"{interval_start:02d}-{interval_end:02d}",
+        "price_usd_per_mwh": price_usd,
+        "price_zar_per_mwh": price_zar,
+        "traded_purchases_mwh": quantity if trade_type == "BUY" else None,
+        "traded_sales_mwh": quantity if trade_type == "SELL" else None,
+        "purchase_turnover_usd": amount_usd if trade_type == "BUY" else None,
+        "sale_turnover_usd": -amount_usd if trade_type == "SELL" else None,
+        "portfolio": portfolio,
+        "trade_type": trade_type,
+        "trade_id": trade_id,
+        "data_source": IDM_TRADE_DATA_SOURCE,
+        "metadata": {
+            "data_source": IDM_TRADE_DATA_SOURCE,
+            "source_uid": str(uid),
+            "portfolio": portfolio,
+            "trade_type": trade_type,
+            "price_zar_per_mwh": price_zar,
+            "trade_id": trade_id,
+        },
+        "source_file": f"email:{uid}:{subject}",
+    }
+
+
+def _store_idm_trade(record: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    collection = get_db()[TRADING_INVOICE_HOURLY_COLLECTION]
+    unique_filter = {
+        "delivery_date": record["delivery_date"],
+        "market": "idm",
+        "hour": record["hour"],
+    }
+    existing = collection.find_one(unique_filter)
+    existing_metadata = existing.get("metadata", {}) if existing else {}
+    existing_trade_ids = list(existing.get("trade_ids", [])) if existing else []
+    if existing and existing.get("trade_id"):
+        existing_trade_ids.append(existing["trade_id"])
+    existing_trade_ids = list(dict.fromkeys(existing_trade_ids))
+    if record["trade_id"] in existing_trade_ids:
+        return {
+            "job": IDM_TRADE_JOB,
+            "status": "already_imported",
+            "delivery_date": record["delivery_date"],
+            "market": "idm",
+            "hour": record["hour"],
+            "trade_type": record["trade_type"],
+            "imported": 0,
+            "updated": 0,
+            "source_file": record["source_file"],
+        }
+
+    direct_idm_record = bool(
+        existing
+        and (
+            existing_metadata.get("data_source") == IDM_TRADE_DATA_SOURCE
+            or existing_trade_ids
+        )
+    )
+    if direct_idm_record:
+        previous_purchase_mwh = existing.get("traded_purchases_mwh") or 0.0
+        previous_sale_mwh = existing.get("traded_sales_mwh") or 0.0
+        purchase_mwh = previous_purchase_mwh + (record.get("traded_purchases_mwh") or 0.0)
+        sale_mwh = previous_sale_mwh + (record.get("traded_sales_mwh") or 0.0)
+        previous_purchase_amount = existing.get("purchase_turnover_usd") or 0.0
+        previous_sale_amount = existing.get("sale_turnover_usd") or 0.0
+        purchase_amount = previous_purchase_amount + (record.get("purchase_turnover_usd") or 0.0)
+        sale_amount = previous_sale_amount + (record.get("sale_turnover_usd") or 0.0)
+        previous_quantity = previous_purchase_mwh + previous_sale_mwh
+        new_quantity = (record.get("traded_purchases_mwh") or 0.0) + (
+            record.get("traded_sales_mwh") or 0.0
+        )
+        total_quantity = purchase_mwh + sale_mwh
+        weighted_usd = (
+            (existing.get("price_usd_per_mwh") or 0.0) * previous_quantity
+            + (record.get("price_usd_per_mwh") or 0.0) * new_quantity
+        )
+        weighted_zar = (
+            (existing.get("price_zar_per_mwh") or 0.0) * previous_quantity
+            + (record.get("price_zar_per_mwh") or 0.0) * new_quantity
+        )
+        trade_type = (
+            "MIXED"
+            if purchase_mwh and sale_mwh
+            else "BUY"
+            if purchase_mwh
+            else "SELL"
+        )
+        source_files = [
+            value.strip()
+            for value in str(existing.get("source_file", "")).split(" + ")
+            if value.strip()
+        ]
+        source_files.append(record["source_file"])
+        record = {
+            **record,
+            "price_usd_per_mwh": weighted_usd / total_quantity if total_quantity else None,
+            "price_zar_per_mwh": weighted_zar / total_quantity if total_quantity else None,
+            "traded_purchases_mwh": purchase_mwh or None,
+            "traded_sales_mwh": sale_mwh or None,
+            "purchase_turnover_usd": purchase_amount or None,
+            "sale_turnover_usd": sale_amount or None,
+            "trade_type": trade_type,
+            "trade_ids": existing_trade_ids + [record["trade_id"]],
+            "source_file": " + ".join(dict.fromkeys(source_files)),
+            "metadata": {
+                **existing_metadata,
+                **record["metadata"],
+                "idm_trade_ids": existing_trade_ids + [record["trade_id"]],
+            },
+        }
+    else:
+        record["trade_ids"] = [record["trade_id"]]
+        record["metadata"] = {
+            **record["metadata"],
+            "idm_trade_ids": [record["trade_id"]],
+        }
+
+    result = collection.update_one(
+        unique_filter,
+        {
+            "$set": {**record, "updated_at": now},
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    return {
+        "job": IDM_TRADE_JOB,
+        "status": "success",
+        "delivery_date": record["delivery_date"],
+        "market": "idm",
+        "hour": record["hour"],
+        "trade_type": record["trade_type"],
+        "imported": 1 if result.upserted_id is not None else 0,
+        "updated": result.matched_count,
+        "source_file": record["source_file"],
+    }
 
 
 def _job_for_attachment(filename: str):
@@ -322,6 +565,49 @@ class CreditNoteEmailImporter:
     def _process_message(self, uid: str, message: Message) -> dict:
         subject = str(message.get("subject", ""))
         LOGGER.debug("UID %s | subject=%r", uid, subject)
+        idm_trade = _extract_idm_trade(message, uid)
+        if idm_trade is not None:
+            LOGGER.info(
+                "ðŸ“ˆ UID %s | IDM %s | delivery=%s | hour=%s | quantity=%s MW | price=%s USD/MWh",
+                uid,
+                idm_trade["trade_type"],
+                idm_trade["delivery_date"],
+                idm_trade["hour"],
+                idm_trade["traded_purchases_mwh"] or idm_trade["traded_sales_mwh"],
+                idm_trade["price_usd_per_mwh"],
+            )
+            result = _store_idm_trade(idm_trade)
+            if result.get("status") != "already_imported":
+                result["run_id"] = f"email:{uid}:{IDM_TRADE_JOB}"
+                result["notification"] = record_external_run(
+                    run_id=result["run_id"],
+                    dataset_id="idm_trades",
+                    job=IDM_TRADE_JOB,
+                    status="success",
+                    start_date=idm_trade["delivery_date"],
+                    end_date=idm_trade["delivery_date"],
+                    result=result,
+                    source="email_importer",
+                )
+                LOGGER.info(
+                    "ðŸ”” UID %s | IDM webhook=%s%s",
+                    uid,
+                    result["notification"].get("status"),
+                    (
+                        f" | http={result['notification'].get('http_status')}"
+                        if result["notification"].get("http_status") is not None
+                        else ""
+                    ),
+                )
+            else:
+                LOGGER.info("UID %s | IDM trade already imported; webhook skipped", uid)
+            return {
+                "uid": uid,
+                "subject": subject,
+                "status": "success",
+                "jobs": [result],
+                "delivery_dates": [idm_trade["delivery_date"]],
+            }
         with tempfile.TemporaryDirectory(prefix="email-credit-note-") as directory:
             download_dir = Path(directory)
             attachments = _attachment_parts(message)

@@ -717,12 +717,17 @@ class SappTradingInvoiceHourlyDetailCreate(BaseModel):
     hour: Optional[int] = Field(None, ge=1, le=24, description="Delivery hour, 1-24")
     hour_label: Optional[str] = Field(None, description="Original hour label from the document")
     price_usd_per_mwh: Optional[float] = None
+    price_zar_per_mwh: Optional[float] = None
     traded_purchases_mwh: Optional[float] = None
     traded_sales_mwh: Optional[float] = None
     purchase_turnover_usd: Optional[float] = None
     sale_turnover_usd: Optional[float] = None
     admin_fees_usd: Optional[float] = None
     wheeling_cost_usd: Optional[float] = None
+    portfolio: Optional[str] = None
+    trade_type: Optional[str] = None
+    trade_id: Optional[str] = None
+    trade_ids: list[str] = Field(default_factory=list)
     data_source: str = Field("SAPP_MTP_TRADING_INVOICE_HOURLY_DETAIL")
     source_file: Optional[str] = None
 
