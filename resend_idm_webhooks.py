@@ -18,11 +18,12 @@ from dotenv import load_dotenv
 
 from app.db.database import get_db
 from app.services.sapp_sync_notifier import record_external_run
+from sapp_email_document_importer import IDM_PORTFOLIO_COLLECTION, IDM_PORTFOLIO_JOB
 
 
-COLLECTION = "sapp_trading_invoice_hourly_details"
-DATASET_ID = "idm_trades"
-JOB = "idm_trade_concluded"
+COLLECTION = IDM_PORTFOLIO_COLLECTION
+DATASET_ID = "portfolio_idm"
+JOB = IDM_PORTFOLIO_JOB
 
 
 def _date(value: str) -> date:

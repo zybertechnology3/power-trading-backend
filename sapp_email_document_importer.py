@@ -57,8 +57,10 @@ load_dotenv()
 DATE_PATTERN = re.compile(r"(?:for|credit[- ]note)[^0-9]*(\d{4}[/-]\d{2}[/-]\d{2})", re.I)
 DOWNLOAD_COPY_PATTERN = re.compile(r" \(\d+\)(?=\.[^.]+$)")
 STATE_VERSION = 3
-IDM_TRADE_JOB = "idm_trade_concluded"
 IDM_TRADE_DATA_SOURCE = "SAPP_MTP_IDM_TRADE_EMAIL"
+IDM_PORTFOLIO_JOB = "participant_portfolio_results_idm"
+IDM_PORTFOLIO_DATASET_ID = "portfolio_idm"
+IDM_PORTFOLIO_COLLECTION = "sapp_participant_portfolio_results"
 DEFAULT_SUBJECT_SEARCH_TERMS = (
     "MTP - Trading Invoice / Credit Note",
     "MTP - DAM - Participant Portfolio Results",
@@ -290,6 +292,16 @@ def _extract_idm_trade(message: Message, uid: str) -> dict | None:
         "trade_type": trade_type,
         "trade_id": trade_id,
         "trade_fingerprint": trade_id,
+        "participant_total_area_schedule_mwh": (
+            quantity if trade_type == "BUY" else -quantity
+        ),
+        "area_price_usd_per_mwh": price_usd,
+        "idm_quantity_mwh": quantity,
+        "idm_price_usd_per_mwh": price_usd,
+        "idm_price_zar_per_mwh": price_zar,
+        "idm_trade_type": trade_type,
+        "idm_trade_id": trade_id,
+        "idm_trade_ids": [trade_id],
         "data_source": IDM_TRADE_DATA_SOURCE,
         "metadata": {
             "data_source": IDM_TRADE_DATA_SOURCE,
@@ -306,7 +318,7 @@ def _extract_idm_trade(message: Message, uid: str) -> dict | None:
 
 def _store_idm_trade(record: dict) -> dict:
     now = datetime.now(timezone.utc)
-    collection = get_db()[TRADING_INVOICE_HOURLY_COLLECTION]
+    collection = get_db()[IDM_PORTFOLIO_COLLECTION]
     unique_filter = {
         "delivery_date": record["delivery_date"],
         "market": "idm",
@@ -328,7 +340,7 @@ def _store_idm_trade(record: dict) -> dict:
     incoming_fingerprint = record.get("trade_fingerprint") or record["trade_id"]
     if incoming_fingerprint in existing_fingerprints or record["trade_id"] in existing_trade_ids:
         return {
-            "job": IDM_TRADE_JOB,
+            "job": IDM_PORTFOLIO_JOB,
             "status": "already_imported",
             "delivery_date": record["delivery_date"],
             "market": "idm",
@@ -392,6 +404,14 @@ def _store_idm_trade(record: dict) -> dict:
             "trade_type": trade_type,
             "trade_ids": existing_trade_ids + [record["trade_id"]],
             "trade_fingerprints": existing_fingerprints + [incoming_fingerprint],
+            "participant_total_area_schedule_mwh": purchase_mwh - sale_mwh,
+            "area_price_usd_per_mwh": weighted_usd / total_quantity if total_quantity else None,
+            "idm_quantity_mwh": total_quantity or None,
+            "idm_price_usd_per_mwh": weighted_usd / total_quantity if total_quantity else None,
+            "idm_price_zar_per_mwh": weighted_zar / total_quantity if total_quantity else None,
+            "idm_trade_type": trade_type,
+            "idm_trade_id": record["trade_id"],
+            "idm_trade_ids": existing_trade_ids + [record["trade_id"]],
             "source_file": " + ".join(dict.fromkeys(source_files)),
             "metadata": {
                 **existing_metadata,
@@ -403,6 +423,7 @@ def _store_idm_trade(record: dict) -> dict:
     else:
         record["trade_ids"] = [record["trade_id"]]
         record["trade_fingerprints"] = [incoming_fingerprint]
+        record["idm_trade_ids"] = [record["trade_id"]]
         record["metadata"] = {
             **record["metadata"],
             "idm_trade_ids": [record["trade_id"]],
@@ -418,7 +439,7 @@ def _store_idm_trade(record: dict) -> dict:
         upsert=True,
     )
     return {
-        "job": IDM_TRADE_JOB,
+        "job": IDM_PORTFOLIO_JOB,
         "status": "success",
         "delivery_date": record["delivery_date"],
         "market": "idm",
@@ -656,11 +677,11 @@ class CreditNoteEmailImporter:
             )
             result = _store_idm_trade(idm_trade)
             if result.get("status") != "already_imported":
-                result["run_id"] = f"email:{uid}:{IDM_TRADE_JOB}"
+                result["run_id"] = f"email:{uid}:{IDM_PORTFOLIO_JOB}"
                 result["notification"] = record_external_run(
                     run_id=result["run_id"],
-                    dataset_id="idm_trades",
-                    job=IDM_TRADE_JOB,
+                    dataset_id=IDM_PORTFOLIO_DATASET_ID,
+                    job=IDM_PORTFOLIO_JOB,
                     status="success",
                     start_date=idm_trade["delivery_date"],
                     end_date=idm_trade["delivery_date"],

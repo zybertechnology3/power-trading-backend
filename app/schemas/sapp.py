@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 BidStatus = Literal["draft", "submitted"]
 SappBidMarket = Literal["dam", "fpm_w", "fpm_m"]
+SappPortfolioMarket = Literal["dam", "fpm_w", "fpm_m", "idm"]
 SappBidProduct = Literal["off_peak", "peak", "standard"]
 MONDAY = 0
 
@@ -598,7 +599,10 @@ class SappParticipantPortfolioResultCreate(BaseModel):
     """Hourly participant portfolio result extracted from a SAPP MTP DAM document."""
 
     timestamp: datetime = Field(..., description="Delivery timestamp for this hourly result")
-    market: SappBidMarket = Field("dam", description="Portfolio market: dam, fpm_w, or fpm_m")
+    market: SappPortfolioMarket = Field(
+        "dam",
+        description="Portfolio result market: dam, fpm_w, fpm_m, or idm",
+    )
     delivery_date: date = Field(..., description="SAPP delivery date")
     source_delivery_date: Optional[date] = Field(
         None,
@@ -631,6 +635,13 @@ class SappParticipantPortfolioResultCreate(BaseModel):
         None,
         description="Total DAM turnover in MWh",
     )
+    portfolio: Optional[str] = None
+    idm_quantity_mwh: Optional[float] = None
+    idm_price_usd_per_mwh: Optional[float] = None
+    idm_price_zar_per_mwh: Optional[float] = None
+    idm_trade_type: Optional[str] = None
+    idm_trade_id: Optional[str] = None
+    idm_trade_ids: list[str] = Field(default_factory=list)
     data_source: str = Field("SAPP_MTP_DAM_PARTICIPANT_PORTFOLIO_RESULTS")
     source_file: Optional[str] = None
 

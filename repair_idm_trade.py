@@ -9,10 +9,15 @@ from dotenv import load_dotenv
 
 from app.db.database import get_db
 from app.services.sapp_sync_notifier import record_external_run
-from sapp_email_document_importer import _idm_trade_fingerprint
+from sapp_email_document_importer import (
+    IDM_PORTFOLIO_COLLECTION,
+    IDM_PORTFOLIO_DATASET_ID,
+    IDM_PORTFOLIO_JOB,
+    _idm_trade_fingerprint,
+)
 
 
-COLLECTION = "sapp_trading_invoice_hourly_details"
+COLLECTION = IDM_PORTFOLIO_COLLECTION
 
 
 def _date(value: str) -> str:
@@ -79,6 +84,16 @@ def main() -> int:
         "traded_sales_mwh": args.quantity if args.trade_type == "SELL" else None,
         "purchase_turnover_usd": amount_usd if args.trade_type == "BUY" else None,
         "sale_turnover_usd": -amount_usd if args.trade_type == "SELL" else None,
+        "participant_total_area_schedule_mwh": (
+            args.quantity if args.trade_type == "BUY" else -args.quantity
+        ),
+        "area_price_usd_per_mwh": price_usd,
+        "idm_quantity_mwh": args.quantity,
+        "idm_price_usd_per_mwh": price_usd,
+        "idm_price_zar_per_mwh": price_zar,
+        "idm_trade_type": args.trade_type,
+        "idm_trade_id": fingerprint,
+        "idm_trade_ids": [fingerprint],
         "metadata.idm_trade_ids": [fingerprint],
         "metadata.idm_trade_fingerprints": [fingerprint],
         "metadata.repaired_duplicate": True,
@@ -98,8 +113,8 @@ def main() -> int:
     run_id = f"manual:idm-repair:{args.delivery_date}:{args.hour}:{fingerprint}"
     notification = record_external_run(
         run_id=run_id,
-        dataset_id="idm_trades",
-        job="idm_trade_concluded",
+        dataset_id=IDM_PORTFOLIO_DATASET_ID,
+        job=IDM_PORTFOLIO_JOB,
         status="success",
         start_date=args.delivery_date,
         end_date=args.delivery_date,

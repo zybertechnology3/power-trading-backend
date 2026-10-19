@@ -692,10 +692,10 @@ def _normalize_portfolio_market(market: Optional[str]) -> Optional[str]:
         return None
 
     normalized_market = str(market).strip().lower().replace("-", "_").replace(" ", "_")
-    if normalized_market not in {"dam", "fpm_w", "fpm_m"}:
+    if normalized_market not in {"dam", "fpm_w", "fpm_m", "idm"}:
         raise HTTPException(
             status_code=400,
-            detail="market must be one of: dam, fpm_w, fpm_m",
+            detail="market must be one of: dam, fpm_w, fpm_m, idm",
         )
     return normalized_market
 
