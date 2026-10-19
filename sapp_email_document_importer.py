@@ -568,7 +568,7 @@ class CreditNoteEmailImporter:
         idm_trade = _extract_idm_trade(message, uid)
         if idm_trade is not None:
             LOGGER.info(
-                "ðŸ“ˆ UID %s | IDM %s | delivery=%s | hour=%s | quantity=%s MW | price=%s USD/MWh",
+                "[IDM] UID %s | %s | delivery=%s | hour=%s | quantity=%s MW | price=%s USD/MWh",
                 uid,
                 idm_trade["trade_type"],
                 idm_trade["delivery_date"],
@@ -590,7 +590,7 @@ class CreditNoteEmailImporter:
                     source="email_importer",
                 )
                 LOGGER.info(
-                    "ðŸ”” UID %s | IDM webhook=%s%s",
+                    "[IDM webhook] UID %s | status=%s%s",
                     uid,
                     result["notification"].get("status"),
                     (
