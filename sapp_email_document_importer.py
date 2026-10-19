@@ -154,6 +154,64 @@ def _number(value: str | None) -> float | None:
     return float(match.group(0).replace(",", ""))
 
 
+def _idm_trade_fingerprint(
+    *,
+    delivery_date: str,
+    hour: int,
+    trade_type: str,
+    portfolio: str | None,
+    quantity: float,
+    price_usd: float,
+    price_zar: float | None,
+) -> str:
+    """Build an ID that remains stable when an email is forwarded or re-fetched."""
+    identity = {
+        "delivery_date": delivery_date,
+        "hour": hour,
+        "trade_type": trade_type,
+        "portfolio": portfolio or "",
+        "quantity": round(quantity, 9),
+        "price_usd": round(price_usd, 9),
+        "price_zar": round(price_zar, 9) if price_zar is not None else None,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _idm_fingerprint_for_record(record: dict) -> str | None:
+    """Derive a fingerprint from a single stored IDM record, including legacy rows."""
+    trade_type = str(record.get("trade_type", "")).upper()
+    quantity = (
+        record.get("traded_purchases_mwh")
+        if trade_type == "BUY"
+        else record.get("traded_sales_mwh")
+        if trade_type == "SELL"
+        else None
+    )
+    if (
+        trade_type not in {"BUY", "SELL"}
+        or not record.get("delivery_date")
+        or record.get("hour") is None
+        or quantity is None
+        or record.get("price_usd_per_mwh") is None
+    ):
+        return None
+    return _idm_trade_fingerprint(
+        delivery_date=str(record["delivery_date"]),
+        hour=int(record["hour"]),
+        trade_type=trade_type,
+        portfolio=record.get("portfolio"),
+        quantity=float(quantity),
+        price_usd=float(record["price_usd_per_mwh"]),
+        price_zar=(
+            float(record["price_zar_per_mwh"])
+            if record.get("price_zar_per_mwh") is not None
+            else None
+        ),
+    )
+
+
 def _extract_idm_trade(message: Message, uid: str) -> dict | None:
     """Extract one IDM trade-concluded email into hourly-detail fields."""
     subject = str(message.get("subject", ""))
@@ -206,9 +264,15 @@ def _extract_idm_trade(message: Message, uid: str) -> dict | None:
 
     trade_type = trade_match.group(1).upper()
     amount_usd = quantity * price_usd
-    trade_id = hashlib.sha256(
-        f"{uid}|{delivery_date.isoformat()}|{hour}|{trade_type}|{portfolio or ''}".encode()
-    ).hexdigest()[:24]
+    trade_id = _idm_trade_fingerprint(
+        delivery_date=delivery_date.isoformat(),
+        hour=hour,
+        trade_type=trade_type,
+        portfolio=portfolio,
+        quantity=quantity,
+        price_usd=price_usd,
+        price_zar=price_zar,
+    )
     return {
         "timestamp": datetime.combine(delivery_date, datetime.min.time())
         + timedelta(hours=hour - 1),
@@ -225,6 +289,7 @@ def _extract_idm_trade(message: Message, uid: str) -> dict | None:
         "portfolio": portfolio,
         "trade_type": trade_type,
         "trade_id": trade_id,
+        "trade_fingerprint": trade_id,
         "data_source": IDM_TRADE_DATA_SOURCE,
         "metadata": {
             "data_source": IDM_TRADE_DATA_SOURCE,
@@ -233,6 +298,7 @@ def _extract_idm_trade(message: Message, uid: str) -> dict | None:
             "trade_type": trade_type,
             "price_zar_per_mwh": price_zar,
             "trade_id": trade_id,
+            "trade_fingerprint": trade_id,
         },
         "source_file": f"email:{uid}:{subject}",
     }
@@ -252,7 +318,15 @@ def _store_idm_trade(record: dict) -> dict:
     if existing and existing.get("trade_id"):
         existing_trade_ids.append(existing["trade_id"])
     existing_trade_ids = list(dict.fromkeys(existing_trade_ids))
-    if record["trade_id"] in existing_trade_ids:
+    existing_fingerprints = list(
+        existing_metadata.get("idm_trade_fingerprints", [])
+    )
+    if not existing_fingerprints and existing and len(existing_trade_ids) <= 1:
+        existing_fingerprint = existing.get("trade_fingerprint") or _idm_fingerprint_for_record(existing)
+        if existing_fingerprint:
+            existing_fingerprints.append(existing_fingerprint)
+    incoming_fingerprint = record.get("trade_fingerprint") or record["trade_id"]
+    if incoming_fingerprint in existing_fingerprints or record["trade_id"] in existing_trade_ids:
         return {
             "job": IDM_TRADE_JOB,
             "status": "already_imported",
@@ -317,18 +391,22 @@ def _store_idm_trade(record: dict) -> dict:
             "sale_turnover_usd": sale_amount or None,
             "trade_type": trade_type,
             "trade_ids": existing_trade_ids + [record["trade_id"]],
+            "trade_fingerprints": existing_fingerprints + [incoming_fingerprint],
             "source_file": " + ".join(dict.fromkeys(source_files)),
             "metadata": {
                 **existing_metadata,
                 **record["metadata"],
                 "idm_trade_ids": existing_trade_ids + [record["trade_id"]],
+                "idm_trade_fingerprints": existing_fingerprints + [incoming_fingerprint],
             },
         }
     else:
         record["trade_ids"] = [record["trade_id"]]
+        record["trade_fingerprints"] = [incoming_fingerprint]
         record["metadata"] = {
             **record["metadata"],
             "idm_trade_ids": [record["trade_id"]],
+            "idm_trade_fingerprints": [incoming_fingerprint],
         }
 
     result = collection.update_one(
