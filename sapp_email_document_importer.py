@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 
 from app.db.database import get_db
 from app.services.sapp_sync_notifier import record_external_run
+from app.services.sapp_flows import FLOWS_JOB, FLOW_DATASET_ID, store_flows
 from sapp_scraper import (
     CONSTRAINED_AREA_RESULTS_JOB,
     FPM_M_CONSTRAINED_AREA_RESULTS_JOB,
@@ -62,6 +63,7 @@ IDM_PORTFOLIO_JOB = "participant_portfolio_results_idm"
 IDM_PORTFOLIO_DATASET_ID = "portfolio_idm"
 IDM_PORTFOLIO_COLLECTION = "sapp_participant_portfolio_results"
 DEFAULT_SUBJECT_SEARCH_TERMS = (
+    "MTP - DAM Flows",
     "MTP - Trading Invoice / Credit Note",
     "MTP - DAM - Participant Portfolio Results",
     "MTP - FPM-W - Participant Portfolio Results",
@@ -454,6 +456,8 @@ def _store_idm_trade(record: dict) -> dict:
 def _job_for_attachment(filename: str):
     """Identify supported SAPP workbook types using the attachment filename."""
     normalized = re.sub(r"[^a-z0-9]+", "", filename.lower())
+    if re.match(r"mtp(?:dam)?flows\d{4}", normalized):
+        return FLOWS_JOB
     if "tradinginvoicecreditnote" in normalized:
         return TRADING_INVOICE_RESULTS_JOB
     if "participant" in normalized and "portfolio" in normalized and "fpmw" in normalized:
@@ -755,7 +759,12 @@ class CreditNoteEmailImporter:
                     job.name,
                     len(records),
                 )
-                if job.name == TRADING_INVOICE_RESULTS_JOB.name:
+                if job.name == FLOWS_JOB.name:
+                    if any(record["delivery_date"] != delivery_date.isoformat() for record in records):
+                        raise ValueError("Flow workbook delivery date differs from email/filename date")
+                    result = store_flows(records)
+                    result["status"] = "success"
+                elif job.name == TRADING_INVOICE_RESULTS_JOB.name:
                     result = _merge_and_store(records, delivery_date)
                 else:
                     result = store_records_in_database(records, job)
@@ -766,6 +775,7 @@ class CreditNoteEmailImporter:
                     result["notification"] = record_external_run(
                         run_id=result["run_id"],
                         dataset_id={
+                            FLOWS_JOB.name: FLOW_DATASET_ID,
                             TRADING_INVOICE_RESULTS_JOB.name: "credit_notes",
                             PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: "portfolio_dam",
                             PARTICIPANT_PORTFOLIO_FPM_W_RESULTS_JOB.name: "portfolio_fpm_w",

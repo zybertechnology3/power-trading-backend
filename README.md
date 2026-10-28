@@ -577,3 +577,87 @@ List responses include `meters` for table columns and `records` for interval
 rows. `interval_start` must be aligned to `:00` or `:30`. Fresh databases are
 seeded with deterministic half-hourly dummy readings for both MPS and LPS across
 the previous seven days.
+
+## MTP corridor flows and frontend sync
+
+The email importer accepts `MTP-Flows_YYYY-MM-DD_*.xlsx` attachments, including
+forwarded emails with subjects such as `FW: MTP - DAM Flows for 2026/10/28`.
+The default IMAP subject search now includes `MTP - DAM Flows`. If
+`SAPP_EMAIL_SUBJECT_SEARCH_TERMS` is configured, append that term to the existing
+list; configured terms replace the defaults. Existing importer state is preserved.
+
+Each workbook sheet is imported as its own product: `NET_TOTAL`, `FPM_M`,
+`FPM_W`, or `DAM`. A `BILATERAL` sheet is supported when explicitly present;
+it is not calculated from the other sheets. The supplied workbook contains
+40 corridors, 24 hours, and four products (3,840 records).
+
+Records in MongoDB `sapp_flows` have a unique key of
+`(delivery_date, hour, product, interface_id)`. Duplicate/forwarded attachments
+upsert the same records. Revised files replace matching values when processed.
+Content-hashed batch metadata is stored in `sapp_network_upload_batches` with
+`source_type: "mtp_flows"`; each flow record includes its `batch_id`.
+All populated sheets must contain 24 hours with finite numeric values for every
+corridor. Missing values are rejected rather than treated as zero. Validation
+errors leave the email eligible for retry.
+
+Read endpoints (optional filters: `product`, `interface_id`, `from_area`, `to_area`):
+
+```text
+GET /sapp/flows?delivery_date=2026-10-28
+GET /sapp/flows/2026-10-28?product=DAM
+GET /sapp/flows?start_date=2026-10-28&end_date=2026-10-29&interface_id=BOT_TO_RSAN
+```
+
+Responses contain `dataset_id`, `start_date`, `end_date`, `total`, and `records`:
+
+```json
+{
+  "dataset_id": "mtp_flows",
+  "start_date": "2026-10-28",
+  "end_date": "2026-10-28",
+  "total": 1,
+  "records": [{
+    "delivery_date": "2026-10-28",
+    "hour": 1,
+    "hour_label": "00-01",
+    "product": "NET_TOTAL",
+    "interface_id": "BOT_TO_RSAN",
+    "from_area": "BOT",
+    "to_area": "RSAN",
+    "flow_mw": -93.0,
+    "batch_id": "<SHA-256 of workbook bytes>",
+    "source_file": "MTP-Flows_2026-10-28_1.xlsx"
+  }]
+}
+```
+
+Hour 1 is `00-01`; hour 24 is `23-00` (or `23-24` in some exports).
+Values retain the workbook's sign relative to the named direction. Reverse
+corridors can represent the opposite sign of the same transfer; avoid summing
+both directions as independent transfers. `NET_TOTAL` is a separate series,
+not an additional product to sum with DAM/FPM. These are MTP reported schedules;
+the import does not establish that they are metered physical measurements.
+
+After storage, the existing signed webhook sends `event: "sapp.dataset.ready"`,
+`dataset_id: "mtp_flows"`, `job: "mtp_flows"`, `source: "email_importer"`,
+and the delivery day in `date_range`. The run/event ID is
+`email:<uid>:mtp_flows`; `result` includes imported/updated counts, products,
+and batch IDs. Existing `SAPP_SYNC_NOTIFY_URL` and `SAPP_SYNC_NOTIFY_SECRET`
+settings apply, with the same HMAC signature and headers as other datasets.
+
+The frontend should verify the signature, deduplicate events, fetch `/sapp/flows`
+for the notified dates, and upsert using the natural key above. A relational
+frontend can map the external batch hash to its own batch UUID. Catch-up polling
+uses `/sapp/auto-scraper/runs/finished?dataset_id=mtp_flows`. Webhook delivery
+failures retain stored flows and the durable completion run.
+
+Deploy by rebuilding the image and recreating both the API and email importer
+containers using the existing environment and persistent importer-state mount.
+This change adds no scheduled Selenium jobs. The frontend must add the
+`mtp_flows` dataset handler to its existing sync receiver.
+
+Offline regression checks (mock database and HTTP; no mailbox or production writes):
+
+```text
+python -m unittest discover -s tests -v
+```

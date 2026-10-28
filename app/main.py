@@ -23,6 +23,7 @@ from app.api import (
     resource_forecasting,
     sapp,
     sapp_auto_scraper,
+    sapp_flows,
     telemetry,
 )
 from app.core.config import settings
@@ -81,6 +82,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(telemetry.router)
 app.include_router(sapp.router)
+app.include_router(sapp_flows.router)
 app.include_router(sapp_auto_scraper.router)
 app.include_router(Contract.router)
 app.include_router(resource_forecasting.router)
