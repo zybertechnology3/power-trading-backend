@@ -661,3 +661,72 @@ Offline regression checks (mock database and HTTP; no mailbox or production writ
 ```text
 python -m unittest discover -s tests -v
 ```
+
+## MTP DAM available transmission capacities (ATC)
+
+The importer supports `MTP-DAM-Available-Transmission-Capacities_YYYY-MM-DD_*.xlsx`
+attachments and forwarded subjects such as
+`FW: MTP - DAM - Available Transmission Capacities for 2026/10/28`.
+If `SAPP_EMAIL_SUBJECT_SEARCH_TERMS` is set, append
+`MTP - DAM - Available Transmission Capacities` to its comma-separated list,
+preserving all previous subjects (including `MTP - DAM Flows`). If unset, the
+updated default already includes this subject. No new secrets or environment
+variables are required. Existing email state and scheduling are unchanged.
+
+ATC email data is stored in `sapp_bm_atc_records`. Each row has:
+
+- `delivery_date`: ISO delivery day.
+- `market`: `BM_ATC`, the frontend's ATC table classification.
+- `source_market`: `DAM`, identifying the workbook's actual source market.
+- `hour`: 1–24, or null for a supplied summary row.
+- `hour_label` and `product`: the source interval or canonical summary label.
+- `row_index`: hours 1–24; Min=25, Max=26, Avg=27, Tot=28.
+- `is_summary`: true only for summary rows.
+- `columns`: the ordered source corridor codes, e.g. `BOT_TO_RSAN`.
+- `values`: a corridor-to-capacity map; numeric values remain numbers and blanks
+  remain null. Zero is a real capacity value, not missing data.
+- `source_file`: attachment filename.
+
+The unique upsert key is `(delivery_date, market, row_index)`. The sample workbook
+contains 24 rows and 40 corridor columns (960 capacity cells), with no summary
+rows. Summary rows are preserved if supplied, not generated. All 24 hours must
+be present and unique; invalid values or date mismatches fail before storage and
+remain retryable. Forwarded/duplicate emails update matching records; revisions
+replace matching values. Min/Max/Avg/Tot are not additional hourly capacity.
+
+Read endpoints:
+
+```text
+GET /sapp/atc?delivery_date=2026-10-28
+GET /sapp/atc/2026-10-28
+GET /sapp/atc?start_date=2026-10-14&end_date=2026-10-28
+GET /sapp/atc/2026-10-28?include_summaries=false
+```
+
+Use either `delivery_date` or the inclusive date range. Responses contain
+`dataset_id: "mtp_atc"`, `start_date`, `end_date`, `total`, and `records`, ordered
+by date and row index. Empty dates return zero records. The existing
+`/sapp/bm-atc-results` endpoint and `sapp_bm_atc_results` scraper collection are
+unchanged; the new email workbook is DAM capacity, not proof of BM capacity.
+
+After successful storage, the existing signed webhook uses
+`event: "sapp.dataset.ready"`, `dataset_id: "mtp_atc"`, `job: "mtp_atc"`,
+`source: "email_importer"`, and run/event ID `email:<uid>:mtp_atc`.
+`date_range` contains the delivery day. `result` includes imported/updated
+counts, total, hourly/summary counts, source market, and corridor columns.
+The same HMAC signature, shared webhook URL/secret, and completion logging as
+flows apply. Catch-up polling uses
+`/sapp/auto-scraper/runs/finished?dataset_id=mtp_atc`.
+
+The frontend ATC handler should verify signatures, deduplicate events, fetch
+the notified dates from `/sapp/atc`, and upsert `sapp_bm_atc_records` using the
+natural key above. Preserve source market metadata and source route identifiers.
+Render dynamic corridor columns and sort by row index. Support manual resync
+and catch-up polling through the same handler as webhooks.
+
+Rebuild the updated image and recreate **both** API and importer containers.
+Preserve the importer directory state mount. Recreating the importer alone does
+not expose the new GET routes in the running API. Before replaying frontend
+events, verify `/openapi.json` lists `/sapp/atc` and test a delivery date through
+the public API. No ATC production imports or VPS deployment are performed by
+the offline regression tests.

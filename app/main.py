@@ -22,6 +22,7 @@ from app.api import (
     outage_requests,
     resource_forecasting,
     sapp,
+    sapp_atc,
     sapp_auto_scraper,
     sapp_flows,
     telemetry,
@@ -82,6 +83,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(telemetry.router)
 app.include_router(sapp.router)
+app.include_router(sapp_atc.router)
 app.include_router(sapp_flows.router)
 app.include_router(sapp_auto_scraper.router)
 app.include_router(Contract.router)

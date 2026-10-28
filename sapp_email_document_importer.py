@@ -3,6 +3,8 @@
 The importer deliberately reuses the existing workbook extractor and MongoDB
 storage path from ``sapp_scraper.py``. It supports both the normal C1 workbook
 and the optional P1 workbook, including when they arrive in separate emails.
+MTP flow and DAM available-transmission-capacity workbooks also use this shared
+storage and signed frontend notification path.
 
 Examples:
     python sapp_email_document_importer.py --once
@@ -34,6 +36,7 @@ from dotenv import load_dotenv
 from app.db.database import get_db
 from app.services.sapp_sync_notifier import record_external_run
 from app.services.sapp_flows import FLOWS_JOB, FLOW_DATASET_ID, store_flows
+from app.services.sapp_atc import ATC_JOB, ATC_DATASET_ID, store_atc
 from sapp_scraper import (
     CONSTRAINED_AREA_RESULTS_JOB,
     FPM_M_CONSTRAINED_AREA_RESULTS_JOB,
@@ -63,6 +66,7 @@ IDM_PORTFOLIO_JOB = "participant_portfolio_results_idm"
 IDM_PORTFOLIO_DATASET_ID = "portfolio_idm"
 IDM_PORTFOLIO_COLLECTION = "sapp_participant_portfolio_results"
 DEFAULT_SUBJECT_SEARCH_TERMS = (
+    "MTP - DAM - Available Transmission Capacities",
     "MTP - DAM Flows",
     "MTP - Trading Invoice / Credit Note",
     "MTP - DAM - Participant Portfolio Results",
@@ -456,6 +460,8 @@ def _store_idm_trade(record: dict) -> dict:
 def _job_for_attachment(filename: str):
     """Identify supported SAPP workbook types using the attachment filename."""
     normalized = re.sub(r"[^a-z0-9]+", "", filename.lower())
+    if re.match(r"mtpdamavailabletransmissioncapacities\d{4}", normalized):
+        return ATC_JOB
     if re.match(r"mtp(?:dam)?flows\d{4}", normalized):
         return FLOWS_JOB
     if "tradinginvoicecreditnote" in normalized:
@@ -759,7 +765,12 @@ class CreditNoteEmailImporter:
                     job.name,
                     len(records),
                 )
-                if job.name == FLOWS_JOB.name:
+                if job.name == ATC_JOB.name:
+                    if any(record["delivery_date"] != delivery_date.isoformat() for record in records):
+                        raise ValueError("ATC workbook delivery date differs from email/filename date")
+                    result = store_atc(records)
+                    result["status"] = "success"
+                elif job.name == FLOWS_JOB.name:
                     if any(record["delivery_date"] != delivery_date.isoformat() for record in records):
                         raise ValueError("Flow workbook delivery date differs from email/filename date")
                     result = store_flows(records)
@@ -775,6 +786,7 @@ class CreditNoteEmailImporter:
                     result["notification"] = record_external_run(
                         run_id=result["run_id"],
                         dataset_id={
+                            ATC_JOB.name: ATC_DATASET_ID,
                             FLOWS_JOB.name: FLOW_DATASET_ID,
                             TRADING_INVOICE_RESULTS_JOB.name: "credit_notes",
                             PARTICIPANT_PORTFOLIO_RESULTS_JOB.name: "portfolio_dam",

@@ -111,7 +111,7 @@ class FlowsTests(unittest.TestCase):
         self.assertEqual(rows[0]['from_area'], 'BOT')
         self.assertEqual(rows[46]['hour_label'], '23-00')
         self.assertEqual(_job_for_attachment(self.path.name), FLOWS_JOB)
-        self.assertIsNone(_job_for_attachment('MTP-DAM-Available-Transmission-Capacities_2026-10-28_1.xlsx'))
+        self.assertNotEqual(_job_for_attachment('MTP-DAM-Available-Transmission-Capacities_2026-10-28_1.xlsx'), FLOWS_JOB)
 
     def test_incomplete_or_blank_workbook_rejected(self):
         for kwargs in ({'missing_hour': True}, {'blank': True}):
